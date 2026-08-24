@@ -162,10 +162,10 @@ export class Pathfinder {
 
     let rate = 0;
     const probeIn = 10n ** BigInt(this.decimalsForSac(tin)); // 1 whole token
-    const pools = this.discovery
+    const allPools = this.discovery
       .getPoolsForPair(tin, tout)
-      .sort((x, y) => (y.totalVolume || 0) - (x.totalVolume || 0))
-      .slice(0, 1);
+      .sort((x, y) => (y.totalVolume || 0) - (x.totalVolume || 0));
+    const pools = allPools.slice(0, 2);
     for (const p of pools) {
       const inIdx = p.tokenAddresses.indexOf(tin);
       const outIdx = p.tokenAddresses.indexOf(tout);
@@ -186,8 +186,15 @@ export class Pathfinder {
           rate = outScaled; // out per 1 whole token in
         }
       } catch {
-        /* unprobeable edge → rate 0, ranked last */
+        /* try the next pool */
       }
+      if (rate > 0) break;
+    }
+    if (rate === 0 && allPools.length > 0) {
+      // Pools EXIST but the probe failed (throttled RPC, exotic pool
+      // type). Rank the edge last but keep it verifiable — pruning here
+      // is how a transient sim failure turned into a worse route.
+      rate = 1e-9;
     }
     if (rate === 0) {
       // sushi edge (or aqua probe failed): neutral rank so the path is

@@ -97,18 +97,55 @@ export class StellarClient {
   /**
    * Simulate and return a native JS value from a contract call.
    */
+  // ── Simulation gate ─────────────────────────────────
+  // The pathfinder can fire dozens of concurrent simulations (spot
+  // probes + depth quotes). Public Soroban RPCs rate-limit such bursts,
+  // and a throttled sim used to read as "no liquidity" — quotes went
+  // intermittently blind under our own load. Cap in-flight sims and
+  // retry once with backoff.
+  private static SIM_CONCURRENCY = parseInt(process.env.RPC_SIM_CONCURRENCY ?? '8');
+  private static simInFlight = 0;
+  private static simWaiters: Array<() => void> = [];
+
+  private static async simSlot(): Promise<void> {
+    if (StellarClient.simInFlight < StellarClient.SIM_CONCURRENCY) {
+      StellarClient.simInFlight++;
+      return;
+    }
+    await new Promise<void>((resolve) => StellarClient.simWaiters.push(resolve));
+    StellarClient.simInFlight++;
+  }
+
+  private static simRelease(): void {
+    StellarClient.simInFlight--;
+    const next = StellarClient.simWaiters.shift();
+    if (next) next();
+  }
+
   async simulateAndParse<T>(
     contractId: string,
     method: string,
     args: xdr.ScVal[]
   ): Promise<T | null> {
-    const result = await this.simulateCall(contractId, method, args);
-    if (!result) return null;
-    try {
-      return scValToNative(result) as T;
-    } catch {
-      return null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await StellarClient.simSlot();
+      try {
+        const result = await this.simulateCall(contractId, method, args);
+        if (result) {
+          try {
+            return scValToNative(result) as T;
+          } catch {
+            return null; // parse failure is deterministic — no retry
+          }
+        }
+      } catch {
+        /* fall through to retry */
+      } finally {
+        StellarClient.simRelease();
+      }
+      if (attempt === 0) await new Promise((r) => setTimeout(r, 250));
     }
+    return null;
   }
 
   /**

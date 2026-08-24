@@ -175,13 +175,28 @@ function TokenDropdown({
     if (sym.startsWith(q)) return 1;
     if (sym.includes(q)) return 2;
     if (t.name.toLowerCase().includes(q)) return 3;
-    // fuzzy: 1 typo for short queries, 2 for longer ones
-    if (q.length >= 3 && editDistLe(sym, q, q.length >= 6 ? 2 : 1)) return 4;
+    if (q.length >= 3) {
+      const tol = q.length >= 6 ? 2 : 1;
+      // whole-symbol typo tolerance: 'solvebtc' → SolvBTC
+      if (editDistLe(sym, q, tol)) return 4;
+      // PREFIX-window tolerance for mid-typing: 'solve' is one typo away
+      // from the first 5-6 chars of 'solvbtc', so the token never
+      // vanishes while the user is still typing toward it
+      if (editDistLe(sym.slice(0, q.length), q, tol)) return 4;
+      if (editDistLe(sym.slice(0, Math.min(sym.length, q.length + 1)), q, tol)) return 4;
+    }
     return 5;
   };
   const available = tokens
     .filter((t) => t.symbol !== exclude && (!q || matchRank(t) < 5))
-    .sort((a, b) => (q ? matchRank(a) - matchRank(b) : 0));
+    .sort((a, b) => {
+      if (!q) return 0;
+      const ra = matchRank(a);
+      const rb = matchRank(b);
+      if (ra !== rb) return ra - rb;
+      // within a tier, shorter symbols are the closer match
+      return a.symbol.length - b.symbol.length;
+    });
 
   return (
     <div ref={ref} style={{ position: 'relative', zIndex: open ? 50 : 1 }}>
@@ -382,6 +397,27 @@ function InputPanel({
       {/* Amount + Token row */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
         {readOnly ? (
+          value === '…' ? (
+            <span style={{ flex: 1, display: 'flex', gap: '7px', alignItems: 'center', height: '34px' }}>
+              {[0, 1, 2].map((i) => (
+                <span
+                  key={i}
+                  style={{
+                    width: '9px',
+                    height: '9px',
+                    borderRadius: '50%',
+                    background: '#6366f1',
+                    display: 'inline-block',
+                    animation: `ufamaDotHop 0.9s ${i * 0.15}s ease-in-out infinite`,
+                  }}
+                />
+              ))}
+              <style>{`@keyframes ufamaDotHop {
+                0%, 55%, 100% { transform: translateY(0); opacity: 0.55; }
+                25% { transform: translateY(-9px); opacity: 1; }
+              }`}</style>
+            </span>
+          ) : (
           <span
             style={{
               flex: 1,
@@ -393,6 +429,7 @@ function InputPanel({
           >
             {value || '0.00'}
           </span>
+          )
         ) : (
           <input
             type="number"
