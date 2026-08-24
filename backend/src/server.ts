@@ -315,6 +315,11 @@ function orderToJson(order: ChainOrder, extra: Record<string, unknown> = {}) {
   };
 }
 
+/** Token decimals by SAC address from the discovery universe (default 7). */
+function decimalsForSac(sac: string): number {
+  return tokenDiscovery.getTokens().find((t) => t.sacAddress === sac)?.decimals ?? 7;
+}
+
 /** ceil(a * b / d) for bigints — mirrors the contract's rounding. */
 function muldivCeil(a: bigint, b: bigint, d: bigint): bigint {
   return (a * b + d - 1n) / d;
@@ -551,7 +556,10 @@ app.get('/api/quote', async (req, res) => {
     const amountIn = parseAmount(req.query.amountIn, 'amountIn');
     const slippage = parseSlippageBps(req.query.slippage);
 
-    const route = await routingEngine.computeRoute(tokenIn, tokenOut, amountIn, slippage);
+    const route = await routingEngine.computeRoute(tokenIn, tokenOut, amountIn, slippage, {}, {
+      in: decimalsForSac(tokenIn),
+      out: decimalsForSac(tokenOut),
+    });
 
     res.json({
       tokenIn: route.tokenIn,
