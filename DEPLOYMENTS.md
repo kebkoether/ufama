@@ -1,6 +1,33 @@
 # Deployments
 
-## Mainnet (canary — unannounced, dust-tested 2026-08-17)
+## Mainnet v1.1 — LIVE SET (deployed 2026-08-22)
+
+| Contract | Address |
+|---|---|
+| FeeVault | `CBNI2QR4LBM7GLLKSYOIASACBRSKNDMLDZAGUOTBBHMCAPCZH5HSHPXP` |
+| SwapBook | `CB2UJMIFIT3SKCAKD7FDSRJCU6KWV2WXHLWSH25WKO6PMSRVMZDRS5CI` |
+| Router | `CDY6O3L2D4FVJCCW3MBO76ZYKNZXNKCVB4JRXXIWJJSXHA2VE4SSZDXK` |
+| TwapBook | `CDB2E3K6R7EAJS3XWW3C3UZXXH3EK66FJPRU7OISUDP4SO7KYDR5FJD6` |
+| Aqua adapter | `CCTL6C4PYDTXT6GL5YTE6CG4ZH2EXKJONUP4445SMTY5AYQPNQY666HZ` |
+| Sushi adapter (factory fallback) | `CDFNVWKR6BO57LR3PMGGDK456FOAOILKSPE56GYRFGIY2Q5JPUULL3IY` |
+
+Git tag: `v1.1.0`. Fees verified on-chain at deploy: Router 0/100k
+(ZERO — instant swaps venue-fees-only, cap 0.5 bps), SwapBook 5/100k
+(0.5 bps, settable ≤ cap), TwapBook 100/100k (10 bps, settable ≤ cap).
+Venues 1 = Aqua, 2 = Sushi on Router and TwapBook. Aqua XLM/USDC pool
+registered: concentrated `CBBMQBNHB2FYVZYV7VNHOJHUMTFJLR4PUMRVQYNW6RHIKZO2NQMIBUCV`
+(hash `24f9c991…71f3`). Sushi pairs resolve PERMISSIONLESSLY via the
+factory — no per-pair registration.
+
+Post-deploy TODOs:
+- [ ] SwapBook oracle admin is TEMPORARILY the deployer — repoint to the
+      Railway oracle pusher's public key (`set_oracle_admin`) before
+      oracle-mode (market) orders open.
+- [ ] Configure SEP-40/Reflector (`set_sep40_oracle` + `set_sep40_feed`
+      per token) — until then pairs use the guarded pushed price.
+- [ ] Railway cutover: the seven env values above + `SWAPBOOK_V11=1`.
+
+## Mainnet v1.0 (SUPERSEDED by v1.1 — was the canary set, dust-tested 2026-08-17)
 
 | Contract | Address |
 |---|---|
