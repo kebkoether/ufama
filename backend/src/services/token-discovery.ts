@@ -184,6 +184,7 @@ export class TokenDiscoveryService {
     fee: number;
     decimalsA: number;
     decimalsB: number;
+    liquidityUsd: number;
   }> {
     const best = new Map<string, SushiPool>();
     for (const p of this.sushiPools) {
@@ -198,6 +199,7 @@ export class TokenDiscoveryService {
       fee: p.fee,
       decimalsA: p.decimalsA,
       decimalsB: p.decimalsB,
+      liquidityUsd: p.liquidityUsd,
     }));
   }
 

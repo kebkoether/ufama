@@ -6,15 +6,19 @@
  *   1. GRAPH   — edges are discovered pools (Aqua + Sushi), weighted by a
  *                liquidity proxy (Sushi liquidityUSD / Aqua lifetime volume).
  *   2. SEARCH  — DFS from tokenIn to tokenOut, up to MAX_HOPS swaps, no
- *                token revisits, branching capped to the most-liquid
- *                neighbors so 300+ pools stay tractable.
- *   3. RANK    — candidate paths are ordered by the product of cached
- *                per-edge spot rates (probed with 1-token estimate_swap
- *                simulations, 5-min TTL, lazily and concurrently).
+ *                token revisits; per node the top-liquidity Aqua edges
+ *                plus ALL Sushi edges (few, pre-filtered by USD floor).
+ *   3. RANK    — ZERO simulations: fewest hops first, then the sum of
+ *                log-liquidity along the path. (A probe-based ranker was
+ *                tried and retired: its simulation burst starved the
+ *                verification phase's time budget on slow RPCs, so the
+ *                search returned nothing precisely when it mattered.)
  *   4. VERIFY  — the top candidates are quoted FOR REAL, hop by hop,
  *                through the routing engine (each hop still gets
  *                best-venue split treatment). Chained conservatively:
  *                hop N+1 is sized from hop N's slippage-protected minimum.
+ *                The best-ranked path is ALWAYS verified to completion —
+ *                the budget can trim breadth, never blind the search.
  *   5. COMPARE — the best path competes with the direct route; the
  *                higher net output wins. Multi-hop is a competitor, not
  *                a fallback.
@@ -32,10 +36,8 @@ const MAX_HOPS = parseInt(process.env.PATHFINDER_MAX_HOPS ?? '5');
 const BRANCH_CAP = parseInt(process.env.PATHFINDER_BRANCH_CAP ?? '6');
 const CANDIDATE_CAP = parseInt(process.env.PATHFINDER_CANDIDATES ?? '40');
 const VERIFY_TOP = parseInt(process.env.PATHFINDER_VERIFY_TOP ?? '4');
-const RATE_TTL_MS = 5 * 60 * 1000;
-const PROBE_CONCURRENCY = 8;
 /** Wall-clock budget for one bestRoute call (quote UX latency cap). */
-const SEARCH_BUDGET_MS = parseInt(process.env.PATHFINDER_BUDGET_MS ?? '6000');
+const SEARCH_BUDGET_MS = parseInt(process.env.PATHFINDER_BUDGET_MS ?? '8000');
 
 export interface LiquidityEdge {
   a: string;
@@ -67,8 +69,6 @@ export interface PathResult {
 const RESULT_TTL_MS = 15_000;
 
 export class Pathfinder {
-  /** "pool|dir" -> { rate: out-per-in scaled 1e9, ts } */
-  private rateCache = new Map<string, { rate: number; ts: number }>();
   /** short-lived full-result memo — repeat keystrokes and the follow-up
    *  build call reuse the same search instead of re-running it */
   private resultCache = new Map<
@@ -108,7 +108,7 @@ export class Pathfinder {
         b: p.tokenB,
         venue: 'sushi',
         pool: p.pool,
-        liquidityProxy: 1, // sushi pairs pre-filtered by USD floor
+        liquidityProxy: p.liquidityUsd,
       });
     }
     return out;
@@ -124,8 +124,12 @@ export class Pathfinder {
       }
     }
     for (const [t, list] of adj) {
-      list.sort((x, y) => (y.liquidityProxy || 0) - (x.liquidityProxy || 0));
-      adj.set(t, list.slice(0, BRANCH_CAP));
+      const aqua = list
+        .filter((e) => e.venue === 'aqua')
+        .sort((x, y) => (y.liquidityProxy || 0) - (x.liquidityProxy || 0))
+        .slice(0, BRANCH_CAP);
+      const sushi = list.filter((e) => e.venue === 'sushi');
+      adj.set(t, [...aqua, ...sushi]);
     }
     return adj;
   }
@@ -154,89 +158,34 @@ export class Pathfinder {
     return results.filter((p) => p.length > 2);
   }
 
-  /** Cached spot rate for one directed pair (best pool), 1e9-scaled. */
-  private async spotRate(tin: string, tout: string): Promise<number> {
-    const key = `${tin}|${tout}`;
-    const hit = this.rateCache.get(key);
-    if (hit && Date.now() - hit.ts < RATE_TTL_MS) return hit.rate;
-
-    let rate = 0;
-    const probeIn = 10n ** BigInt(this.decimalsForSac(tin)); // 1 whole token
-    const allPools = this.discovery
-      .getPoolsForPair(tin, tout)
-      .sort((x, y) => (y.totalVolume || 0) - (x.totalVolume || 0));
-    const pools = allPools.slice(0, 2);
-    for (const p of pools) {
-      const inIdx = p.tokenAddresses.indexOf(tin);
-      const outIdx = p.tokenAddresses.indexOf(tout);
-      if (inIdx < 0 || outIdx < 0) continue;
-      try {
-        const est = await this.stellar.simulateAndParse<bigint>(
-          p.poolAddress,
-          'estimate_swap',
-          [
-            StellarClient.toU32(inIdx),
-            StellarClient.toU32(outIdx),
-            StellarClient.toU128(probeIn),
-          ]
-        );
-        if (est && BigInt(est) > 0n) {
-          const outScaled =
-            Number(BigInt(est)) / 10 ** this.decimalsForSac(tout);
-          rate = outScaled; // out per 1 whole token in
-        }
-      } catch {
-        /* try the next pool */
+  /**
+   * Rank candidate paths WITHOUT simulations: fewest hops first, then
+   * the highest liquidity along the path (sum of per-edge log-liquidity,
+   * each edge scored by its best pool in either venue's own units —
+   * crude across venues, but real quoting decides the final winner).
+   */
+  private rankPaths(paths: string[][]): string[][] {
+    const adj = this.adjacency(this.edges());
+    const edgeScore = (a: string, b: string): number => {
+      let best = 0;
+      for (const e of adj.get(a) ?? []) {
+        const other = e.a === a ? e.b : e.a;
+        if (other === b) best = Math.max(best, e.liquidityProxy || 0);
       }
-      if (rate > 0) break;
-    }
-    if (rate === 0 && allPools.length > 0) {
-      // Pools EXIST but the probe failed (throttled RPC, exotic pool
-      // type). Rank the edge last but keep it verifiable — pruning here
-      // is how a transient sim failure turned into a worse route.
-      rate = 1e-9;
-    }
-    if (rate === 0) {
-      // sushi edge (or aqua probe failed): neutral rank so the path is
-      // still verifiable, just not preferred by the heuristic
-      const sushi = this.discovery
-        .getSushiPairs()
-        .some((p) => (p.tokenA === tin && p.tokenB === tout) || (p.tokenA === tout && p.tokenB === tin));
-      if (sushi) rate = 1;
-    }
-    this.rateCache.set(key, { rate, ts: Date.now() });
-    return rate;
-  }
-
-  /** Rank paths by Σ log(edge spot rate); prunes zero-rate paths. */
-  private async rankPaths(paths: string[][]): Promise<string[][]> {
-    // lazily probe all needed edges with bounded concurrency
-    const pairs = new Set<string>();
-    for (const p of paths)
-      for (let i = 0; i < p.length - 1; i++) pairs.add(`${p[i]}|${p[i + 1]}`);
-    const list = [...pairs];
-    for (let i = 0; i < list.length; i += PROBE_CONCURRENCY) {
-      await Promise.all(
-        list.slice(i, i + PROBE_CONCURRENCY).map((k) => {
-          const [a, b] = k.split('|');
-          return this.spotRate(a, b);
-        })
-      );
-    }
-    const scored = await Promise.all(
-      paths.map(async (p) => {
-        let score = 0;
-        for (let i = 0; i < p.length - 1; i++) {
-          const r = await this.spotRate(p[i], p[i + 1]); // cached
-          if (r <= 0) return { p, score: -Infinity };
-          score += Math.log(r);
-        }
-        return { p, score };
-      })
-    );
+      return best;
+    };
+    const scored = paths.map((p) => {
+      let liq = 0;
+      for (let i = 0; i < p.length - 1; i++) {
+        const s = edgeScore(p[i], p[i + 1]);
+        if (s <= 0) return { p, hops: p.length, liq: -Infinity };
+        liq += Math.log(s + 1);
+      }
+      return { p, hops: p.length, liq };
+    });
     return scored
-      .filter((s) => s.score > -Infinity)
-      .sort((x, y) => y.score - x.score)
+      .filter((s) => s.liq > -Infinity)
+      .sort((x, y) => x.hops - y.hops || y.liq - x.liq)
       .slice(0, VERIFY_TOP)
       .map((s) => s.p);
   }
@@ -294,19 +243,25 @@ export class Pathfinder {
     let multi: PathResult | null = null;
     try {
       const candidates = this.candidatePaths(tokenIn, tokenOut);
-      if (candidates.length > 0 && Date.now() < deadline) {
-        const ranked = await this.rankPaths(candidates);
-        // Verify all finalists CONCURRENTLY — paths are independent, so
-        // wall-clock is the slowest path, not the sum of all of them.
+      if (candidates.length > 0) {
+        const ranked = this.rankPaths(candidates);
+        // Verify finalists CONCURRENTLY. The BEST-ranKED path always
+        // runs to completion; the budget only trims the alternatives —
+        // a slow RPC can narrow the search, never blind it.
         const quoted = await Promise.all(
-          ranked.map((p) =>
-            Date.now() < deadline
+          ranked.map((p, i) =>
+            i === 0 || Date.now() < deadline
               ? this.quotePath(p, amountIn, slippageBps).catch(() => null)
               : Promise.resolve(null)
           )
         );
         for (const q of quoted) {
           if (q && (!multi || q.netAmountOut > multi.netAmountOut)) multi = q;
+        }
+        if (!multi && ranked.length > 0) {
+          console.warn(
+            `[Pathfinder] ${ranked.length} ranked paths for ${tokenIn.slice(0, 6)}→${tokenOut.slice(0, 6)} all failed verification`
+          );
         }
       }
     } catch (err) {
