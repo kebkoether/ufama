@@ -168,6 +168,11 @@ export class TokenDiscoveryService {
     return map;
   }
 
+  /** All discovered Aqua pools (spam floor applied) — pathfinder graph. */
+  getAquaPools(): AquaPool[] {
+    return this.pools.filter((p) => p.txCount >= this.minTxCount);
+  }
+
   /**
    * Best Sushi pool per discovered pair (highest USD liquidity), for the
    * Sushi venue adapter's dynamic pair table.

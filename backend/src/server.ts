@@ -17,6 +17,7 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { Asset } from '@stellar/stellar-sdk';
 import { RoutingEngine } from './router/engine.js';
+import { Pathfinder, PathResult } from './router/pathfinder.js';
 import { createVenueRegistry } from './venues/index.js';
 import { StellarClient, scEnum } from './stellar/client.js';
 import { TOKENS, resolveToken, resolveSacAddress } from './stellar/tokens.js';
@@ -211,6 +212,8 @@ const registry = createVenueRegistry({
 console.log('');
 
 const routingEngine = new RoutingEngine(registry);
+// Multi-hop pathfinder (deferred init: needs decimalsForSac, defined below)
+let pathfinder: Pathfinder;
 
 // ─── Background Services ───────────────────────────────
 
@@ -221,6 +224,13 @@ const oracleService = new OraclePriceService({
   oracleSecretKey: process.env.ORACLE_SECRET_KEY,
 });
 oracleService.start();
+
+pathfinder = new Pathfinder(
+  tokenDiscovery,
+  routingEngine,
+  stellar,
+  (sac) => decimalsForSac(sac)
+);
 
 const timerSweep = new TimerSweepService({
   stellar,
@@ -316,57 +326,15 @@ function orderToJson(order: ChainOrder, extra: Record<string, unknown> = {}) {
   };
 }
 
-/**
- * Two-hop routing: when no venue trades a pair directly, try routing
- * through a hub (XLM, then USDC). Both legs are quoted executable-only,
- * and leg 2 is sized from leg 1's MINIMUM (slippage-protected) output —
- * the plan the build endpoint can actually execute as two transactions.
- * Any surplus from leg 1 beyond its minimum stays in the user's wallet
- * as hub-token change.
- */
-async function computeTwoHopRoute(
-  tokenIn: string,
-  tokenOut: string,
-  amountIn: bigint,
-  slippage: number
-) {
-  const hubs = [XLM_SAC, resolveSacAddress('USDC')].filter(Boolean) as string[];
-  let best: {
-    mid: string;
-    leg1: Awaited<ReturnType<typeof routingEngine.computeRoute>>;
-    leg1Min: bigint;
-    leg2: Awaited<ReturnType<typeof routingEngine.computeRoute>>;
-  } | null = null;
-  for (const mid of hubs) {
-    if (!mid || mid === tokenIn || mid === tokenOut) continue;
-    try {
-      const leg1 = await routingEngine.computeRoute(
-        tokenIn, mid, amountIn, slippage,
-        { executableOnly: true },
-        { in: decimalsForSac(tokenIn), out: decimalsForSac(mid) }
-      );
-      if (leg1.segments.length === 0 || leg1.netAmountOut <= 0n) continue;
-      const leg1Min = (leg1.netAmountOut * BigInt(10000 - slippage)) / 10000n;
-      if (leg1Min <= 0n) continue;
-      const leg2 = await routingEngine.computeRoute(
-        mid, tokenOut, leg1Min, slippage,
-        { executableOnly: true },
-        { in: decimalsForSac(mid), out: decimalsForSac(tokenOut) }
-      );
-      if (leg2.segments.length === 0 || leg2.netAmountOut <= 0n) continue;
-      if (!best || leg2.netAmountOut > best.leg2.netAmountOut) {
-        best = { mid, leg1, leg1Min, leg2 };
-      }
-    } catch {
-      continue;
-    }
-  }
-  return best;
-}
 
 /** Symbol for a SAC from the discovery universe ('' if unknown). */
 function symbolForSac(sac: string): string {
   return tokenDiscovery.getTokens().find((t) => t.sacAddress === sac)?.symbol ?? '';
+}
+
+/** Human-readable chain for a multi-hop path: "SolvBTC → XLM → USDC". */
+function pathLabel(path: string[]): string {
+  return path.map((sac) => symbolForSac(sac) || sac.slice(0, 4)).join(' → ');
 }
 
 /** Token decimals by SAC address from the discovery universe (default 7). */
@@ -610,47 +578,45 @@ app.get('/api/quote', async (req, res) => {
     const amountIn = parseAmount(req.query.amountIn, 'amountIn');
     const slippage = parseSlippageBps(req.query.slippage);
 
-    const route = await routingEngine.computeRoute(tokenIn, tokenOut, amountIn, slippage, {}, {
-      in: decimalsForSac(tokenIn),
-      out: decimalsForSac(tokenOut),
-    });
-    if (route.segments.length === 0 || route.netAmountOut <= 0n) {
-      // No direct market — try a two-hop through a hub (e.g. SolvBTC
-      // trades only against XLM; SolvBTC→USDC = SolvBTC→XLM→USDC).
-      const hop = await computeTwoHopRoute(tokenIn, tokenOut, amountIn, slippage);
-      if (!hop) {
-        res.status(404).json({
-          error: 'No route: no direct market and no two-hop path with liquidity',
-          noLiquidity: true,
-        });
-        return;
-      }
-      const viaSymbol = symbolForSac(hop.mid) || 'XLM';
-      const leg1Venue = hop.leg1.segments.map((s) => s.venueName).join('+');
-      const leg2Venue = hop.leg2.segments.map((s) => s.venueName).join('+');
+    // Best execution: the direct route COMPETES with multi-hop paths
+    // (up to 5 swaps across pools); highest net output wins.
+    const { direct, multi } = await pathfinder.bestRoute(tokenIn, tokenOut, amountIn, slippage);
+    const directOut = direct.segments.length > 0 ? direct.netAmountOut : 0n;
+    const multiOut = multi?.netAmountOut ?? 0n;
+
+    if (directOut <= 0n && multiOut <= 0n) {
+      res.status(404).json({
+        error: 'No route: no direct market and no multi-hop path with liquidity (up to 5 swaps searched)',
+        noLiquidity: true,
+      });
+      return;
+    }
+
+    if (multi && multiOut > directOut) {
+      const label = pathLabel(multi.path);
       res.json({
         tokenIn,
         tokenOut,
         amountIn: amountIn.toString(),
-        expectedOut: hop.leg2.netAmountOut.toString(),
-        netAmountOut: hop.leg2.netAmountOut.toString(),
+        expectedOut: multiOut.toString(),
+        netAmountOut: multiOut.toString(),
         protocolFee: '0',
         swapBookAmountOut: '0',
         blendedBps: 0,
-        priceImpactBps:
-          Math.max(0, hop.leg1.priceImpactBps ?? 0) +
-          Math.max(0, hop.leg2.priceImpactBps ?? 0),
-        twoHop: {
-          via: hop.mid,
-          viaSymbol,
-          note: `Routes ${leg1Venue} → ${viaSymbol} → ${leg2Venue} in two transactions; leftover ${viaSymbol} change (if any) stays in your wallet`,
+        priceImpactBps: multi.hops.reduce(
+          (s, h) => s + Math.max(0, h.route.priceImpactBps ?? 0), 0),
+        multiHop: {
+          path: multi.path,
+          label,
+          hops: multi.hops.length,
+          note: `Best rate routes ${label} (${multi.hops.length} transactions to sign; any surplus intermediate tokens stay in your wallet)`,
         },
         segments: [
           {
-            venue: `${leg1Venue} via ${viaSymbol}`,
-            venueId: hop.leg1.segments[0]?.venueId ?? 1,
+            venue: `multi-hop: ${label}`,
+            venueId: multi.hops[0].route.segments[0]?.venueId ?? 1,
             amountIn: amountIn.toString(),
-            expectedOut: hop.leg2.netAmountOut.toString(),
+            expectedOut: multiOut.toString(),
             effectiveBps: 0,
           },
         ],
@@ -658,6 +624,7 @@ app.get('/api/quote', async (req, res) => {
       });
       return;
     }
+    const route = direct;
 
     res.json({
       tokenIn: route.tokenIn,
@@ -876,61 +843,53 @@ app.post('/api/swap/build', async (req, res) => {
       return;
     }
 
-    if (!route || route.instructions.length === 0) {
-      // Two-hop fallback: two Router transactions through a hub token,
-      // returned in the blend shape the frontend already signs leg-by-leg.
-      const hop = await computeTwoHopRoute(tokenIn, tokenOut, amountIn, slippage);
-      if (!hop) {
-        throw new BadRequest('No executable venue liquidity for this pair (direct or two-hop)');
+    // Multi-hop competes with (or substitutes for) the direct route.
+    const directOut2 =
+      route && route.instructions.length > 0 ? route.netAmountOut : 0n;
+    const multiPlan = await pathfinder.bestRoute(tokenIn, tokenOut, amountIn, slippage);
+    const multi = multiPlan.multi;
+    if ((!route || route.instructions.length === 0 || (multi && multi.netAmountOut > directOut2)) ) {
+      if (!multi) {
+        throw new BadRequest('No executable venue liquidity for this pair (direct or multi-hop, up to 5 swaps searched)');
       }
-      const leg2Min = (hop.leg2.netAmountOut * BigInt(10000 - slippage)) / 10000n;
-      if (hop.leg1Min <= 0n || leg2Min <= 0n) {
-        throw new BadRequest('Two-hop route output too small');
-      }
-      const buildLeg = (
-        tin: string,
-        tout: string,
-        amt: bigint,
-        minOut: bigint,
-        leg: Awaited<ReturnType<typeof routingEngine.computeRoute>>
-      ) =>
+      const buildLeg = (h: PathResult['hops'][number]) =>
         stellar.buildTransaction(sourceAddress, config.routerContractId, 'execute_route', [
           StellarClient.toAddress(sourceAddress),
-          StellarClient.toAddress(tin),
-          StellarClient.toAddress(tout),
-          StellarClient.toI128(amt),
-          StellarClient.toI128(minOut),
+          StellarClient.toAddress(h.tokenIn),
+          StellarClient.toAddress(h.tokenOut),
+          StellarClient.toI128(h.amountIn),
+          StellarClient.toI128(h.minOut),
           StellarClient.toRouteSegments(
-            leg.instructions.map((i) => ({
+            h.route.instructions.map((i) => ({
               venueId: i.venueId,
               amountIn: i.amountIn,
               minAmountOut: i.minAmountOut,
             }))
           ),
         ]);
-      const viaSymbol = symbolForSac(hop.mid) || 'hub';
-      const [xdr1, xdr2] = await Promise.all([
-        buildLeg(tokenIn, hop.mid, amountIn, hop.leg1Min, hop.leg1),
-        buildLeg(hop.mid, tokenOut, hop.leg1Min, leg2Min, hop.leg2),
-      ]);
+      const xdrs = await Promise.all(multi.hops.map(buildLeg));
+      const label = pathLabel(multi.path);
+      const lastHop = multi.hops[multi.hops.length - 1];
       res.json({
         kind: 'blend', // frontend signs legs sequentially, each min-out protected
-        twoHop: { via: hop.mid, viaSymbol },
-        legs: [
-          { kind: 'soroban', xdr: xdr1, amountIn: amountIn.toString(), expectedOut: hop.leg1.netAmountOut.toString() },
-          { kind: 'soroban', xdr: xdr2, amountIn: hop.leg1Min.toString(), expectedOut: hop.leg2.netAmountOut.toString() },
-        ],
+        multiHop: { path: multi.path, label, hops: multi.hops.length },
+        legs: multi.hops.map((h, i) => ({
+          kind: 'soroban',
+          xdr: xdrs[i],
+          amountIn: h.amountIn.toString(),
+          expectedOut: h.route.netAmountOut.toString(),
+        })),
         route: {
           totalAmountIn: amountIn.toString(),
-          netAmountOut: hop.leg2.netAmountOut.toString(),
-          minTotalOut: leg2Min.toString(),
+          netAmountOut: multi.netAmountOut.toString(),
+          minTotalOut: lastHop.minOut.toString(),
           blendedBps: 0,
           segments: [
             {
-              venue: `two-hop via ${viaSymbol}`,
-              venueId: hop.leg1.segments[0]?.venueId ?? 1,
+              venue: `multi-hop: ${label}`,
+              venueId: multi.hops[0].route.segments[0]?.venueId ?? 1,
               amountIn: amountIn.toString(),
-              expectedOut: hop.leg2.netAmountOut.toString(),
+              expectedOut: multi.netAmountOut.toString(),
             },
           ],
         },
