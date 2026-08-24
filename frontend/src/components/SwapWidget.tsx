@@ -149,16 +149,38 @@ function TokenDropdown({
   // must put deJAAA on top, not below whatever has more volume. Without
   // a query the list keeps its volume-sorted (hot first) order.
   const q = query.trim().toLowerCase();
+  // Bounded edit distance for typo tolerance ("solvebtc" → SolvBTC).
+  const editDistLe = (a: string, b: string, max: number): boolean => {
+    if (Math.abs(a.length - b.length) > max) return false;
+    let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+      const cur = [i];
+      let rowMin = i;
+      for (let j = 1; j <= b.length; j++) {
+        cur[j] = Math.min(
+          prev[j] + 1,
+          cur[j - 1] + 1,
+          prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+        );
+        rowMin = Math.min(rowMin, cur[j]);
+      }
+      if (rowMin > max) return false;
+      prev = cur;
+    }
+    return prev[b.length] <= max;
+  };
   const matchRank = (t: Token): number => {
     const sym = t.symbol.toLowerCase();
     if (sym === q) return 0;
     if (sym.startsWith(q)) return 1;
     if (sym.includes(q)) return 2;
     if (t.name.toLowerCase().includes(q)) return 3;
-    return 4;
+    // fuzzy: 1 typo for short queries, 2 for longer ones
+    if (q.length >= 3 && editDistLe(sym, q, q.length >= 6 ? 2 : 1)) return 4;
+    return 5;
   };
   const available = tokens
-    .filter((t) => t.symbol !== exclude && (!q || matchRank(t) < 4))
+    .filter((t) => t.symbol !== exclude && (!q || matchRank(t) < 5))
     .sort((a, b) => (q ? matchRank(a) - matchRank(b) : 0));
 
   return (
