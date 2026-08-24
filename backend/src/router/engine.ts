@@ -81,7 +81,10 @@ interface Tranche {
   expectedOut: bigint;
 }
 
-const FEE_NUMERATOR = 5n;
+// Protocol fee per 100k of output — MUST mirror the deployed Router's
+// get_fee (v1.1 defaults to ZERO; instant swaps are venue-fees-only).
+// If set_fee is ever used on-chain, update ROUTER_FEE_PER_100K to match.
+const FEE_NUMERATOR = BigInt(process.env.ROUTER_FEE_PER_100K ?? '0');
 const FEE_DENOMINATOR = 100_000n;
 
 export class RoutingEngine {
@@ -99,12 +102,15 @@ export class RoutingEngine {
    *   route_expired_order segments). Quote-only callers may include all
    *   venues for display.
    */
+  /** Optional token decimals (default 7/7) — only the informational
+   *  bps fields need them; amounts are raw base units throughout. */
   async computeRoute(
     tokenIn: string,
     tokenOut: string,
     amountIn: bigint,
     slippageBps: number = 50, // default 0.5% slippage tolerance
-    opts: { executableOnly?: boolean; includeClassicDex?: boolean } = {}
+    opts: { executableOnly?: boolean; includeClassicDex?: boolean } = {},
+    decimals: { in: number; out: number } = { in: 7, out: 7 },
   ): Promise<Route> {
     // 1. Get all available venues
     let venues = await this.registry.getAvailable();
@@ -141,7 +147,7 @@ export class RoutingEngine {
     );
 
     // 3. Greedy allocation: fill from cheapest marginal price
-    const segments = this.greedyAllocate(profiles, amountIn);
+    const segments = this.greedyAllocate(profiles, amountIn, decimals);
 
     // 4. Build route
     const totalExpectedOut = segments.reduce(
@@ -161,9 +167,15 @@ export class RoutingEngine {
         : 0n;
     const netAmountOut = totalExpectedOut - protocolFee;
 
+    // Normalize the input to out-token decimals so the bps comparison is
+    // unit-safe on mixed-decimal pairs (USDC 7dp vs deJAAA 18dp).
+    const inScaled =
+      decimals.out >= decimals.in
+        ? amountIn * 10n ** BigInt(decimals.out - decimals.in)
+        : amountIn / 10n ** BigInt(decimals.in - decimals.out);
     const blendedBps =
-      amountIn > 0n
-        ? Number(((amountIn - netAmountOut) * 10000n) / amountIn)
+      inScaled > 0n
+        ? Number(((inScaled - netAmountOut) * 10000n) / inScaled)
         : 0;
 
     // True price impact: execution rate vs the best small-size rate any
@@ -264,8 +276,9 @@ export class RoutingEngine {
    */
   private greedyAllocate(
     profiles: VenueDepthProfile[],
-    totalAmount: bigint
-  ): RouteSegment[] {
+    totalAmount: bigint,
+    decimals: { in: number; out: number },
+  ) {
     // Flatten all tranches and sort by marginal bps (cheapest first)
     const allTranches = profiles.flatMap((p) => p.tranches);
     allTranches.sort((a, b) => a.marginalBps - b.marginalBps);
@@ -334,12 +347,13 @@ export class RoutingEngine {
 
     // Convert to RouteSegments
     return [...venueAllocations.entries()].map(([venueId, alloc]) => {
+      const segInScaled =
+        decimals.out >= decimals.in
+          ? alloc.amountIn * 10n ** BigInt(decimals.out - decimals.in)
+          : alloc.amountIn / 10n ** BigInt(decimals.in - decimals.out);
       const effectiveBps =
-        alloc.amountIn > 0n
-          ? Number(
-              ((alloc.amountIn - alloc.expectedOut) * 10000n) /
-                alloc.amountIn
-            )
+        segInScaled > 0n
+          ? Number(((segInScaled - alloc.expectedOut) * 10000n) / segInScaled)
           : 0;
 
       return {
