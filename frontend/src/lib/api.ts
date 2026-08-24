@@ -49,13 +49,15 @@ export async function getQuote(
   tokenIn: string,
   tokenOut: string,
   amountIn: string,
-  slippage?: number
+  slippage?: number,
+  opts?: { fast?: boolean }
 ): Promise<QuoteResponse> {
   const params = new URLSearchParams({
     tokenIn,
     tokenOut,
     amountIn,
     ...(slippage && { slippage: slippage.toString() }),
+    ...(opts?.fast && { fast: '1' }),
   });
 
   const response = await fetch(`${API_BASE}/api/quote?${params}`);

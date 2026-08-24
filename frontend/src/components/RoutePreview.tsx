@@ -179,13 +179,15 @@ function MultiHopFlow({
       style={{
         display: 'flex',
         alignItems: 'center',
-        overflowX: 'auto',
+        flexWrap: 'wrap', // long chains wrap to the next line, never scroll
+        rowGap: '10px',
         padding: '6px 2px 10px',
       }}
     >
       <TokenNode symbol={hops[0].fromSymbol} />
       {hops.map((h, i) => (
-        <span key={i} style={{ display: 'contents' }}>
+        // arrow + destination wrap TOGETHER, so a line never ends mid-arrow
+        <span key={i} style={{ display: 'flex', alignItems: 'center', flexShrink: 0 }}>
           <HopArrow venues={h.venues} />
           <TokenNode symbol={h.toSymbol} />
         </span>
