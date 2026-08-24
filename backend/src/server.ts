@@ -608,8 +608,21 @@ app.get('/api/quote', async (req, res) => {
         multiHop: {
           path: multi.path,
           label,
-          hops: multi.hops.length,
+          hopCount: multi.hops.length,
           note: `Best rate routes ${label} (${multi.hops.length} transactions to sign; any surplus intermediate tokens stay in your wallet)`,
+          // Per-hop venue splits — everything the route diagram needs,
+          // all already computed (zero extra latency)
+          hops: multi.hops.map((h) => ({
+            fromSymbol: symbolForSac(h.tokenIn) || h.tokenIn.slice(0, 4),
+            toSymbol: symbolForSac(h.tokenOut) || h.tokenOut.slice(0, 4),
+            venues: h.route.segments.map((s) => ({
+              venue: s.venueName,
+              pct:
+                h.amountIn > 0n
+                  ? Number((s.amountIn * 100n) / h.amountIn)
+                  : 100,
+            })),
+          })),
         },
         segments: [
           {
