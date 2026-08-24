@@ -2,8 +2,13 @@
  * Aqua AMM venue adapter.
  *
  * Integrates with the Aquarius DEX on Stellar (Soroban-native AMM).
- * Uses the Aqua REST API for quotes (faster than on-chain simulation)
- * and falls back to on-chain simulation if the API is unavailable.
+ * Quotes by simulating estimate_swap DIRECTLY on pools from the
+ * discovery sweep — works for EVERY discovered pair, no registration.
+ * (Aqua's REST estimate endpoint 404s — it never existed; the old
+ * REST-first path silently zeroed every non-registered pair.) Falls
+ * back to the on-chain adapter's registered pool when discovery has
+ * nothing. NOTE: on-chain EXECUTION still requires the pair registered
+ * on the adapter contract (scripts/register-aqua-pools.sh).
  *
  * Mainnet Router: CBQDHNBFBZYE4MKPWBSJOPIYLW4SFSXAXUTSXJN76GNKYVYPCKWC6QUK
  * Testnet Router: CDGX6Q3ZZIDSX2N3SHBORWUIEG2ZZEBAAMYARAXTT7M5L6IXKNJMT3GB
@@ -12,6 +17,14 @@
 
 import { VenueAdapter, Quote, DepthQuote, SwapInstruction } from './adapter.js';
 import { StellarClient } from '../stellar/client.js';
+
+export interface DiscoveredAquaPool {
+  poolAddress: string;
+  tokenAddresses: string[];
+  txCount: number;
+  totalVolume: number;
+}
+export type AquaPoolsProvider = (sacA: string, sacB: string) => DiscoveredAquaPool[];
 
 export class AquaAdapter implements VenueAdapter {
   readonly name = 'Aqua';
@@ -22,7 +35,8 @@ export class AquaAdapter implements VenueAdapter {
   constructor(
     private adapterContractId: string,
     private aquaApiUrl: string,
-    stellar: StellarClient
+    stellar: StellarClient,
+    private poolsProvider?: AquaPoolsProvider
   ) {
     this.stellar = stellar;
   }
@@ -98,18 +112,36 @@ export class AquaAdapter implements VenueAdapter {
   }
 
   /**
-   * Fetch a swap quote — tries REST API first, falls back to on-chain sim.
+   * Fetch a swap quote: simulate estimate_swap on the best discovered
+   * pool for the pair (highest lifetime volume first, next pool as
+   * fallback), then the adapter's registered pool as a last resort.
    */
   private async fetchQuote(
     tokenIn: string,
     tokenOut: string,
     amountIn: bigint
   ): Promise<bigint> {
-    // Try REST API first (faster)
-    const apiResult = await this.fetchApiQuote(tokenIn, tokenOut, amountIn);
-    if (apiResult > 0n) return apiResult;
+    const pools = (this.poolsProvider?.(tokenIn, tokenOut) ?? [])
+      .filter((p) => p.tokenAddresses.length >= 2)
+      .sort((a, b) => (b.totalVolume || 0) - (a.totalVolume || 0))
+      .slice(0, 2);
+    for (const pool of pools) {
+      const inIdx = pool.tokenAddresses.indexOf(tokenIn);
+      const outIdx = pool.tokenAddresses.indexOf(tokenOut);
+      if (inIdx < 0 || outIdx < 0) continue;
+      const est = await this.stellar.simulateAndParse<bigint>(
+        pool.poolAddress,
+        'estimate_swap',
+        [
+          StellarClient.toU32(inIdx),
+          StellarClient.toU32(outIdx),
+          StellarClient.toU128(amountIn),
+        ]
+      );
+      if (est && BigInt(est) > 0n) return BigInt(est);
+    }
 
-    // Fallback: simulate on-chain via our adapter contract
+    // Last resort: the adapter contract's registered pool
     const onChainResult = await this.stellar.simulateAndParse<bigint>(
       this.adapterContractId,
       'quote',
@@ -119,32 +151,7 @@ export class AquaAdapter implements VenueAdapter {
         StellarClient.toI128(amountIn),
       ]
     );
-
-    return onChainResult ?? 0n;
+    return onChainResult ? BigInt(onChainResult) : 0n;
   }
 
-  private async fetchApiQuote(
-    tokenIn: string,
-    tokenOut: string,
-    amountIn: bigint
-  ): Promise<bigint> {
-    try {
-      const response = await fetch(
-        `${this.aquaApiUrl}/estimate-swap?` +
-          new URLSearchParams({
-            token_in: tokenIn,
-            token_out: tokenOut,
-            amount_in: amountIn.toString(),
-          }),
-        { signal: AbortSignal.timeout(3000) }
-      );
-
-      if (!response.ok) return 0n;
-
-      const data = (await response.json()) as { estimated_out?: string };
-      return data.estimated_out ? BigInt(data.estimated_out) : 0n;
-    } catch {
-      return 0n;
-    }
-  }
 }

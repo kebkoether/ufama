@@ -254,6 +254,10 @@ export class StellarClient {
     return nativeToScVal(value, { type: 'u64' });
   }
 
+  static toU128(value: bigint): xdr.ScVal {
+    return nativeToScVal(value, { type: 'u128' });
+  }
+
   /**
    * Encode Vec<RouteSegment> for the Router contract.
    * Struct fields encode as an ScMap with keys in lexicographic order:

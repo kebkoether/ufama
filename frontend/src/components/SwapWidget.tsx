@@ -440,6 +440,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
   // hot-first: sorted by venue volume so the tokens people actually trade sit
   // at the top of the dropdown. Falls back to the curated list offline.
   const [allTokens, setAllTokens] = useState<Token[]>(TOKENS);
+  const [quoteNote, setQuoteNote] = useState<string>('');
 
   // Decimal-aware conversions — Sushi-discovered Soroban tokens (deJTRSY,
   // deJAAA, ...) are 18 decimals, not the SAC-standard 7.
@@ -599,6 +600,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
       debounceRef.current = setTimeout(async () => {
         try {
           setLoading(true);
+          setQuoteNote('');
           const baseAmount = toBaseUnits(amount, decimalsOf(tIn));
           const data = await fetchQuote(tokenParam(tIn), tokenParam(tOut), baseAmount);
           setQuote(data);
@@ -610,8 +612,14 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
             tokenInDecimals: decimalsOf(tIn),
             tokenOutDecimals: decimalsOf(tOut),
           });
-        } catch (error) {
+        } catch (error: any) {
           console.error('Quote error:', error);
+          setQuote(null);
+          setQuoteNote(
+            String(error?.message ?? '').includes('No route')
+              ? 'No route — no venue has enough liquidity for this pair at this size.'
+              : 'Quote unavailable — try again in a moment.'
+          );
         } finally {
           setLoading(false);
         }
@@ -1260,6 +1268,20 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
                 </div>
               </div>
             )}
+          </div>
+        )}
+
+        {quoteNote && (
+          <div style={{
+            marginTop: '10px',
+            padding: '10px 12px',
+            borderRadius: '10px',
+            background: 'rgba(234, 179, 8, 0.08)',
+            border: '1px solid rgba(234, 179, 8, 0.25)',
+            color: '#eab308',
+            fontSize: '13px',
+          }}>
+            {quoteNote}
           </div>
         )}
 

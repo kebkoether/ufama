@@ -60,7 +60,13 @@ export async function getQuote(
 
   const response = await fetch(`${API_BASE}/api/quote?${params}`);
   if (!response.ok) {
-    throw new Error(`Quote failed: ${response.statusText}`);
+    // Surface the server's reason (e.g. no venue liquidity) to the UI
+    let detail = response.statusText;
+    try {
+      const body = await response.json();
+      if (body?.error) detail = body.error;
+    } catch {}
+    throw new Error(detail);
   }
   return response.json();
 }
