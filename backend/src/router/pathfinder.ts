@@ -64,9 +64,17 @@ export interface PathResult {
   netAmountOut: bigint;
 }
 
+const RESULT_TTL_MS = 15_000;
+
 export class Pathfinder {
   /** "pool|dir" -> { rate: out-per-in scaled 1e9, ts } */
   private rateCache = new Map<string, { rate: number; ts: number }>();
+  /** short-lived full-result memo — repeat keystrokes and the follow-up
+   *  build call reuse the same search instead of re-running it */
+  private resultCache = new Map<
+    string,
+    { ts: number; val: { direct: any; multi: PathResult | null } }
+  >();
 
   constructor(
     private discovery: TokenDiscoveryService,
@@ -265,6 +273,10 @@ export class Pathfinder {
     direct: Awaited<ReturnType<RoutingEngine['computeRoute']>>;
     multi: PathResult | null;
   }> {
+    const cacheKey = `${tokenIn}|${tokenOut}|${amountIn}|${slippageBps}`;
+    const hit = this.resultCache.get(cacheKey);
+    if (hit && Date.now() - hit.ts < RESULT_TTL_MS) return hit.val;
+
     const deadline = Date.now() + SEARCH_BUDGET_MS;
     const direct = await this.engine.computeRoute(
       tokenIn, tokenOut, amountIn, slippageBps,
@@ -277,15 +289,30 @@ export class Pathfinder {
       const candidates = this.candidatePaths(tokenIn, tokenOut);
       if (candidates.length > 0 && Date.now() < deadline) {
         const ranked = await this.rankPaths(candidates);
-        for (const p of ranked) {
-          if (Date.now() >= deadline) break;
-          const q = await this.quotePath(p, amountIn, slippageBps);
+        // Verify all finalists CONCURRENTLY — paths are independent, so
+        // wall-clock is the slowest path, not the sum of all of them.
+        const quoted = await Promise.all(
+          ranked.map((p) =>
+            Date.now() < deadline
+              ? this.quotePath(p, amountIn, slippageBps).catch(() => null)
+              : Promise.resolve(null)
+          )
+        );
+        for (const q of quoted) {
           if (q && (!multi || q.netAmountOut > multi.netAmountOut)) multi = q;
         }
       }
     } catch (err) {
       console.warn('[Pathfinder] search failed, direct-only:', err);
     }
-    return { direct, multi };
+    const val = { direct, multi };
+    this.resultCache.set(cacheKey, { ts: Date.now(), val });
+    if (this.resultCache.size > 500) {
+      // drop expired entries opportunistically
+      for (const [k, v] of this.resultCache) {
+        if (Date.now() - v.ts >= RESULT_TTL_MS) this.resultCache.delete(k);
+      }
+    }
+    return val;
   }
 }

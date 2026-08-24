@@ -578,9 +578,22 @@ app.get('/api/quote', async (req, res) => {
     const amountIn = parseAmount(req.query.amountIn, 'amountIn');
     const slippage = parseSlippageBps(req.query.slippage);
 
+    // fast=1: stage-1 answer for the UI — direct route only, returns in
+    // one engine pass while the full best-route search runs in a second
+    // request. The pathfinder's result cache makes the follow-up cheap.
+    const fastOnly = req.query.fast === '1';
+
     // Best execution: the direct route COMPETES with multi-hop paths
     // (up to 5 swaps across pools); highest net output wins.
-    const { direct, multi } = await pathfinder.bestRoute(tokenIn, tokenOut, amountIn, slippage);
+    const { direct, multi } = fastOnly
+      ? {
+          direct: await routingEngine.computeRoute(tokenIn, tokenOut, amountIn, slippage, { executableOnly: true }, {
+            in: decimalsForSac(tokenIn),
+            out: decimalsForSac(tokenOut),
+          }),
+          multi: null,
+        }
+      : await pathfinder.bestRoute(tokenIn, tokenOut, amountIn, slippage);
     const directOut = direct.segments.length > 0 ? direct.netAmountOut : 0n;
     const multiOut = multi?.netAmountOut ?? 0n;
 

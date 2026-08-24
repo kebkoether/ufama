@@ -463,6 +463,9 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
   // at the top of the dropdown. Falls back to the curated list offline.
   const [allTokens, setAllTokens] = useState<Token[]>(TOKENS);
   const [quoteNote, setQuoteNote] = useState<string>('');
+  // Best-route search still running (stage-2) — drives the pulse UI
+  const [searching, setSearching] = useState(false);
+  const quoteSeq = useRef(0);
 
   // Decimal-aware conversions — Sushi-discovered Soroban tokens (deJTRSY,
   // deJAAA, ...) are 18 decimals, not the SAC-standard 7.
@@ -620,11 +623,8 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         return;
       }
       debounceRef.current = setTimeout(async () => {
-        try {
-          setLoading(true);
-          setQuoteNote('');
-          const baseAmount = toBaseUnits(amount, decimalsOf(tIn));
-          const data = await fetchQuote(tokenParam(tIn), tokenParam(tOut), baseAmount);
+        const seq = ++quoteSeq.current;
+        const publish = (data: any) => {
           setQuote(data);
           // Symbols ride along so RoutePreview can label amounts correctly
           onRouteComputed({
@@ -634,7 +634,26 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
             tokenInDecimals: decimalsOf(tIn),
             tokenOutDecimals: decimalsOf(tOut),
           });
+        };
+        try {
+          setLoading(true);
+          setSearching(true);
+          setQuoteNote('');
+          const baseAmount = toBaseUnits(amount, decimalsOf(tIn));
+          let gotFull = false;
+          // Stage 1: direct route — on screen in one engine pass.
+          fetchQuote(tokenParam(tIn), tokenParam(tOut), baseAmount, undefined, { fast: true })
+            .then((d) => {
+              if (seq === quoteSeq.current && !gotFull) publish(d);
+            })
+            .catch(() => {}); // fast stage failing is fine; stage 2 decides
+          // Stage 2: full best-route search (direct vs multi-hop).
+          const data = await fetchQuote(tokenParam(tIn), tokenParam(tOut), baseAmount);
+          gotFull = true;
+          if (seq !== quoteSeq.current) return;
+          publish(data);
         } catch (error: any) {
+          if (seq !== quoteSeq.current) return;
           console.error('Quote error:', error);
           setQuote(null);
           setQuoteNote(
@@ -643,7 +662,10 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
               : 'Quote unavailable — try again in a moment.'
           );
         } finally {
-          setLoading(false);
+          if (seq === quoteSeq.current) {
+            setLoading(false);
+            setSearching(false);
+          }
         }
       }, 400); // 400ms debounce
     },
@@ -941,7 +963,9 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           label={mode === 'instant' ? 'Buying' : 'Buying (estimated)'}
           sublabel={loading ? 'Fetching...' : balanceLabel(tokenOut)}
           value={
-            (mode === 'instant' || mode === 'twap') && quote
+            (mode === 'instant' || mode === 'twap') && !quote && loading
+              ? '…'
+              : (mode === 'instant' || mode === 'twap') && quote
               ? `${mode === 'twap' ? '~' : ''}${formatOutput(quote.netAmountOut)}`
               : mode === 'p2p' && amountIn && parseFloat(amountIn) > 0
               ? p2pPlan
@@ -1290,6 +1314,33 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
                 </div>
               </div>
             )}
+          </div>
+        )}
+
+        {searching && mode === 'instant' && (
+          <div
+            style={{
+              marginTop: '10px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              fontSize: '12px',
+              color: '#8a8f9c',
+            }}
+          >
+            <span
+              style={{
+                width: '10px',
+                height: '10px',
+                borderRadius: '50%',
+                border: '2px solid #6366f1',
+                borderTopColor: 'transparent',
+                display: 'inline-block',
+                animation: 'ufamaSpin 0.7s linear infinite',
+              }}
+            />
+            Searching every pool for the best route…
+            <style>{`@keyframes ufamaSpin { to { transform: rotate(360deg); } }`}</style>
           </div>
         )}
 
