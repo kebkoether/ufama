@@ -206,6 +206,7 @@ const registry = createVenueRegistry({
   rpcUrl: config.rpcUrl,
   networkPassphrase: config.networkPassphrase,
   sushiPairsProvider: () => tokenDiscovery.getSushiPairs(),
+  aquaPoolsProvider: (a, b) => tokenDiscovery.getPoolsForPair(a, b),
 });
 console.log('');
 
@@ -560,6 +561,13 @@ app.get('/api/quote', async (req, res) => {
       in: decimalsForSac(tokenIn),
       out: decimalsForSac(tokenOut),
     });
+    if (route.segments.length === 0 || route.netAmountOut <= 0n) {
+      res.status(404).json({
+        error: 'No route: no venue has liquidity for this pair at this size',
+        noLiquidity: true,
+      });
+      return;
+    }
 
     res.json({
       tokenIn: route.tokenIn,

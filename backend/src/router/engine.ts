@@ -345,6 +345,13 @@ export class RoutingEngine {
       // Expected out for overflow is approximate
     }
 
+    // A venue that pays nothing is not a route — drop zero-output
+    // allocations entirely (previously a quoteless pair "routed" 100%
+    // through SwapBook at expectedOut 0).
+    for (const [venueId, alloc] of [...venueAllocations.entries()]) {
+      if (alloc.expectedOut <= 0n) venueAllocations.delete(venueId);
+    }
+
     // Convert to RouteSegments
     return [...venueAllocations.entries()].map(([venueId, alloc]) => {
       const segInScaled =
