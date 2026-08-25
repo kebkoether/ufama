@@ -145,6 +145,9 @@ function TokenDropdown({
     if (!open) setQuery('');
   }, [open]);
 
+  // brief ✓ feedback after copying a contract address
+  const [copiedKey, setCopiedKey] = useState('');
+
   const selectedToken = tokens.find((t) => t.symbol === selected) || tokens[0];
   // Exclude the token on the other side; filter by search query.
   // With a query, MATCH QUALITY ranks first (exact symbol, then symbol
@@ -311,6 +314,34 @@ function TokenDropdown({
                   </div>
                   <div style={{ fontSize: '12px', color: isComingSoon ? '#3a3f4c' : '#8a8f9c' }}>{token.name}</div>
                 </div>
+                {token.sacAddress && (
+                  // span, not button — rows are <button>s and nesting
+                  // buttons is invalid HTML
+                  <span
+                    role="button"
+                    title={copiedKey === token.sacAddress ? 'Copied!' : `Copy contract address\n${token.sacAddress}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      navigator.clipboard?.writeText(token.sacAddress!).then(() => {
+                        setCopiedKey(token.sacAddress!);
+                        setTimeout(() => setCopiedKey(''), 1200);
+                      });
+                    }}
+                    style={{
+                      fontSize: '12px',
+                      padding: '3px 6px',
+                      borderRadius: '5px',
+                      color: copiedKey === token.sacAddress ? '#22c55e' : '#565b68',
+                      background: 'transparent',
+                      cursor: 'pointer',
+                      userSelect: 'none',
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.color = '#8a8f9c'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.color = copiedKey === token.sacAddress ? '#22c55e' : '#565b68'; }}
+                  >
+                    {copiedKey === token.sacAddress ? '✓' : '⧉'}
+                  </span>
+                )}
                 {isComingSoon && (
                   <span style={{
                     fontSize: '10px',

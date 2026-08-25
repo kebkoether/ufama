@@ -24,6 +24,7 @@ import { TOKENS, resolveToken, resolveSacAddress } from './stellar/tokens.js';
 import { OraclePriceService } from './services/oracle.js';
 import { TimerSweepService } from './services/timer-sweep.js';
 import { assertNotBlocked, isBlocked, BlockedAddressError } from './services/screening.js';
+import { Sep1Verifier } from './services/sep1-verify.js';
 import { TokenDiscoveryService } from './services/token-discovery.js';
 import { TwapKeeperService } from './services/twap-keeper.js';
 
@@ -231,6 +232,22 @@ pathfinder = new Pathfinder(
   stellar,
   (sac) => decimalsForSac(sac)
 );
+
+// SEP-1 issuer-domain handshake: earns the green verified badge for
+// venue-discovered classic assets automatically. First sweep runs after
+// discovery has populated (90s), then every 6h; verdicts cached 24h.
+const sep1 = new Sep1Verifier(config.horizonUrl);
+const runSep1Sweep = async () => {
+  const targets = tokenDiscovery
+    .getTokens()
+    .filter((t) => t.issuer && !t.homeDomain)
+    .map((t) => ({ symbol: t.symbol, issuer: t.issuer }));
+  if (targets.length === 0) return;
+  const n = await sep1.sweep(targets);
+  console.log(`[SEP1] swept ${targets.length} issuers, ${n} verified domains`);
+};
+setTimeout(() => runSep1Sweep().catch(() => {}), 90_000);
+setInterval(() => runSep1Sweep().catch(() => {}), 6 * 60 * 60 * 1000);
 
 const timerSweep = new TimerSweepService({
   stellar,
@@ -553,10 +570,17 @@ app.get('/api/assets', (_req, res) => {
     }
   }
   res.json({
-    assets: tokenDiscovery.getTokens().map((t) => ({
-      ...t,
-      twapEligible: eligibleSacs.has(t.sacAddress),
-    })),
+    assets: tokenDiscovery.getTokens().map((t) => {
+      // SEP-1 handshake result: a discovered token whose issuer's own
+      // domain vouches for it earns the verified badge automatically
+      const earned =
+        !t.homeDomain && t.issuer ? sep1.getDomain(t.symbol, t.issuer) : null;
+      return {
+        ...t,
+        ...(earned ? { homeDomain: earned, verified: true } : {}),
+        twapEligible: eligibleSacs.has(t.sacAddress),
+      };
+    }),
     discovery: tokenDiscovery.getStatus(),
     p2pAllowed: P2P_ALLOWED_TOKENS,
   });

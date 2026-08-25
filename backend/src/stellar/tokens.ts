@@ -53,7 +53,11 @@ export const TOKENS: Record<string, TokenConfig> = {
   USDC: {
     symbol: 'USDC',
     name: 'USD Coin (Circle)',
-    homeDomain: 'centre.io',
+    // Issuer's on-chain home_domain claim. NOTE: Circle no longer hosts
+    // a stellar.toml (the historic one was centre.io, dissolved), so the
+    // automated SEP-1 handshake fails for the most legitimate asset on
+    // the network — this curated entry is a hand attestation instead.
+    homeDomain: 'circle.com',
     issuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
     sacAddress: '', // Run: stellar contract id asset --asset USDC:GA5ZSE... --network mainnet
     decimals: 7,
