@@ -68,6 +68,9 @@ const config = {
    * and updating SWAPBOOK_CONTRACT_ID.
    */
   swapbookV11: ['1', 'true'].includes((process.env.SWAPBOOK_V11 ?? '').toLowerCase()),
+  /** v1.2 Router deployed: multi-hop executes as ONE atomic execute_path
+   *  transaction instead of a signed-per-leg blend plan. */
+  routerV12: ['1', 'true'].includes((process.env.ROUTER_V12 ?? '').toLowerCase()),
 };
 
 /**
@@ -917,9 +920,67 @@ app.post('/api/swap/build', async (req, res) => {
             }))
           ),
         ]);
-      const xdrs = await Promise.all(multi.hops.map(buildLeg));
       const label = pathLabel(multi.path);
       const lastHop = multi.hops[multi.hops.length - 1];
+      if (config.routerV12) {
+        // v1.2: the WHOLE path in one atomic transaction — one signature,
+        // all-or-nothing, real outputs flow hop to hop on-chain.
+        const finalMin = (multi.netAmountOut * BigInt(10000 - slippage)) / 10000n;
+        const pathXdr = await stellar.buildTransaction(
+          sourceAddress,
+          config.routerContractId,
+          'execute_path',
+          [
+            StellarClient.toAddress(sourceAddress),
+            StellarClient.toAddress(tokenIn),
+            StellarClient.toI128(amountIn),
+            StellarClient.toI128(finalMin > 0n ? finalMin : 1n),
+            StellarClient.toPathHops(
+              multi.hops.map((h) => {
+                const hopTotal = h.route.instructions.reduce(
+                  (s, i) => s + i.amountIn,
+                  0n
+                );
+                let assigned = 0;
+                return {
+                  tokenOut: h.tokenOut,
+                  legs: h.route.instructions.map((i, idx) => {
+                    // weights in bps of the hop input; last leg absorbs
+                    // rounding so they always sum to exactly 10,000
+                    const isLast = idx === h.route.instructions.length - 1;
+                    const w = isLast
+                      ? 10_000 - assigned
+                      : Number((i.amountIn * 10_000n) / (hopTotal > 0n ? hopTotal : 1n));
+                    assigned += w;
+                    return { venueId: i.venueId, weightBps: w, minAmountOut: 0n };
+                  }),
+                };
+              })
+            ),
+          ]
+        );
+        res.json({
+          xdr: pathXdr,
+          kind: 'soroban',
+          multiHop: { path: multi.path, label, hops: multi.hops.length, atomic: true },
+          route: {
+            totalAmountIn: amountIn.toString(),
+            netAmountOut: multi.netAmountOut.toString(),
+            minTotalOut: finalMin.toString(),
+            blendedBps: 0,
+            segments: [
+              {
+                venue: `atomic path: ${label}`,
+                venueId: multi.hops[0].route.segments[0]?.venueId ?? 1,
+                amountIn: amountIn.toString(),
+                expectedOut: multi.netAmountOut.toString(),
+              },
+            ],
+          },
+        });
+        return;
+      }
+      const xdrs = await Promise.all(multi.hops.map(buildLeg));
       res.json({
         kind: 'blend', // frontend signs legs sequentially, each min-out protected
         multiHop: { path: multi.path, label, hops: multi.hops.length },

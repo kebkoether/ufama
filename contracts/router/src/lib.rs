@@ -17,6 +17,11 @@ const FEE_DENOMINATOR: i128 = 100_000;
 /// Matches the backend's MAX_PARTNER_FEE_BPS for classic legs.
 const MAX_PARTNER_FEE_PER_100K: i128 = 1_000;
 
+/// Atomic multi-hop: maximum swaps in one execute_path invocation.
+const MAX_PATH_HOPS: u32 = 5;
+/// Weight denominator for splitting a hop across venues.
+const WEIGHT_DENOMINATOR: i128 = 10_000;
+
 // ─── Storage Keys ───────────────────────────────────────
 
 #[contracttype]
@@ -44,6 +49,31 @@ pub struct RouteSegment {
     pub amount_in: i128,
     /// Minimum token_out expected from this leg
     pub min_amount_out: i128,
+}
+
+/// One venue's share of a single hop in an atomic path. Amounts are NOT
+/// fixed by the caller — each hop swaps whatever the previous hop
+/// actually delivered, split by weight (basis points of the carry; the
+/// last leg takes the remainder so nothing is stranded by rounding).
+/// This is what makes the path atomic-composable: no conservative
+/// min-out chaining between hops, the real output flows through.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PathLeg {
+    pub venue_id: u32,
+    /// Share of this hop's input, in parts of 10,000
+    pub weight_bps: i128,
+    /// Per-leg minimum output (0 = rely on the final min)
+    pub min_amount_out: i128,
+}
+
+/// One hop of an atomic path: swap the carried balance into `token_out`
+/// across one or more venue legs.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PathHop {
+    pub token_out: Address,
+    pub legs: Vec<PathLeg>,
 }
 
 /// Mirror of SwapBook's ClaimedOrder (identical field names → identical XDR).
@@ -75,6 +105,8 @@ pub enum RouterError {
     SwapBookNotSet = 11,
     FeeAboveCap = 12,
     PartnerFeeAboveCap = 13,
+    PathTooLong = 14,
+    InvalidPath = 15,
 }
 
 // ─── Contract ───────────────────────────────────────────
@@ -179,6 +211,136 @@ impl Router {
             venue_id,
         );
         Ok(())
+    }
+
+    /// ATOMIC MULTI-HOP: execute a whole path (up to MAX_PATH_HOPS swaps,
+    /// venues mixed freely per hop) in ONE invocation. One signature; if
+    /// any hop disappoints, the entire path reverts and the user keeps
+    /// exactly what they started with. Funds never rest in a wallet
+    /// between hops, and each hop swaps the previous hop's ACTUAL output
+    /// (no conservative min-out chaining as with multi-transaction plans).
+    ///
+    /// The protocol fee applies once, on the FINAL output, and
+    /// `min_final_out` protects the user net of it.
+    pub fn execute_path(
+        env: Env,
+        user: Address,
+        token_in: Address,
+        total_amount_in: i128,
+        min_final_out: i128,
+        hops: Vec<PathHop>,
+    ) -> Result<i128, RouterError> {
+        user.require_auth();
+
+        if total_amount_in <= 0 || min_final_out <= 0 {
+            return Err(RouterError::InvalidAmount);
+        }
+        if hops.is_empty() {
+            return Err(RouterError::InvalidPath);
+        }
+        if hops.len() > MAX_PATH_HOPS {
+            return Err(RouterError::PathTooLong);
+        }
+        // Validate every hop before moving any funds
+        let mut prev_token = token_in.clone();
+        for i in 0..hops.len() {
+            let hop = hops.get(i).unwrap();
+            if hop.token_out == prev_token {
+                return Err(RouterError::InvalidPath);
+            }
+            if hop.legs.is_empty() {
+                return Err(RouterError::InvalidPath);
+            }
+            let mut weight_sum: i128 = 0;
+            for j in 0..hop.legs.len() {
+                let leg = hop.legs.get(j).unwrap();
+                if leg.weight_bps <= 0 || leg.min_amount_out < 0 {
+                    return Err(RouterError::InvalidPath);
+                }
+                weight_sum += leg.weight_bps;
+            }
+            if weight_sum != WEIGHT_DENOMINATOR {
+                return Err(RouterError::InvalidPath);
+            }
+            prev_token = hop.token_out;
+        }
+
+        // Pull the input, then walk the chain
+        token::Client::new(&env, &token_in).transfer(
+            &user,
+            env.current_contract_address(),
+            &total_amount_in,
+        );
+
+        let mut carry_token = token_in.clone();
+        let mut carry: i128 = total_amount_in;
+        for i in 0..hops.len() {
+            let hop = hops.get(i).unwrap();
+            let carry_client = token::Client::new(&env, &carry_token);
+            let mut hop_out: i128 = 0;
+            let mut remaining = carry;
+            for j in 0..hop.legs.len() {
+                let leg = hop.legs.get(j).unwrap();
+                // last leg takes the remainder — rounding strands nothing
+                let leg_in = if j == hop.legs.len() - 1 {
+                    remaining
+                } else {
+                    carry * leg.weight_bps / WEIGHT_DENOMINATOR
+                };
+                if leg_in <= 0 {
+                    return Err(RouterError::InvalidAmount);
+                }
+                remaining -= leg_in;
+
+                let venue: Address = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Venue(leg.venue_id))
+                    .ok_or(RouterError::VenueNotFound)?;
+                carry_client.transfer(&env.current_contract_address(), &venue, &leg_in);
+                let received: i128 = env.invoke_contract(
+                    &venue,
+                    &Symbol::new(&env, "swap"),
+                    soroban_sdk::vec![
+                        &env,
+                        env.current_contract_address().into_val(&env),
+                        carry_token.into_val(&env),
+                        hop.token_out.into_val(&env),
+                        leg_in.into_val(&env),
+                        leg.min_amount_out.into_val(&env),
+                    ],
+                );
+                if received < leg.min_amount_out {
+                    return Err(RouterError::InsufficientOutput);
+                }
+                hop_out += received;
+            }
+            carry_token = hop.token_out.clone();
+            carry = hop_out;
+        }
+
+        // Fee once, on the final output; user floor enforced net of it
+        let fee = Self::calculate_fee(&env, carry);
+        let user_receives = carry - fee;
+        if user_receives < min_final_out {
+            return Err(RouterError::InsufficientOutput);
+        }
+        let out_client = token::Client::new(&env, &carry_token);
+        out_client.transfer(&env.current_contract_address(), &user, &user_receives);
+        if fee > 0 {
+            let fee_vault: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeVault)
+                .ok_or(RouterError::NotInitialized)?;
+            out_client.transfer(&env.current_contract_address(), &fee_vault, &fee);
+        }
+
+        env.events().publish(
+            (symbol_short!("route"), symbol_short!("path")),
+            (user, token_in, carry_token, total_amount_in, user_receives, fee),
+        );
+        Ok(user_receives)
     }
 
     /// Execute a multi-venue routed swap for `user`.

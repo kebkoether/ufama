@@ -361,3 +361,121 @@ fn test_partner_fee_split_is_additive() {
         )
         .is_err());
 }
+
+
+// ─── v1.2: atomic multi-hop (execute_path) ───────────────
+
+#[test]
+fn test_execute_path_two_hops_one_invocation() {
+    let t = setup(10_000); // venue 1 pays 1:1 in any pair
+    let client = RouterClient::new(&t.env, &t.router_id);
+
+    // Third token so we can chain A → B → C
+    let token_c = t.env
+        .register_stellar_asset_contract_v2(Address::generate(&t.env))
+        .address();
+    let venue1 = client.get_venue(&1u32);
+    StellarAssetClient::new(&t.env, &token_c).mint(&venue1, &10_000_000_0000000);
+
+    let amount = 1_000_0000000i128;
+    let hops = soroban_sdk::vec![
+        &t.env,
+        PathHop {
+            token_out: t.token_b.clone(),
+            legs: soroban_sdk::vec![&t.env, PathLeg { venue_id: 1, weight_bps: 10_000, min_amount_out: 0 }],
+        },
+        PathHop {
+            token_out: token_c.clone(),
+            legs: soroban_sdk::vec![&t.env, PathLeg { venue_id: 1, weight_bps: 10_000, min_amount_out: 0 }],
+        },
+    ];
+    // 1:1 both hops; fee (5/100k from setup) applies ONCE, on the final out
+    let fee = (amount * 5 + 100_000 - 1) / 100_000;
+    let received = client.execute_path(
+        &t.user, &t.token_a, &amount, &(amount - fee), &hops,
+    );
+    assert_eq!(received, amount - fee);
+    assert_eq!(TokenClient::new(&t.env, &token_c).balance(&t.user), amount - fee);
+    assert_eq!(TokenClient::new(&t.env, &token_c).balance(&t.fee_vault), fee);
+    // Nothing rests on the router — the whole chain settled in one call
+    assert_eq!(TokenClient::new(&t.env, &t.token_a).balance(&t.router_id), 0);
+    assert_eq!(TokenClient::new(&t.env, &t.token_b).balance(&t.router_id), 0);
+    assert_eq!(TokenClient::new(&t.env, &token_c).balance(&t.router_id), 0);
+}
+
+#[test]
+fn test_execute_path_split_hop_weights() {
+    let t = setup(10_000); // venue 1 = 1:1
+    let client = RouterClient::new(&t.env, &t.router_id);
+    // venue 2 pays 1.01
+    let venue2 = t.env.register(MockVenue, (10_100i128,));
+    StellarAssetClient::new(&t.env, &t.token_b).mint(&venue2, &10_000_000_0000000);
+    client.register_venue(&2u32, &venue2);
+
+    let amount = 1_000_0000000i128;
+    // 60% via venue 1 (1:1), 40% via venue 2 (1.01); last leg = remainder
+    let hops = soroban_sdk::vec![
+        &t.env,
+        PathHop {
+            token_out: t.token_b.clone(),
+            legs: soroban_sdk::vec![
+                &t.env,
+                PathLeg { venue_id: 1, weight_bps: 6_000, min_amount_out: 0 },
+                PathLeg { venue_id: 2, weight_bps: 4_000, min_amount_out: 0 },
+            ],
+        },
+    ];
+    let leg1_in = amount * 6_000 / 10_000;
+    let leg2_in = amount - leg1_in;
+    let expected_out = leg1_in + leg2_in * 10_100 / 10_000;
+    let fee = (expected_out * 5 + 100_000 - 1) / 100_000;
+    let received = client.execute_path(
+        &t.user, &t.token_a, &amount, &(expected_out - fee), &hops,
+    );
+    assert_eq!(received, expected_out - fee);
+}
+
+#[test]
+fn test_execute_path_atomic_revert_and_validation() {
+    let t = setup(9_500); // venue pays 95% — final min will fail
+    let client = RouterClient::new(&t.env, &t.router_id);
+    let amount = 1_000_0000000i128;
+    let user_before = TokenClient::new(&t.env, &t.token_a).balance(&t.user);
+
+    let hops = soroban_sdk::vec![
+        &t.env,
+        PathHop {
+            token_out: t.token_b.clone(),
+            legs: soroban_sdk::vec![&t.env, PathLeg { venue_id: 1, weight_bps: 10_000, min_amount_out: 0 }],
+        },
+    ];
+    // Demand full 1:1 — venue pays 95% — WHOLE path reverts
+    assert!(client
+        .try_execute_path(&t.user, &t.token_a, &amount, &amount, &hops)
+        .is_err());
+    assert_eq!(TokenClient::new(&t.env, &t.token_a).balance(&t.user), user_before);
+
+    // Weights must sum to 10,000
+    let bad_weights = soroban_sdk::vec![
+        &t.env,
+        PathHop {
+            token_out: t.token_b.clone(),
+            legs: soroban_sdk::vec![&t.env, PathLeg { venue_id: 1, weight_bps: 9_999, min_amount_out: 0 }],
+        },
+    ];
+    assert!(client
+        .try_execute_path(&t.user, &t.token_a, &amount, &1, &bad_weights)
+        .is_err());
+
+    // Hop into the same token is nonsense
+    let self_hop = soroban_sdk::vec![
+        &t.env,
+        PathHop {
+            token_out: t.token_a.clone(),
+            legs: soroban_sdk::vec![&t.env, PathLeg { venue_id: 1, weight_bps: 10_000, min_amount_out: 0 }],
+        },
+    ];
+    assert!(client
+        .try_execute_path(&t.user, &t.token_a, &amount, &1, &self_hop)
+        .is_err());
+}

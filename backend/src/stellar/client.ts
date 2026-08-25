@@ -329,6 +329,50 @@ export class StellarClient {
   }
 
   /**
+   * Encode Vec<PathHop> for Router.execute_path. Field order per struct
+   * is lexicographic: PathHop{legs, token_out}; PathLeg{min_amount_out,
+   * venue_id, weight_bps}.
+   */
+  static toPathHops(
+    hops: Array<{
+      tokenOut: string;
+      legs: Array<{ venueId: number; weightBps: number; minAmountOut: bigint }>;
+    }>
+  ): xdr.ScVal {
+    return xdr.ScVal.scvVec(
+      hops.map((h) =>
+        xdr.ScVal.scvMap([
+          new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol('legs'),
+            val: xdr.ScVal.scvVec(
+              h.legs.map((l) =>
+                xdr.ScVal.scvMap([
+                  new xdr.ScMapEntry({
+                    key: xdr.ScVal.scvSymbol('min_amount_out'),
+                    val: nativeToScVal(l.minAmountOut, { type: 'i128' }),
+                  }),
+                  new xdr.ScMapEntry({
+                    key: xdr.ScVal.scvSymbol('venue_id'),
+                    val: nativeToScVal(l.venueId, { type: 'u32' }),
+                  }),
+                  new xdr.ScMapEntry({
+                    key: xdr.ScVal.scvSymbol('weight_bps'),
+                    val: nativeToScVal(BigInt(l.weightBps), { type: 'i128' }),
+                  }),
+                ])
+              )
+            ),
+          }),
+          new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol('token_out'),
+            val: new Address(h.tokenOut).toScVal(),
+          }),
+        ])
+      )
+    );
+  }
+
+  /**
    * Encode Vec<FillSpec> for SwapBook.match_and_place. Struct fields
    * encode as an ScMap with keys in lexicographic order:
    * amount_out < fill_amount_in < order_id.
