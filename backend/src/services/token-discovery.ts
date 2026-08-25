@@ -146,11 +146,20 @@ export class TokenDiscoveryService {
     const curatedSacs = new Set(curated.map((t) => t.sacAddress).filter(Boolean));
 
     const extras: AggregatedToken[] = [];
+    const bySymbol = new Map<string, AggregatedToken>();
     for (const token of this.discovered.values()) {
       if (curatedSacs.has(token.sacAddress)) continue; // already curated
       if (curatedSymbols.has(token.symbol.toUpperCase())) continue; // spoof guard
-      extras.push({ ...token, venueVolume: volumeBySac.get(token.sacAddress) ?? 0 });
+      const cand = { ...token, venueVolume: volumeBySac.get(token.sacAddress) ?? 0 };
+      // The symbol is the app-wide identifier (selection, balances,
+      // quoting) — duplicate symbols from different issuers are
+      // AMBIGUOUS, not just ugly. Keep the highest-volume claimant.
+      const prev = bySymbol.get(cand.symbol.toUpperCase());
+      if (!prev || cand.venueVolume > prev.venueVolume) {
+        bySymbol.set(cand.symbol.toUpperCase(), cand);
+      }
     }
+    extras.push(...bySymbol.values());
     extras.sort((a, b) => a.symbol.localeCompare(b.symbol));
 
     return [...curated, ...extras];
