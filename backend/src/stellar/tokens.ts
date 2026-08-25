@@ -17,6 +17,13 @@ export interface TokenConfig {
   sacAddress: string;
   decimals: number;
   status: 'live' | 'coming_soon';
+  /**
+   * Issuer's verified home domain (the SEP-1 identity: the issuer
+   * account's home_domain hosts a stellar.toml that declares this asset
+   * back). Shown in the UI as the trust anchor — 'the USDC that
+   * circle.com claims' — for curated tokens.
+   */
+  homeDomain?: string;
 }
 
 /**
@@ -41,10 +48,12 @@ export const TOKENS: Record<string, TokenConfig> = {
     sacAddress: 'CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA',
     decimals: 7,
     status: 'live',
+    homeDomain: 'stellar.org',
   },
   USDC: {
     symbol: 'USDC',
     name: 'USD Coin (Circle)',
+    homeDomain: 'centre.io',
     issuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
     sacAddress: '', // Run: stellar contract id asset --asset USDC:GA5ZSE... --network mainnet
     decimals: 7,
@@ -53,6 +62,7 @@ export const TOKENS: Record<string, TokenConfig> = {
   PYUSD: {
     symbol: 'PYUSD',
     name: 'PayPal USD',
+    homeDomain: 'paxos.com',
     issuer: 'GDQE7IXJ4HUHV6RQHIUPRJSEZE4DRS5WY577O2FY6YQ5LVWZ7JZTU2V5',
     sacAddress: '', // Run: stellar contract id asset --asset PYUSD:GDQE7I... --network mainnet
     decimals: 7,
@@ -61,6 +71,7 @@ export const TOKENS: Record<string, TokenConfig> = {
   USDY: {
     symbol: 'USDY',
     name: 'Ondo US Dollar Yield',
+    homeDomain: 'ondo.finance',
     issuer: 'GAJMPX5NBOG6TQFPQGRABJEEB2YE7RFRLUKJDZAZGAD5GFX4J7TADAZ6',
     sacAddress: '',
     decimals: 7,

@@ -56,6 +56,8 @@ export interface AggregatedToken {
   issuer: string;
   sacAddress: string;
   decimals: number;
+  /** Curated tokens only: the issuer's SEP-1 home domain */
+  homeDomain?: string;
   status: 'live' | 'coming_soon';
   /** Where this listing came from */
   source: 'curated' | 'aqua' | 'sushi';
@@ -135,6 +137,7 @@ export class TokenDiscoveryService {
         issuer: t.issuer,
         sacAddress: sac,
         decimals: t.decimals,
+        homeDomain: t.homeDomain,
         status: t.status,
         source: 'curated' as const,
         verified: true,

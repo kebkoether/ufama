@@ -25,6 +25,8 @@ interface Token {
   venueVolume?: number;
   /** Token decimals (7 for SACs; Soroban-native tokens can differ) */
   decimals?: number;
+  /** Curated tokens: issuer's verified home domain (SEP-1) */
+  homeDomain?: string;
   /** Has a registered venue pool → allowed in the TWAP tab */
   twapEligible?: boolean;
 }
@@ -66,6 +68,7 @@ function assetToToken(asset: any): Token {
     sacAddress: asset.sacAddress || undefined,
     issuer: asset.issuer || undefined,
     decimals: asset.decimals ?? 7,
+    homeDomain: asset.homeDomain || undefined,
     verified: asset.verified ?? asset.source === 'curated',
     venueVolume: asset.venueVolume ?? 0,
     twapEligible: asset.twapEligible ?? false,
@@ -173,6 +176,12 @@ function TokenDropdown({
     const sym = t.symbol.toLowerCase();
     if (sym === q) return 0;
     if (sym.startsWith(q)) return 1;
+    // paste-a-contract-address search: exact hygiene tool — a C… (SAC)
+    // or G… (issuer) prefix of 6+ chars pins the one true token
+    if (q.length >= 6 && /^[cg][a-z2-7]+$/.test(q)) {
+      if (t.sacAddress?.toLowerCase().startsWith(q)) return 0;
+      if (t.issuer?.toLowerCase().startsWith(q)) return 0;
+    }
     if (sym.includes(q)) return 2;
     if (t.name.toLowerCase().includes(q)) return 3;
     if (q.length >= 3) {
@@ -268,6 +277,13 @@ function TokenDropdown({
             return (
               <button
                 key={token.sacAddress || `${token.symbol}-${idx}`}
+                title={[
+                  token.homeDomain ? `Verified issuer: ${token.homeDomain}` : undefined,
+                  token.sacAddress ? `Contract: ${token.sacAddress}` : undefined,
+                  token.issuer ? `Issuer: ${token.issuer}` : undefined,
+                ]
+                  .filter(Boolean)
+                  .join('\n') || undefined}
                 onClick={() => { if (!isComingSoon) { onSelect(token.symbol); setOpen(false); } }}
                 disabled={isComingSoon}
                 style={{
@@ -306,6 +322,11 @@ function TokenDropdown({
                     whiteSpace: 'nowrap',
                   }}>
                     SOON
+                  </span>
+                )}
+                {token.homeDomain && (
+                  <span style={{ fontSize: '10px', fontWeight: 600, color: '#22c55e', background: 'rgba(34, 197, 94, 0.1)', padding: '2px 6px', borderRadius: '4px', whiteSpace: 'nowrap' }}>
+                    ✓ {token.homeDomain}
                   </span>
                 )}
                 {!isComingSoon && token.verified === false && (
