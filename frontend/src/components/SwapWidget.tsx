@@ -267,7 +267,7 @@ function TokenDropdown({
             const isHot = !q && idx < 10 && (token.venueVolume ?? 0) > 0;
             return (
               <button
-                key={token.symbol}
+                key={token.sacAddress || `${token.symbol}-${idx}`}
                 onClick={() => { if (!isComingSoon) { onSelect(token.symbol); setOpen(false); } }}
                 disabled={isComingSoon}
                 style={{
