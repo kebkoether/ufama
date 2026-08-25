@@ -146,6 +146,10 @@ export default function Home() {
         {' '}&middot;{' '}
         Powered by{' '}
         <span style={{ color: '#8a8f9c', fontWeight: 500 }}>Soroban</span>
+        {' '}&middot;{' '}
+        <span title="Build version" style={{ fontFamily: 'monospace', fontSize: '11px' }}>
+          {process.env.NEXT_PUBLIC_BUILD_SHA}
+        </span>
       </div>
     </div>
   );
