@@ -1,6 +1,11 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   experimental: {},
+  env: {
+    // Vercel injects the commit at build time; footer shows it so
+    // "which build am I looking at" is a glance, not an investigation.
+    NEXT_PUBLIC_BUILD_SHA: (process.env.VERCEL_GIT_COMMIT_SHA || 'dev').slice(0, 7),
+  },
   async headers() {
     return [
       {
