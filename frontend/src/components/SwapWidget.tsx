@@ -1041,20 +1041,31 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
                   {(bps / 100).toFixed(2)}%
                 </button>
               ))}
+              {/* Custom tolerance — same unit as the presets (percent),
+                  converted to bps internally. */}
               <input
                 type="number"
-                min={1}
-                max={1000}
-                value={[25, 50, 100].includes(instantSlippageBps) ? '' : instantSlippageBps}
+                step={0.05}
+                min={0.01}
+                max={10}
+                value={
+                  [25, 50, 100].includes(instantSlippageBps)
+                    ? ''
+                    : instantSlippageBps / 100
+                }
                 onChange={(e) => {
-                  const v = parseInt(e.target.value);
-                  if (Number.isInteger(v) && v >= 1 && v <= 1000) setInstantSlippageBps(v);
+                  const v = parseFloat(e.target.value);
+                  if (Number.isFinite(v) && v >= 0.01 && v <= 10) {
+                    setInstantSlippageBps(Math.round(v * 100));
+                  }
                 }}
-                placeholder="bps"
+                placeholder="custom %"
+                title="Custom slippage tolerance, in percent"
                 style={{
-                  width: '52px', padding: '5px 8px', background: '#0d1117',
-                  border: '1px solid #1a1f2e', borderRadius: '7px',
+                  width: '72px', padding: '5px 8px', background: '#0d1117',
+                  border: '1px dashed #2a3040', borderRadius: '7px',
                   color: '#e1e4ea', fontSize: '11px', outline: 'none',
+                  textAlign: 'center',
                 }}
               />
             </div>
