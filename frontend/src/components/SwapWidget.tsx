@@ -1135,7 +1135,10 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
                 {([
                   { min: 30, label: '30m' },
                   { min: 60, label: '1h' },
+                  { min: 120, label: '2h' },
+                  { min: 180, label: '3h' },
                   { min: 360, label: '6h' },
+                  { min: 720, label: '12h' },
                   { min: 1440, label: '24h' },
                   { min: 4320, label: '3d' },
                 ]).map((opt) => (
