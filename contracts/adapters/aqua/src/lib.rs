@@ -13,9 +13,14 @@ use soroban_sdk::{
 ///                token_in, amount: u128, amount_with_slippage: u128) -> u128
 ///   Per-pool quoting: estimate_swap(in_idx: u32, out_idx: u32, amount: u128) -> u128
 ///
-/// This adapter executes SINGLE-HOP swaps through an admin-registered pool
-/// per pair. Multi-hop routing goes through the backend's find-path API and
-/// is out of scope for the on-chain adapter (stable pairs are single-hop).
+/// Pool resolution (v1.2): an admin-registered pool wins (ops can pin a
+/// specific pool); otherwise the adapter asks Aqua's own router ON-CHAIN
+/// via get_pools(tokens) and picks the pool with the deepest output-side
+/// reserves — every pool Aqua has or ever creates is tradeable here
+/// permissionlessly, mirroring the Sushi adapter's factory fallback.
+/// Safe because the caller's min_amount_out bounds the outcome whichever
+/// pool executes. Multi-hop routing composes ABOVE this adapter (the
+/// Router's execute_path chains single-hop adapter calls atomically).
 ///
 /// Funds flow (AtomicSwap Router contract → this adapter):
 ///   The router PUSHES token_in to this adapter before invoking `swap`.
@@ -242,10 +247,91 @@ impl AquaAdapter {
         token_in: &Address,
         token_out: &Address,
     ) -> Result<PoolInfo, AquaAdapterError> {
-        env.storage()
+        if let Some(info) = env
+            .storage()
             .persistent()
             .get(&DataKey::Pool(token_in.clone(), token_out.clone()))
-            .ok_or(AquaAdapterError::PoolNotSet)
+        {
+            return Ok(info);
+        }
+        Self::resolve_pool(env, token_in, token_out)
+    }
+
+    /// Ask Aqua's router for the pair's pools and pick the one with the
+    /// deepest output-side reserves. Bounded to the first few pools per
+    /// pair (Aqua rarely has more than 2-3 per pair).
+    fn resolve_pool(
+        env: &Env,
+        token_in: &Address,
+        token_out: &Address,
+    ) -> Result<PoolInfo, AquaAdapterError> {
+        let aqua_router: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AquaRouter)
+            .ok_or(AquaAdapterError::NotInitialized)?;
+
+        // Aqua keys pools by its own token ordering — try both
+        let orders = [
+            soroban_sdk::vec![env, token_in.clone(), token_out.clone()],
+            soroban_sdk::vec![env, token_out.clone(), token_in.clone()],
+        ];
+        let mut best: Option<(i128, PoolInfo)> = None;
+        for tokens_arg in orders.iter() {
+            let pools: soroban_sdk::Map<BytesN<32>, Address> = env.invoke_contract(
+                &aqua_router,
+                &Symbol::new(env, "get_pools"),
+                soroban_sdk::vec![env, tokens_arg.into_val(env)],
+            );
+            for (inspected, (hash, pool_addr)) in (0_u32..).zip(pools.iter()) {
+                if inspected >= 4 {
+                    break;
+                }
+                let tokens: soroban_sdk::Vec<Address> = env.invoke_contract(
+                    &pool_addr,
+                    &Symbol::new(env, "get_tokens"),
+                    soroban_sdk::vec![env],
+                );
+                // both sides must be in the pool
+                let mut out_idx: Option<u32> = None;
+                let mut has_in = false;
+                for k in 0..tokens.len() {
+                    let t = tokens.get(k).unwrap();
+                    if &t == token_in {
+                        has_in = true;
+                    } else if &t == token_out {
+                        out_idx = Some(k);
+                    }
+                }
+                let Some(out_idx) = out_idx else { continue };
+                if !has_in {
+                    continue;
+                }
+                let reserves: soroban_sdk::Vec<u128> = env.invoke_contract(
+                    &pool_addr,
+                    &Symbol::new(env, "get_reserves"),
+                    soroban_sdk::vec![env],
+                );
+                let depth = reserves
+                    .get(out_idx)
+                    .map(|r| i128::try_from(r).unwrap_or(i128::MAX))
+                    .unwrap_or(0);
+                if best.as_ref().map(|(d, _)| depth > *d).unwrap_or(true) {
+                    best = Some((
+                        depth,
+                        PoolInfo {
+                            tokens: tokens.clone(),
+                            pool_hash: hash.clone(),
+                            pool_address: pool_addr.clone(),
+                        },
+                    ));
+                }
+            }
+            if best.is_some() {
+                break; // first ordering that yields pools is Aqua's canonical one
+            }
+        }
+        best.map(|(_, info)| info).ok_or(AquaAdapterError::PoolNotSet)
     }
 
     fn token_indexes(
@@ -269,3 +355,6 @@ impl AquaAdapter {
         }
     }
 }
+
+#[cfg(test)]
+mod test;

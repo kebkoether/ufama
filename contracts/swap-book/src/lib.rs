@@ -65,12 +65,12 @@ pub enum DataKey {
     OracleAdmin,
     /// Protocol fee numerator per FEE_DENOMINATOR (settable ≤ cap)
     FeePer100k,
-    /// SEP-40 oracle contract (e.g. Reflector). When set and both tokens
-    /// of a pair have feeds, it takes precedence over the pushed price.
-    Sep40Oracle,
     /// Max acceptable age (seconds) of a SEP-40 price
     Sep40MaxAge,
-    /// SEP-40 asset feed for a token
+    /// SEP-40 feed for a token — carries ITS OWN oracle contract, so
+    /// different tokens can price off different oracles (e.g. Reflector's
+    /// external-markets oracle for XLM/USDC/EURC, their Stellar-DEX
+    /// oracle for the Etherfuse stablebonds).
     Sep40Feed(Address),
 }
 
@@ -107,6 +107,17 @@ pub enum PriceMode {
 pub enum OracleAsset {
     Stellar(Address),
     Other(Symbol),
+}
+
+/// A token's oracle feed: which SEP-40 contract to ask, how the asset is
+/// keyed there, and that oracle's price decimals (captured at
+/// registration so cross-oracle pairs normalize correctly).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FeedConfig {
+    pub oracle: Address,
+    pub asset: OracleAsset,
+    pub oracle_decimals: u32,
 }
 
 /// Mirror of the SEP-40 `PriceData` struct (field names must match).
@@ -547,35 +558,39 @@ impl SwapBook {
         (Self::fee_per_100k(&env), FEE_DENOMINATOR)
     }
 
-    /// Configure the SEP-40 oracle (e.g. Reflector) and the max price age
-    /// in seconds. Admin only. Once set, pairs where BOTH tokens have a
-    /// registered feed price exclusively off the SEP-40 oracle (fail
-    /// closed); other pairs keep using the pushed price.
-    pub fn set_sep40_oracle(
-        env: Env,
-        oracle: Address,
-        max_age_secs: u64,
-    ) -> Result<(), SwapBookError> {
+    /// Set the max acceptable SEP-40 price age in seconds. Admin only.
+    pub fn set_sep40_max_age(env: Env, max_age_secs: u64) -> Result<(), SwapBookError> {
         Self::require_admin(&env)?;
-        env.storage().instance().set(&DataKey::Sep40Oracle, &oracle);
         env.storage().instance().set(&DataKey::Sep40MaxAge, &max_age_secs);
         env.events().publish(
-            (symbol_short!("sep40"), symbol_short!("oracle")),
-            (oracle, max_age_secs),
+            (symbol_short!("sep40"), symbol_short!("max_age")),
+            max_age_secs,
         );
         Ok(())
     }
 
-    /// Register the SEP-40 asset feed for a token. Admin only.
+    /// Register a token's SEP-40 feed — the oracle contract to ask AND
+    /// how the asset is keyed there. Admin only. The oracle's price
+    /// decimals are read on-chain here and stored with the feed, so pairs
+    /// whose tokens use DIFFERENT oracles still cross-rate correctly.
+    /// Pairs where BOTH tokens have feeds price exclusively off SEP-40
+    /// (fail closed); others keep the pushed price.
     pub fn set_sep40_feed(
         env: Env,
         token: Address,
-        feed: OracleAsset,
+        oracle: Address,
+        asset: OracleAsset,
     ) -> Result<(), SwapBookError> {
         Self::require_admin(&env)?;
+        let oracle_decimals: u32 = env.invoke_contract(
+            &oracle,
+            &Symbol::new(&env, "decimals"),
+            soroban_sdk::vec![&env],
+        );
+        let cfg = FeedConfig { oracle: oracle.clone(), asset, oracle_decimals };
         env.storage()
             .persistent()
-            .set(&DataKey::Sep40Feed(token.clone()), &feed);
+            .set(&DataKey::Sep40Feed(token.clone()), &cfg);
         env.storage().persistent().extend_ttl(
             &DataKey::Sep40Feed(token.clone()),
             TTL_THRESHOLD,
@@ -583,7 +598,7 @@ impl SwapBook {
         );
         env.events().publish(
             (symbol_short!("sep40"), symbol_short!("feed")),
-            token,
+            (token, oracle),
         );
         Ok(())
     }
@@ -901,36 +916,34 @@ impl SwapBook {
         token_in: &Address,
         token_out: &Address,
     ) -> Result<OraclePriceData, SwapBookError> {
-        if let Some(oracle) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Sep40Oracle)
         {
-            let feed_in: Option<OracleAsset> = env
+            let feed_in: Option<FeedConfig> = env
                 .storage()
                 .persistent()
                 .get(&DataKey::Sep40Feed(token_in.clone()));
-            let feed_out: Option<OracleAsset> = env
+            let feed_out: Option<FeedConfig> = env
                 .storage()
                 .persistent()
                 .get(&DataKey::Sep40Feed(token_out.clone()));
             if let (Some(feed_in), Some(feed_out)) = (feed_in, feed_out) {
-                let p_in = Self::sep40_lastprice(env, &oracle, feed_in)?;
-                let p_out = Self::sep40_lastprice(env, &oracle, feed_out)?;
-                // Cross rate. The ORACLE's price decimals cancel in the
-                // ratio, but the two TOKENS' own decimals do not: the fair
-                // value is computed as amount_in * num / den where
-                // amount_in is in token_in base units and the result must
-                // be token_out base units — so scale by each token's
-                // decimals. (For the common all-7-decimals corridor the
-                // factors cancel and this is a no-op.)
+                let p_in = Self::sep40_lastprice(env, &feed_in.oracle, feed_in.asset.clone())?;
+                let p_out = Self::sep40_lastprice(env, &feed_out.oracle, feed_out.asset.clone())?;
+                // Cross rate with TWO normalizations: the tokens' own
+                // decimals (fair value maps token_in base units to
+                // token_out base units), AND — since each feed may come
+                // from a DIFFERENT oracle — each oracle's price decimals
+                // (identical oracles cancel; mixed ones must not skew).
                 let dec_in = token::Client::new(env, token_in).decimals();
                 let dec_out = token::Client::new(env, token_out).decimals();
                 let num = p_in
                     .checked_mul(Self::pow10(dec_out)?)
+                    .ok_or(SwapBookError::Overflow)?
+                    .checked_mul(Self::pow10(feed_out.oracle_decimals)?)
                     .ok_or(SwapBookError::Overflow)?;
                 let den = p_out
                     .checked_mul(Self::pow10(dec_in)?)
+                    .ok_or(SwapBookError::Overflow)?
+                    .checked_mul(Self::pow10(feed_in.oracle_decimals)?)
                     .ok_or(SwapBookError::Overflow)?;
                 return Ok(OraclePriceData {
                     num,

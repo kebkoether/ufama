@@ -83,9 +83,13 @@ export const TOKENS: Record<string, TokenConfig> = {
   },
   USDT0: {
     symbol: 'USDT0',
-    name: 'Tether USD (LayerZero)',
-    issuer: '', // Not yet live on Stellar
-    sacAddress: '',
+    name: 'USDT0 (Tether via LayerZero)',
+    // Addresses provided by Klint 2026-08-25, pre-launch. Issuer has no
+    // home_domain set yet and clawback enabled (auth_revocable) — keep
+    // coming_soon until liquidity exists, then flip via env
+    // TOKEN_USDT0_STATUS=live (no code change needed).
+    issuer: 'GATISXX6BZ6NC7IKQBY37CJD4SOZL3CYZJWXEDG6JVIY4WBS6KXJHN6Q',
+    sacAddress: 'CBSJZEIO5C7KC2SF3MKSNXXJSW5G3VTNBX4ATMKUI3B2MR4JKM4R26YF',
     decimals: 7,
     status: 'coming_soon',
   },

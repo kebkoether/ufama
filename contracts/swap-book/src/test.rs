@@ -663,6 +663,9 @@ impl MockSep40 {
     pub fn lastprice(env: Env, asset: OracleAsset) -> Option<Sep40PriceData> {
         env.storage().persistent().get(&asset)
     }
+    pub fn decimals(_env: Env) -> u32 {
+        14
+    }
 }
 
 #[test]
@@ -679,9 +682,9 @@ fn test_sep40_preferred_over_pushed_price_and_fails_closed() {
     let feed_b = OracleAsset::Stellar(t.token_b.clone());
     sep40.set_price(&feed_a, &2_0000000, &now);
     sep40.set_price(&feed_b, &1_0000000, &now);
-    client.set_sep40_oracle(&sep40_id, &300u64);
-    client.set_sep40_feed(&t.token_a, &feed_a);
-    client.set_sep40_feed(&t.token_b, &feed_b);
+    client.set_sep40_max_age(&300u64);
+    client.set_sep40_feed(&t.token_a, &sep40_id, &feed_a);
+    client.set_sep40_feed(&t.token_b, &sep40_id, &feed_b);
 
     // Oracle-mode order at 1% slippage: required payment follows SEP-40
     let order_id = client.place_order(
