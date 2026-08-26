@@ -22,22 +22,50 @@ export function fromBaseUnits(raw: string | number | bigint, decimals: number): 
     const base = 10n ** BigInt(decimals);
     const whole = v / base;
     const frac = v % base;
-    // 6 fractional digits is plenty for display; avoids Number overflow
-    const fracNum = Number((frac * 1_000_000n) / base) / 1_000_000;
+    // 12 fractional digits: enough that a $2 BTC-denominated amount
+    // (~1.75e-5) keeps 4+ significant digits; the quotient stays well
+    // inside Number's exact-integer range.
+    const fracNum = Number((frac * 1_000_000_000_000n) / base) / 1e12;
     return Number(whole) + fracNum;
   } catch {
     return 0;
   }
 }
 
-/** Formatted display string for a base-unit amount. */
+/**
+ * Formatted display string for a base-unit amount.
+ *
+ * Without an explicit `fractionDigits`, precision adapts to the value —
+ * the significant-digits convention DEX UIs use (Sushi/Uniswap show ~6
+ * sig figs): a $2 BTC buy reads 0.0000175 (not 0.00) and a deJAAA quote
+ * reads 1.891478 (not 1.89). Always at least 2 decimals; capped at the
+ * token's own decimals and 12 places.
+ */
 export function formatUnits(
   raw: string | number | bigint,
   decimals: number,
-  fractionDigits = 2
+  fractionDigits?: number
 ): string {
-  return fromBaseUnits(raw, decimals).toLocaleString('en-US', {
-    minimumFractionDigits: fractionDigits,
-    maximumFractionDigits: fractionDigits,
+  const v = fromBaseUnits(raw, decimals);
+  if (fractionDigits !== undefined) {
+    return v.toLocaleString('en-US', {
+      minimumFractionDigits: fractionDigits,
+      maximumFractionDigits: fractionDigits,
+    });
+  }
+  const abs = Math.abs(v);
+  if (abs === 0) {
+    return '0.00';
+  }
+  // Decimals needed so ~6 significant digits survive. For values ≥ 1 the
+  // integer part supplies some of them; below 1 the leading zeros don't.
+  const sigDecimals =
+    abs >= 1
+      ? 6 - (Math.floor(Math.log10(abs)) + 1)
+      : -Math.floor(Math.log10(abs)) + 5;
+  const maxDigits = Math.min(Math.max(2, sigDecimals), decimals, 12);
+  return v.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: maxDigits,
   });
 }
