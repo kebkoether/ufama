@@ -6,7 +6,14 @@
 //! frontend and verified via on-chain interface fetch (2026-08-18):
 //!   Router  CDMIM23WOUL5CZBKX3GOA3V5R5AMVIMTCP52KCDQORWELAPLJ27WZCHL
 //!   Quoter  CASKWJSINHFW7BF7RUOA4E2FP6B2TYRKFX2UOPWLCPOOPUR6UU3G2RWC
-//!   Factory CCRSMJDITH3VK5QOGYCVZDAKIY5GL3RCG4TCVLIAVB662IW2V5KJGZGF
+//!   Factory CD3KRKGDRVWPXVB3VXLUMQKMX6XZ6Q2H334IVZD4XXNAMKSRVQL5GLYF
+//!
+//! CAUTION: Sushi runs TWO factories on mainnet. CCRSMJDITH…GZGF is an
+//! older deployment whose pools are stale — the v1.1 adapter shipped
+//! pointing at it, which broke unpinned pair resolution (worked around
+//! with set_pair pins, scripts/register-sushi-pairs.sh). Deploys must
+//! use CD3KRKGD…GLYF, verified 2026-08-25 to resolve the same pools
+//! Sushi's own UI trades.
 //!
 //! Router entry: swap_exact_input_single(params: ExactInputSingleParams)
 //! Quoter entry: quote_exact_input_single(token_in, token_out, fee: u32,
