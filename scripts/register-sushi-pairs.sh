@@ -20,10 +20,10 @@ ADAPTER="CDFNVWKR6BO57LR3PMGGDK456FOAOILKSPE56GYRFGIY2Q5JPUULL3IY"
 SRC="mainnet-deployer"
 NET="mainnet"
 FEE=1000000
+# NOTE: keep each command on ONE line — backslash continuations break
+# when git checks the file out with CRLF line endings on Windows.
 reg() {
-  stellar contract invoke --fee ${FEE} --id ${ADAPTER} --source ${SRC} --network ${NET} -- set_pair \
-    --token_a "$1" --token_b "$2" --fee "$3" --pool "$4" >/dev/null 2>&1 \
-    && echo " ✓ $5" || echo " ✗ $5 (check funds/network)"
+  stellar contract invoke --fee ${FEE} --id ${ADAPTER} --source ${SRC} --network ${NET} -- set_pair --token_a "$1" --token_b "$2" --fee "$3" --pool "$4" >/dev/null 2>&1 && echo " OK $5" || echo " FAILED $5"
 }
 
 reg "CBI7UCH5KGSVQRO5H4SUCZUTZABCITZLRHQQZTWL2TK4RZ72TAR6IHRV" "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75" 500  "CDMJRRH5MAJLB7T5SQAWQOOL7UJ3BABGTURSVKIE6AEDSXESDDJIBVCT" "deJTRSY / USDC (liq \$3.94M, fee 0.05%)"
