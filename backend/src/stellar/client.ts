@@ -229,6 +229,26 @@ export class StellarClient {
   }
 
   /**
+   * Build an unsigned changeTrust transaction so a wallet can add the
+   * trustline it needs before receiving a classic-backed token. The user
+   * signs and submits it like any swap leg.
+   */
+  async buildChangeTrust(opts: {
+    sourceAddress: string;
+    asset: InstanceType<typeof Asset>;
+  }): Promise<string> {
+    const account = await this.server.getAccount(opts.sourceAddress);
+    return new TransactionBuilder(account, {
+      fee: '10000',
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(Operation.changeTrust({ asset: opts.asset }))
+      .setTimeout(300)
+      .build()
+      .toXDR();
+  }
+
+  /**
    * Build, sign, and submit a contract call from a service account
    * (keeper sweep, oracle updates). Returns the final tx response.
    */

@@ -1525,6 +1525,39 @@ app.post('/api/twap/cancel', async (req, res) => {
 });
 
 /**
+ * POST /api/trustline/build
+ *
+ * Build an unsigned classic changeTrust transaction so a wallet can
+ * receive a classic-backed token it has no trustline for. Restricted to
+ * assets in the listed token universe so the endpoint can't be used to
+ * push arbitrary trustlines at users.
+ * Body: { sourceAddress, assetCode, issuer }
+ */
+app.post('/api/trustline/build', async (req, res) => {
+  try {
+    const sourceAddress = parseStellarAccount(req.body.sourceAddress, 'sourceAddress');
+    const issuer = parseStellarAccount(req.body.issuer, 'issuer');
+    const assetCode = String(req.body.assetCode ?? '');
+    if (!/^[A-Za-z0-9]{1,12}$/.test(assetCode)) {
+      throw new BadRequest('assetCode must be 1-12 alphanumeric characters');
+    }
+    const listed = tokenDiscovery
+      .getTokens()
+      .some((t) => t.symbol === assetCode && t.issuer === issuer);
+    if (!listed) {
+      throw new BadRequest('Asset is not in the listed token universe');
+    }
+    const xdr = await stellar.buildChangeTrust({
+      sourceAddress,
+      asset: new Asset(assetCode, issuer),
+    });
+    res.json({ xdr });
+  } catch (error) {
+    handleError(res, error, 'Failed to build trustline transaction');
+  }
+});
+
+/**
  * POST /api/swap/submit
  *
  * Submit a signed transaction XDR to the Stellar network.
