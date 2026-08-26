@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useMemo, useRef, useEffect } from 'react';
 import { toBaseUnits, fromBaseUnits, formatUnits } from '@/lib/units';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
@@ -567,20 +567,29 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
   // Wallet balances by symbol, from Horizon. XLM matches the native line;
   // classic assets match on (code, issuer) against the token universe.
   const [balances, setBalances] = useState<Record<string, string>>({});
+  // Trustlines the account holds, as "CODE:ISSUER" keys. null = unknown
+  // (disconnected or unfunded account) — never prompt in that state.
+  const [trustlines, setTrustlines] = useState<Set<string> | null>(null);
   const fetchBalances = useCallback(async () => {
     if (!walletAddress) {
       setBalances({});
+      setTrustlines(null);
       return;
     }
     try {
       const res = await fetch(`${HORIZON_URL}/accounts/${walletAddress}`);
-      if (!res.ok) return; // unfunded accounts 404 — keep whatever we had
+      if (!res.ok) {
+        setTrustlines(null); // unfunded accounts 404 — keep balances we had
+        return;
+      }
       const data = await res.json();
       const next: Record<string, string> = {};
+      const lines = new Set<string>();
       for (const b of data.balances ?? []) {
         if (b.asset_type === 'native') {
           next['XLM'] = b.balance;
         } else if (b.asset_code) {
+          lines.add(`${b.asset_code}:${b.asset_issuer}`);
           const match = allTokens.find(
             (t) => t.symbol === b.asset_code && t.issuer === b.asset_issuer
           );
@@ -602,10 +611,43 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         // Soroban balance fetch is best-effort
       }
       setBalances(next);
+      setTrustlines(lines);
     } catch {
       // Network hiccup — leave the previous snapshot in place
     }
   }, [walletAddress, allTokens]);
+
+  // Classic-backed output assets need a Horizon trustline before the
+  // wallet can receive them; Soroban-native tokens (no issuer) don't.
+  // Returns the token needing one, or null.
+  const missingTrustline = useMemo(() => {
+    if (!walletConnected || !trustlines || tokenOut === 'XLM') return null;
+    const t = allTokens.find((x) => x.symbol === tokenOut);
+    if (!t?.issuer) return null;
+    return trustlines.has(`${t.symbol}:${t.issuer}`) ? null : t;
+  }, [walletConnected, trustlines, allTokens, tokenOut]);
+
+  const [addingTrustline, setAddingTrustline] = useState(false);
+  const handleAddTrustline = useCallback(async () => {
+    if (!walletAddress || !missingTrustline?.issuer) return;
+    setAddingTrustline(true);
+    try {
+      const { buildTrustline, submitTransaction } = await import('@/lib/api');
+      const { xdr } = await buildTrustline(
+        walletAddress,
+        missingTrustline.symbol,
+        missingTrustline.issuer
+      );
+      const signed = await signTransaction(xdr);
+      await submitTransaction(signed);
+      await fetchBalances(); // refreshed trustlines clear the gate
+    } catch (error: any) {
+      console.error('Trustline error:', error);
+      alert(`Failed to add trustline: ${error?.message || 'Unknown error'}`);
+    } finally {
+      setAddingTrustline(false);
+    }
+  }, [walletAddress, missingTrustline, signTransaction, fetchBalances]);
 
   useEffect(() => { fetchBalances(); }, [fetchBalances]);
 
@@ -1523,7 +1565,13 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           const hasAmount = amountIn && parseFloat(amountIn) > 0;
           const p2pPairReady =
             mode !== 'p2p' || (p2pLive(tokenIn) && p2pLive(tokenOut));
-          const disabled = !hasAmount || loading || submitting || !p2pPairReady;
+          // Missing trustline preempts every mode: the wallet can't
+          // receive tokenOut until it's added, so the button becomes the
+          // add-trustline action (clickable even while a quote loads).
+          const trustlineGate = Boolean(missingTrustline && hasAmount && !addingTrustline);
+          const disabled = trustlineGate
+            ? false
+            : !hasAmount || loading || submitting || addingTrustline || !p2pPairReady;
 
           // Determine button action and label
           let onClick: (() => void) | undefined;
@@ -1533,6 +1581,11 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           if (!walletConnected) {
             onClick = connectWallet;
             label = 'Connect Wallet';
+          } else if (addingTrustline) {
+            label = `Adding ${tokenOut} trustline...`;
+          } else if (trustlineGate) {
+            onClick = handleAddTrustline;
+            label = `Add ${tokenOut} trustline to receive it`;
           } else if (submitting) {
             label = 'Signing transaction...';
           } else if (loading) {

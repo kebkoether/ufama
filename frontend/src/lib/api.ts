@@ -264,6 +264,24 @@ export async function submitTransaction(
   return response.json();
 }
 
+/** Build an unsigned changeTrust tx so the wallet can receive assetCode. */
+export async function buildTrustline(
+  sourceAddress: string,
+  assetCode: string,
+  issuer: string
+): Promise<{ xdr: string }> {
+  const response = await fetch(`${API_BASE}/api/trustline/build`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sourceAddress, assetCode, issuer }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error || `Trustline build failed: ${response.statusText}`);
+  }
+  return response.json();
+}
+
 export async function getHealth(): Promise<{
   status: string;
   venues: string[];
