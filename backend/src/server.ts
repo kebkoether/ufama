@@ -1572,6 +1572,17 @@ app.post('/api/swap/submit', async (req, res) => {
     const result = await stellar.submitTransaction(signedXdr);
     res.json({ status: result.status, result });
   } catch (error) {
+    // Submission failures carry user-actionable reasons (bad sequence,
+    // failed on-ledger, try again) — pass them through instead of the
+    // generic label so the UI can show what actually happened.
+    if (
+      error instanceof Error &&
+      /rejected at send|failed on-ledger|not accepted|not confirmed/.test(error.message)
+    ) {
+      console.error('Submit failed:', error.message);
+      res.status(502).json({ error: error.message });
+      return;
+    }
     handleError(res, error, 'Failed to submit transaction');
   }
 });

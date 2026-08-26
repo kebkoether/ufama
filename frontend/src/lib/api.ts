@@ -259,7 +259,8 @@ export async function submitTransaction(
     body: JSON.stringify({ signedXdr }),
   });
   if (!response.ok) {
-    throw new Error(`Submit failed: ${response.statusText}`);
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error || `Submit failed: ${response.statusText}`);
   }
   return response.json();
 }
