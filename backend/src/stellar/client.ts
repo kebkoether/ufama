@@ -278,11 +278,37 @@ export class StellarClient {
     const response = await this.server.sendTransaction(tx);
 
     if (response.status === 'ERROR') {
-      throw new Error(`Transaction send failed: ${JSON.stringify(response)}`);
+      // Surface the actual result code (txBadSeq, txInsufficientFee,
+      // txTooLate...) — the raw response dump only helps in logs.
+      let code = 'unknown';
+      try {
+        code = response.errorResult?.result().switch().name ?? 'unknown';
+      } catch {
+        /* keep 'unknown' */
+      }
+      console.error('sendTransaction ERROR detail:', JSON.stringify(response));
+      throw new Error(`Transaction rejected at send: ${code}`);
+    }
+    if (response.status === 'TRY_AGAIN_LATER' || response.status === 'DUPLICATE') {
+      // Not accepted into the queue — polling would only time out.
+      throw new Error(
+        `Transaction not accepted (${response.status}) — wait a few seconds and retry`
+      );
     }
 
     for (let attempt = 0; attempt < SUBMIT_POLL_ATTEMPTS; attempt++) {
       const getResponse = await this.server.getTransaction(response.hash);
+      if (getResponse.status === 'FAILED') {
+        // Landed on-ledger but failed — callers treat a returned response
+        // as success, so this must throw with the op-level reason.
+        let code = 'unknown';
+        try {
+          code = getResponse.resultXdr.result().switch().name;
+        } catch {
+          /* keep 'unknown' */
+        }
+        throw new Error(`Transaction failed on-ledger: ${code} (${response.hash})`);
+      }
       if (getResponse.status !== 'NOT_FOUND') {
         return getResponse;
       }
