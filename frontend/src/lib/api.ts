@@ -252,7 +252,7 @@ export async function buildTwapCancel(
 
 export async function submitTransaction(
   signedXdr: string
-): Promise<{ status: string; result: any }> {
+): Promise<{ status: string; hash?: string; result: any }> {
   const response = await fetch(`${API_BASE}/api/swap/submit`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
