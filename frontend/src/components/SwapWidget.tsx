@@ -1003,19 +1003,43 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
       let via: string;
       let lastHash: string | undefined;
       if (kind === 'blend' && Array.isArray(data.legs)) {
-        // Split execution: SDEX chunk (classic tx) + AMM chunk (Router tx).
-        // Two signatures; each leg carries its own min-out, so a rejected
-        // or failed second leg means "partially executed", never a worse
-        // price than quoted.
+        // Split/multi-hop execution: one transaction per leg, each with
+        // its own min-out, so a failed later leg means "partially
+        // executed", never a worse price than quoted. Later hops arrive
+        // as DEFERRED build params — they spend tokens the wallet only
+        // holds after the previous leg settles, so each one is built
+        // fresh at its turn (sized to the prior hop's guaranteed
+        // minimum; any surplus intermediate tokens stay in the wallet).
         let done = 0;
         try {
-          for (const [i, leg] of data.legs.entries()) {
+          const legQueue: any[] = [...data.legs];
+          const totalParts = data.legs.length;
+          let guard = 0;
+          while (legQueue.length > 0) {
+            if (++guard > 8) throw new Error('Swap plan has too many legs');
+            const leg = legQueue.shift();
             setTxStatus({
               phase: 'confirming',
-              title: `Confirming part ${i + 1} of ${data.legs.length}…`,
+              title: `Confirming part ${done + 1} of ${Math.max(totalParts, done + 1 + legQueue.length)}…`,
               detail: 'Sign in your wallet, then we watch the chain until it settles.',
             });
-            const signed = await signTransaction(leg.xdr);
+            let legXdr: string | undefined = leg.xdr;
+            if (!legXdr && leg.deferred) {
+              const next = await buildSwap({
+                sourceAddress: walletAddress,
+                tokenIn: leg.deferred.tokenIn,
+                tokenOut: leg.deferred.tokenOut,
+                amountIn: leg.deferred.amountIn,
+                slippage: instantSlippageBps,
+              });
+              if (next.kind === 'blend' && Array.isArray(next.legs)) {
+                legQueue.unshift(...next.legs);
+                continue;
+              }
+              legXdr = next.xdr;
+            }
+            if (!legXdr) throw new Error('Swap plan leg missing transaction');
+            const signed = await signTransaction(legXdr);
             lastHash = (await submitTransaction(signed)).hash;
             done++;
           }
