@@ -127,8 +127,15 @@ export class RoutingEngine {
       throw new Error('No venues available');
     }
 
-    // 2. Query depth quotes from all venues in parallel
-    const depthLevels = DEPTH_LEVELS.filter((d) => d <= amountIn * 2n);
+    // 2. Query depth quotes from all venues in parallel.
+    // DEPTH_LEVELS is denominated at 7 decimals — rescale to the input
+    // token's decimals, or an 18-dec token (deJAAA) gets probed at
+    // 10^-9-of-a-token dust levels whose zero-output tranches poison the
+    // allocation.
+    const levelScale = decimals.in > 7 ? 10n ** BigInt(decimals.in - 7) : 1n;
+    const depthLevels = DEPTH_LEVELS.map((d) => d * levelScale).filter(
+      (d) => d <= amountIn * 2n
+    );
     if (!depthLevels.includes(amountIn)) {
       depthLevels.push(amountIn);
       depthLevels.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
@@ -148,6 +155,21 @@ export class RoutingEngine {
 
     // 3. Greedy allocation: fill from cheapest marginal price
     const segments = this.greedyAllocate(profiles, amountIn, decimals);
+
+    // Conservation invariant: the Router contract REQUIRES segments to
+    // sum exactly to total_amount_in (whole-path revert otherwise), so
+    // any rounding shaved off inside allocation goes to the largest
+    // segment. Its min_amount_out was quoted for a smaller fill, so this
+    // only ever errs in the user's favor.
+    if (segments.length > 0) {
+      const allocated = segments.reduce((s, seg) => s + seg.amountIn, 0n);
+      if (allocated !== amountIn) {
+        const largest = segments.reduce((a, b) =>
+          b.amountIn > a.amountIn ? b : a
+        );
+        largest.amountIn += amountIn - allocated;
+      }
+    }
 
     // 4. Build route
     const totalExpectedOut = segments.reduce(
