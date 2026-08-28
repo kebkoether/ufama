@@ -185,8 +185,16 @@ export async function buildSwap(body: {
   /** Present for single-transaction plans (kind 'soroban' | 'classic') */
   xdr?: string;
   kind: 'soroban' | 'classic' | 'blend';
-  /** Present for kind 'blend': sign and submit each leg in order */
-  legs?: Array<{ kind: 'soroban' | 'classic'; xdr: string; amountIn: string; expectedOut: string }>;
+  /** Present for kind 'blend': sign and submit each leg in order. Later
+   *  multi-hop legs carry `deferred` build params instead of an xdr —
+   *  they can only be built after the prior leg settles. */
+  legs?: Array<{
+    kind: 'soroban' | 'classic';
+    xdr?: string;
+    deferred?: { tokenIn: string; tokenOut: string; amountIn: string };
+    amountIn: string;
+    expectedOut: string;
+  }>;
   route: any;
 }> {
   const response = await fetch(`${API_BASE}/api/swap/build`, {

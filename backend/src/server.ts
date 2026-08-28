@@ -980,13 +980,29 @@ app.post('/api/swap/build', async (req, res) => {
         });
         return;
       }
-      const xdrs = await Promise.all(multi.hops.map(buildLeg));
+      // Only the FIRST hop can be built (simulated) now — later hops
+      // spend tokens the wallet won't hold until the prior hop settles,
+      // so their simulation fails on balance whenever the user doesn't
+      // already carry the intermediate token. Later hops are returned as
+      // deferred build params; the frontend re-requests each one after
+      // the previous leg settles, sized to the prior hop's GUARANTEED
+      // minimum output (any surplus stays in the wallet, as documented).
+      const firstXdr = await buildLeg(multi.hops[0]);
       res.json({
         kind: 'blend', // frontend signs legs sequentially, each min-out protected
         multiHop: { path: multi.path, label, hops: multi.hops.length },
         legs: multi.hops.map((h, i) => ({
           kind: 'soroban',
-          xdr: xdrs[i],
+          ...(i === 0
+            ? { xdr: firstXdr }
+            : {
+                deferred: {
+                  tokenIn: h.tokenIn,
+                  tokenOut: h.tokenOut,
+                  // prior hop's min-out is the amount guaranteed to exist
+                  amountIn: multi.hops[i - 1].minOut.toString(),
+                },
+              }),
           amountIn: h.amountIn.toString(),
           expectedOut: h.route.netAmountOut.toString(),
         })),
