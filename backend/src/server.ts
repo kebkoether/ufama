@@ -15,7 +15,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import { Asset } from '@stellar/stellar-sdk';
+import { Asset, TransactionBuilder } from '@stellar/stellar-sdk';
 import { RoutingEngine } from './router/engine.js';
 import { Pathfinder, PathResult } from './router/pathfinder.js';
 import { createVenueRegistry } from './venues/index.js';
@@ -1570,7 +1570,12 @@ app.post('/api/swap/submit', async (req, res) => {
     }
 
     const result = await stellar.submitTransaction(signedXdr);
-    res.json({ status: result.status, result });
+    // Hash lets the UI link the settled tx on an explorer. Computed from
+    // the envelope so it works regardless of SDK response shape.
+    const hash = TransactionBuilder.fromXDR(signedXdr, config.networkPassphrase)
+      .hash()
+      .toString('hex');
+    res.json({ status: result.status, hash, result });
   } catch (error) {
     // Submission failures carry user-actionable reasons (bad sequence,
     // failed on-ledger, try again) — pass them through instead of the

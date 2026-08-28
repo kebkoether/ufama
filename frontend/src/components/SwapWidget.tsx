@@ -617,6 +617,23 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     }
   }, [walletAddress, allTokens]);
 
+  // Transaction status card (replaces alert() popups): shown under the
+  // action button through the submit lifecycle. The backend polls the
+  // chain until settlement before responding, so by the time a submit
+  // resolves the outcome is final — 'confirming' covers sign+settle.
+  type TxStatus = {
+    phase: 'confirming' | 'success' | 'error';
+    title: string;
+    detail?: string;
+    hash?: string;
+  };
+  const [txStatus, setTxStatus] = useState<TxStatus | null>(null);
+  useEffect(() => {
+    if (txStatus?.phase !== 'success') return;
+    const t = setTimeout(() => setTxStatus(null), 12_000);
+    return () => clearTimeout(t);
+  }, [txStatus]);
+
   // Classic-backed output assets need a Horizon trustline before the
   // wallet can receive them; Soroban-native tokens (no issuer) don't.
   // Returns the token needing one, or null.
@@ -638,12 +655,27 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         missingTrustline.symbol,
         missingTrustline.issuer
       );
+      setTxStatus({
+        phase: 'confirming',
+        title: `Adding ${missingTrustline.symbol} trustline…`,
+        detail: 'Sign in your wallet, then we watch the chain until it settles.',
+      });
       const signed = await signTransaction(xdr);
-      await submitTransaction(signed);
+      const { hash } = await submitTransaction(signed);
       await fetchBalances(); // refreshed trustlines clear the gate
+      setTxStatus({
+        phase: 'success',
+        title: `${missingTrustline.symbol} trustline added`,
+        detail: `Your wallet can now receive ${missingTrustline.symbol} — the swap button is back.`,
+        hash,
+      });
     } catch (error: any) {
       console.error('Trustline error:', error);
-      alert(`Failed to add trustline: ${error?.message || 'Unknown error'}`);
+      setTxStatus({
+        phase: 'error',
+        title: 'Trustline failed',
+        detail: error?.message || 'Unknown error',
+      });
     } finally {
       setAddingTrustline(false);
     }
@@ -860,18 +892,28 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         maxSlippageBps: twapLimitPrice ? undefined : maxSlippageBps,
         maxSlicePct: twapMaxSlicePct,
       });
+      setTxStatus({
+        phase: 'confirming',
+        title: 'Confirming TWAP order on-chain…',
+        detail: 'Sign in your wallet, then we watch the chain until the escrow settles.',
+      });
       const signed = await signTransaction(xdr);
-      await submitTransaction(signed);
-      alert(
-        `TWAP started: ${parseFloat(amountIn).toLocaleString()} ${tokenIn} over ` +
-        `${twapDurationMin >= 60 ? `${twapDurationMin / 60}h` : `${twapDurationMin}m`}. ` +
-        `Proceeds stream to your wallet as slices fill — track it on the Orders page.`
-      );
+      const { hash } = await submitTransaction(signed);
+      setTxStatus({
+        phase: 'success',
+        title: `TWAP started: ${parseFloat(amountIn).toLocaleString()} ${tokenIn} over ${twapDurationMin >= 60 ? `${twapDurationMin / 60}h` : `${twapDurationMin}m`}`,
+        detail: 'Proceeds stream to your wallet as slices fill — track it on the Orders page.',
+        hash,
+      });
       setAmountIn('');
       fetchBalances();
     } catch (error: any) {
       console.error('TWAP submit error:', error);
-      alert(`Failed to start TWAP: ${error?.message || 'Unknown error'}`);
+      setTxStatus({
+        phase: 'error',
+        title: 'TWAP order failed',
+        detail: error?.message || 'Unknown error',
+      });
     } finally {
       setSubmitting(false);
     }
@@ -898,20 +940,42 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         // Sign each transaction via the wallet context (enforces the
         // app's expected network before every signature)
         const { submitTransaction } = await import('@/lib/api');
-        for (const xdrStr of data.xdrs) {
+        let hash: string | undefined;
+        for (const [i, xdrStr] of (data.xdrs as string[]).entries()) {
+          setTxStatus({
+            phase: 'confirming',
+            title:
+              data.xdrs.length > 1
+                ? `Confirming transaction ${i + 1} of ${data.xdrs.length}…`
+                : 'Confirming order on-chain…',
+            detail: 'Sign in your wallet, then we watch the chain until it settles.',
+          });
           const signed = await signTransaction(xdrStr);
-          await submitTransaction(signed);
+          hash = (await submitTransaction(signed)).hash;
         }
-        alert('Order placed successfully! Check the Orders tab to see it.');
+        setTxStatus({
+          phase: 'success',
+          title: 'Order placed',
+          detail: 'Track fills and cancel anytime on the Orders tab.',
+          hash,
+        });
         setP2pPlan(null);
         setAmountIn('');
         fetchBalances();
       } else {
-        alert('Order plan ready but no transactions to sign yet. The smart contracts need SAC addresses configured to build real transactions.');
+        setTxStatus({
+          phase: 'error',
+          title: 'Nothing to sign',
+          detail: 'The order plan came back without transactions — try refreshing the quote.',
+        });
       }
     } catch (error: any) {
       console.error('P2P submit error:', error);
-      alert(`Failed to submit: ${error?.message || 'Unknown error'}`);
+      setTxStatus({
+        phase: 'error',
+        title: 'Order failed',
+        detail: error?.message || 'Unknown error',
+      });
     } finally {
       setSubmitting(false);
     }
@@ -935,7 +999,9 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         slippage: instantSlippageBps,
       });
       const { kind, route } = data;
+      const swappedTitle = `Swapped ${parseFloat(amountIn).toLocaleString()} ${tokenIn} → ${formatUnits(quote.netAmountOut, decimalsOf(tokenOut))} ${tokenOut}`;
       let via: string;
+      let lastHash: string | undefined;
       if (kind === 'blend' && Array.isArray(data.legs)) {
         // Split execution: SDEX chunk (classic tx) + AMM chunk (Router tx).
         // Two signatures; each leg carries its own min-out, so a rejected
@@ -943,18 +1009,26 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         // price than quoted.
         let done = 0;
         try {
-          for (const leg of data.legs) {
+          for (const [i, leg] of data.legs.entries()) {
+            setTxStatus({
+              phase: 'confirming',
+              title: `Confirming part ${i + 1} of ${data.legs.length}…`,
+              detail: 'Sign in your wallet, then we watch the chain until it settles.',
+            });
             const signed = await signTransaction(leg.xdr);
-            await submitTransaction(signed);
+            lastHash = (await submitTransaction(signed)).hash;
             done++;
           }
         } catch (err: any) {
           if (done > 0) {
-            alert(
-              `Partially executed: part 1 of your swap filled, part 2 was ` +
-              `cancelled or failed (${err?.message || 'unknown error'}). ` +
-              `The unswapped portion is still in your wallet.`
-            );
+            setTxStatus({
+              phase: 'error',
+              title: 'Partially executed',
+              detail:
+                `Part ${done} of your swap filled; the rest was cancelled or failed ` +
+                `(${err?.message || 'unknown error'}). The unswapped portion is still in your wallet.`,
+              hash: lastHash,
+            });
             setQuote(null);
             fetchBalances();
             return;
@@ -964,19 +1038,33 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         via = (route?.segments || []).map((s: any) => s.venue).join(' + ') + ' (split for better price)';
       } else {
         if (!data.xdr) throw new Error('Backend returned no transaction to sign');
+        setTxStatus({
+          phase: 'confirming',
+          title: 'Confirming swap on-chain…',
+          detail: 'Sign in your wallet, then we watch the chain until it settles.',
+        });
         const signed = await signTransaction(data.xdr);
-        await submitTransaction(signed);
+        lastHash = (await submitTransaction(signed)).hash;
         via = kind === 'classic'
           ? 'Stellar DEX (classic)'
           : (route?.segments || []).map((s: any) => s.venue).join(' + ') || 'DEX route';
       }
-      alert(`Swap submitted via ${via}. Check your wallet balance.`);
+      setTxStatus({
+        phase: 'success',
+        title: swappedTitle,
+        detail: `Settled via ${via}`,
+        hash: lastHash,
+      });
       setAmountIn('');
       setQuote(null);
       fetchBalances();
     } catch (error: any) {
       console.error('Swap error:', error);
-      alert(`Failed: ${error?.message || 'Unknown error'}`);
+      setTxStatus({
+        phase: 'error',
+        title: 'Swap failed',
+        detail: error?.message || 'Unknown error',
+      });
     } finally {
       setSubmitting(false);
     }
@@ -1657,6 +1745,87 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
             >
               {label}
             </button>
+          );
+        })()}
+
+        {/* Transaction status card — pending / settled / failed */}
+        {txStatus && (() => {
+          const palette = {
+            confirming: { color: '#6366f1', bg: 'rgba(99,102,241,0.08)' },
+            success: { color: '#16a34a', bg: 'rgba(22,163,74,0.08)' },
+            error: { color: '#dc2626', bg: 'rgba(220,38,38,0.08)' },
+          }[txStatus.phase];
+          return (
+            <div
+              style={{
+                marginTop: '12px',
+                padding: '12px 14px',
+                borderRadius: '12px',
+                border: `1px solid ${palette.color}55`,
+                background: palette.bg,
+                display: 'flex',
+                gap: '10px',
+                alignItems: 'flex-start',
+              }}
+            >
+              {txStatus.phase === 'confirming' ? (
+                <>
+                  <style>{`@keyframes ufamaSpin { to { transform: rotate(360deg); } }`}</style>
+                  <span
+                    style={{
+                      width: '16px', height: '16px', flexShrink: 0, marginTop: '1px',
+                      border: `2px solid ${palette.color}40`,
+                      borderTopColor: palette.color,
+                      borderRadius: '50%',
+                      animation: 'ufamaSpin 0.8s linear infinite',
+                    }}
+                  />
+                </>
+              ) : (
+                <span
+                  style={{
+                    width: '18px', height: '18px', flexShrink: 0,
+                    borderRadius: '50%', background: palette.color,
+                    color: 'white', fontSize: '12px', fontWeight: 700,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  }}
+                >
+                  {txStatus.phase === 'success' ? '✓' : '!'}
+                </span>
+              )}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: '13px', fontWeight: 600, color: '#e1e4ea' }}>
+                  {txStatus.title}
+                </div>
+                {txStatus.detail && (
+                  <div style={{ fontSize: '12px', color: '#8a8f9c', marginTop: '2px', overflowWrap: 'break-word' }}>
+                    {txStatus.detail}
+                  </div>
+                )}
+                {txStatus.hash && txStatus.phase !== 'confirming' && (
+                  <a
+                    href={`https://stellar.expert/explorer/public/tx/${txStatus.hash}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ fontSize: '12px', color: palette.color, textDecoration: 'none' }}
+                  >
+                    View on stellar.expert ↗
+                  </a>
+                )}
+              </div>
+              {txStatus.phase !== 'confirming' && (
+                <button
+                  onClick={() => setTxStatus(null)}
+                  style={{
+                    background: 'none', border: 'none', cursor: 'pointer',
+                    color: '#565b68', fontSize: '14px', padding: '0 2px', lineHeight: 1,
+                  }}
+                  aria-label="Dismiss"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
           );
         })()}
 
