@@ -987,6 +987,47 @@ app.post('/api/swap/build', async (req, res) => {
       // deferred build params; the frontend re-requests each one after
       // the previous leg settles, sized to the prior hop's GUARANTEED
       // minimum output (any surplus stays in the wallet, as documented).
+
+      // Protocol-skew guard: a stale frontend that predates deferred
+      // legs would pass an empty XDR to the wallet (opaque wallet error,
+      // AFTER leg 1 executed). Refuse with a clear message instead.
+      if (multi.hops.length > 1 && req.body.supportsDeferred !== true) {
+        throw new BadRequest(
+          'This multi-hop swap needs the latest app — refresh the page and try again.'
+        );
+      }
+
+      // Pre-flight every LATER hop before the user signs anything: leg
+      // N+1 can't be balance-simulated until leg N settles, but venue
+      // EXECUTABILITY is checkable now via the adapter's read-only
+      // quote. Catches unregistered pools/pairs upfront so a plan never
+      // knowingly strands the user mid-path on a dead leg. (Price-move
+      // failures remain possible by design — min_out protects the user —
+      // and only v1.2's atomic execute_path removes them entirely.)
+      await Promise.all(
+        multi.hops.slice(1).flatMap((h) =>
+          h.route.instructions
+            .filter((ins) => /^C[A-Z2-7]{55}$/.test(ins.venueContractId))
+            .map(async (ins) => {
+            const out = await stellar.simulateAndParse<bigint>(
+              ins.venueContractId,
+              'quote',
+              [
+                StellarClient.toAddress(h.tokenIn),
+                StellarClient.toAddress(h.tokenOut),
+                StellarClient.toI128(ins.amountIn),
+              ]
+            );
+            if (out === null || out <= 0n) {
+              const sym = (sac: string) => symbolForSac(sac) || `${sac.slice(0, 4)}…`;
+              throw new BadRequest(
+                `A later leg of this route (${sym(h.tokenIn)} → ${sym(h.tokenOut)}) is not executable on-chain right now — no funds were moved. Try again shortly.`
+              );
+            }
+          })
+        )
+      );
+
       const firstXdr = await buildLeg(multi.hops[0]);
       res.json({
         kind: 'blend', // frontend signs legs sequentially, each min-out protected

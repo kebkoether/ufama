@@ -200,7 +200,10 @@ export async function buildSwap(body: {
   const response = await fetch(`${API_BASE}/api/swap/build`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    // supportsDeferred: this build understands multi-hop legs delivered
+    // as deferred build params (backend refuses deferred plans to older
+    // frontends instead of letting them pass empty XDRs to the wallet).
+    body: JSON.stringify({ ...body, supportsDeferred: true }),
   });
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
