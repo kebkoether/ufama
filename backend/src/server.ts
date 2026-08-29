@@ -156,6 +156,28 @@ function resolveTokenParam(value: unknown, field: string): string {
   }
 }
 
+/**
+ * Translate an on-chain simulation failure into a message a user can act
+ * on. Returns null for anything that isn't a recognizable sim failure —
+ * those keep the generic label (and the full detail in the logs).
+ */
+function explainSimError(error: unknown): string | null {
+  if (!(error instanceof Error)) return null;
+  const m = error.message;
+  if (!/simulation failed/i.test(m)) return null;
+  const code = m.match(/Error\(Contract, #(\d+)\)/)?.[1];
+  if (/resulting balance is not within the allowed range/i.test(m)) {
+    return 'Insufficient balance: this swap would overdraw one of your tokens. Lower the amount and try again.';
+  }
+  if (/trustline.*(missing|not found)|missing.*trustline/i.test(m)) {
+    return 'Your wallet is missing a trustline for one of the assets in this swap.';
+  }
+  if (code === '6') {
+    return 'A venue on this route has no registered pool for the pair yet — try again shortly or pick a different pair.';
+  }
+  return `The swap was rejected in on-chain simulation (contract error #${code ?? 'unknown'}). No funds were moved.`;
+}
+
 function handleError(res: express.Response, error: unknown, label: string): void {
   if (error instanceof BadRequest) {
     res.status(400).json({ error: error.message });
@@ -163,6 +185,12 @@ function handleError(res: express.Response, error: unknown, label: string): void
   }
   if (error instanceof BlockedAddressError) {
     res.status(403).json({ error: error.message });
+    return;
+  }
+  const explained = explainSimError(error);
+  if (explained) {
+    console.error(`${label} (sim):`, error instanceof Error ? error.message.slice(0, 2000) : error);
+    res.status(400).json({ error: explained });
     return;
   }
   console.error(`${label}:`, error);
