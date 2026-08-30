@@ -84,14 +84,16 @@ export const TOKENS: Record<string, TokenConfig> = {
   USDT0: {
     symbol: 'USDT0',
     name: 'USDT0 (Tether via LayerZero)',
-    // Addresses provided by Klint 2026-08-25, pre-launch. Issuer has no
-    // home_domain set yet and clawback enabled (auth_revocable) — keep
-    // coming_soon until liquidity exists, then flip via env
-    // TOKEN_USDT0_STATUS=live (no code change needed).
+    // LIVE 2026-08-30: Sushi USDT0/USDC@0.05% pool
+    // CBVHBZSZOS6KRDJ4D44FU2YLIENOVSSLM3UGKW6XQMVIFUAMWIWCVH2U seeded
+    // ~$10k at parity (verified on-chain). Issuer still has no
+    // home_domain (no SEP-1 badge) and clawback stays enabled
+    // (auth_revocable + auth_clawback_enabled) — standard for
+    // LayerZero-bridged Tether, but worth knowing.
     issuer: 'GATISXX6BZ6NC7IKQBY37CJD4SOZL3CYZJWXEDG6JVIY4WBS6KXJHN6Q',
     sacAddress: 'CBSJZEIO5C7KC2SF3MKSNXXJSW5G3VTNBX4ATMKUI3B2MR4JKM4R26YF',
     decimals: 7,
-    status: 'coming_soon',
+    status: 'live',
   },
   // SolvBTC placeholder removed 2026-08-22: Solv assets ARE live on the
   // DEXes (xSolvBTC on Aqua, SOLVBTC on Sushi) and venue discovery lists
