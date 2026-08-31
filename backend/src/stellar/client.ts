@@ -148,6 +148,36 @@ export class StellarClient {
     return null;
   }
 
+  /** Cached network fee stats → per-op inclusion-fee bid in stroops. */
+  private feeCache: { at: number; soroban: string; classic: string } | null = null;
+
+  /**
+   * Size the inclusion fee from live network traffic (p90 of recent
+   * inclusion fees, doubled for headroom) so surge pricing doesn't bounce
+   * user transactions with txInsufficientFee. Floors match the old fixed
+   * bids; caps keep a runaway surge from bidding more than ~1 XLM
+   * (Soroban, single-op) / 0.1 XLM per classic op. Stats are cached 30s;
+   * if the RPC can't serve them we fall back to the floors.
+   */
+  private async inclusionFee(kind: 'soroban' | 'classic'): Promise<string> {
+    const now = Date.now();
+    if (!this.feeCache || now - this.feeCache.at > 30_000) {
+      let soroban = '200';
+      let classic = '10000';
+      try {
+        const stats = await this.server.getFeeStats();
+        const bid = (p90: string | undefined, floor: number, cap: number) =>
+          Math.min(cap, Math.max(floor, Number(p90 ?? 0) * 2)).toString();
+        soroban = bid(stats.sorobanInclusionFee?.p90, 200, 10_000_000);
+        classic = bid(stats.inclusionFee?.p90, 10_000, 1_000_000);
+      } catch {
+        // fee stats unavailable — keep the floor bids
+      }
+      this.feeCache = { at: now, soroban, classic };
+    }
+    return kind === 'soroban' ? this.feeCache.soroban : this.feeCache.classic;
+  }
+
   /**
    * Build a transaction for a contract call (unsigned).
    * The frontend signs this with the user's wallet.
@@ -163,7 +193,7 @@ export class StellarClient {
 
     const account = await this.server.getAccount(sourceAddress);
     const tx = new TransactionBuilder(account, {
-      fee: '100',
+      fee: await this.inclusionFee('soroban'),
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(operation)
@@ -203,7 +233,7 @@ export class StellarClient {
   }): Promise<string> {
     const account = await this.server.getAccount(opts.sourceAddress);
     const builder = new TransactionBuilder(account, {
-      fee: '10000',
+      fee: await this.inclusionFee('classic'),
       networkPassphrase: this.networkPassphrase,
     }).addOperation(
       Operation.pathPaymentStrictSend({
@@ -239,7 +269,7 @@ export class StellarClient {
   }): Promise<string> {
     const account = await this.server.getAccount(opts.sourceAddress);
     return new TransactionBuilder(account, {
-      fee: '10000',
+      fee: await this.inclusionFee('classic'),
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(Operation.changeTrust({ asset: opts.asset }))
