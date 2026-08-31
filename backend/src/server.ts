@@ -300,6 +300,10 @@ const twapKeeper = new TwapKeeperService({
   routingEngine,
   intervalMs: 30 * 1000, // 30 seconds
   keeperSecretKey: process.env.KEEPER_SECRET_KEY ?? process.env.ADMIN_SECRET_KEY,
+  // Opportunistic slice sizing: fill to the pace ceiling when the market
+  // is at/near oracle fair value (hoisted fns — resolved at tick time)
+  fairValue,
+  tokenMeta: (sac) => ({ decimals: decimalsForSac(sac), symbol: symbolForSac(sac) }),
 });
 twapKeeper.start();
 
@@ -1412,6 +1416,119 @@ app.post('/api/peer-swap/build', async (req, res) => {
 // ─── TWAP endpoints ─────────────────────────────────────
 
 /**
+ * GET /api/twap/recommend?tokenIn&tokenOut&amountIn
+ *
+ * Suggests an execution window for a TWAP of this size. Two forces set
+ * the slice count: each slice should carry enough notional that fixed
+ * spreads/rounding don't dominate (~$25 floor), and each slice should
+ * move the pool by only a few bps (impact / 10). Window = slices spaced
+ * far enough apart that arbitrageurs can refill between them. An
+ * ESTIMATE for convenience only — the response carries a disclaimer the
+ * UI must show.
+ */
+app.get('/api/twap/recommend', async (req, res) => {
+  try {
+    const tokenIn = resolveTokenParam(req.query.tokenIn, 'tokenIn');
+    const tokenOut = resolveTokenParam(req.query.tokenOut, 'tokenOut');
+    const amountIn = parseAmount(req.query.amountIn, 'amountIn');
+    const decIn = decimalsForSac(tokenIn);
+    const units = Number(amountIn) / 10 ** decIn;
+    const priceIn = await fairValue
+      .priceUsd(tokenIn, symbolForSac(tokenIn))
+      .catch(() => null);
+    const notionalUsd = priceIn ? units * priceIn : null;
+
+    // Full-size impact estimate (best-effort — recommendation still
+    // works off notional alone when there's no direct route)
+    let impactBps = 0;
+    try {
+      const route = await routingEngine.computeRoute(
+        tokenIn,
+        tokenOut,
+        amountIn,
+        50,
+        { executableOnly: true },
+        { in: decIn, out: decimalsForSac(tokenOut) }
+      );
+      impactBps = Math.max(0, route.priceImpactBps ?? 0);
+    } catch {
+      /* no direct route */
+    }
+
+    const MIN_SLICE_USD = 25;
+    const REFILL_MINUTES = 2; // spacing that lets arbs re-center the pool
+    const maxUsefulSlices = notionalUsd
+      ? Math.max(1, Math.floor(notionalUsd / MIN_SLICE_USD))
+      : 60;
+    const slicesForImpact = Math.max(1, Math.ceil(impactBps / 10));
+    const slices = Math.min(maxUsefulSlices, slicesForImpact);
+    const recommendedMinutes =
+      slices <= 1 ? 0 : Math.max(30, slices * REFILL_MINUTES);
+
+    // Estimated receive: oracle fair output minus the TWAP protocol fee
+    // (10 bps cap) and the expected per-slice venue cost. Network fees
+    // for slice execution are paid by the protocol's keeper, NOT the
+    // maker — so they don't reduce the estimate.
+    const TWAP_FEE_BPS = 10;
+    let estimatedOut: number | null = null;
+    let sliceCostBps: number | null = null;
+    const priceOut = await fairValue
+      .priceUsd(tokenOut, symbolForSac(tokenOut))
+      .catch(() => null);
+    if (priceIn && priceOut && units > 0) {
+      try {
+        const sliceIn = amountIn / BigInt(Math.max(1, slices));
+        if (sliceIn > 0n) {
+          const sliceRoute = await routingEngine.computeRoute(
+            tokenIn,
+            tokenOut,
+            sliceIn,
+            50,
+            { executableOnly: true },
+            { in: decIn, out: decimalsForSac(tokenOut) }
+          );
+          sliceCostBps = await fairValue.vsOracleBps({
+            tokenInSac: tokenIn,
+            tokenOutSac: tokenOut,
+            symbolIn: symbolForSac(tokenIn),
+            symbolOut: symbolForSac(tokenOut),
+            amountIn: sliceIn,
+            netAmountOut: sliceRoute.netAmountOut,
+            decimalsIn: decIn,
+            decimalsOut: decimalsForSac(tokenOut),
+          });
+        }
+      } catch {
+        /* estimate degrades to impact-based below */
+      }
+      const fairOut = (units * priceIn) / priceOut;
+      const costBps =
+        (sliceCostBps ?? Math.max(impactBps, 5)) + TWAP_FEE_BPS;
+      estimatedOut =
+        Math.round(fairOut * (1 - Math.max(0, costBps) / 10000) * 1e7) / 1e7;
+    }
+
+    res.json({
+      recommendedMinutes,
+      slices,
+      estimatedOut,
+      sliceCostBps,
+      twapFeeBps: TWAP_FEE_BPS,
+      notionalUsd: notionalUsd ? Math.round(notionalUsd * 100) / 100 : null,
+      impactBps: Math.round(impactBps * 10) / 10,
+      note:
+        slices <= 1
+          ? 'This order is small enough that a single instant swap likely executes better than a TWAP — per-slice fees would dominate.'
+          : `Sized so each of ~${slices} slices carries meaningful notional and moves the market only a few bps.`,
+      disclaimer:
+        'Estimate based on current pool depth and oracle prices; markets move and past depth is no guarantee. Not financial advice — you choose the window.',
+    });
+  } catch (error) {
+    handleError(res, error, 'Failed to compute TWAP recommendation');
+  }
+});
+
+/**
  * GET /api/twap/fee
  *
  * Current TWAP protocol fee, read from the TwapBook contract (get_fee).
@@ -1587,7 +1704,12 @@ app.get('/api/twap/orders', async (req, res) => {
         maxSlippageBps: Number(raw.max_slippage_bps),
         lastSliceLedger: Number(raw.last_slice_ledger),
         status: scEnum(raw.status),
-        // convenience for the UI
+        // convenience for the UI — decimals/symbols so amounts render
+        // correctly for non-7-decimal and high-unit-price tokens
+        tokenInSymbol: symbolForSac(String(raw.token_in)),
+        tokenOutSymbol: symbolForSac(String(raw.token_out)),
+        tokenInDecimals: decimalsForSac(String(raw.token_in)),
+        tokenOutDecimals: decimalsForSac(String(raw.token_out)),
         pctFilled: Number((BigInt(raw.filled_in) * 10000n) / BigInt(raw.total_in)) / 100,
         pctElapsed: Math.min(
           100,

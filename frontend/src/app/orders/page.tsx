@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useWallet } from '@/context/WalletContext';
 import { getUserOrders, buildCancelOrder, submitTransaction, getTwapOrders, buildTwapCancel } from '@/lib/api';
+import { formatUnits } from '@/lib/units';
 
 interface Order {
   id: number;
@@ -68,9 +69,24 @@ export default function OrdersPage() {
   }, [address]);
 
   useEffect(() => {
-    if (connected && address) {
-      fetchOrders();
-    }
+    if (!(connected && address)) return;
+    fetchOrders();
+    // Live progress: TWAP slices land every ~30s, so poll quietly (no
+    // loading flicker) — the first fill shows up moments after placement
+    // instead of waiting for a manual refresh.
+    const timer = setInterval(async () => {
+      try {
+        const [userOrders, userTwaps] = await Promise.all([
+          getUserOrders(address),
+          getTwapOrders(address).catch(() => []),
+        ]);
+        setOrders(userOrders || []);
+        setTwapOrders(userTwaps || []);
+      } catch {
+        // transient — keep the previous snapshot
+      }
+    }, 15_000);
+    return () => clearInterval(timer);
   }, [connected, address, fetchOrders]);
 
   const handleCancel = useCallback(
@@ -169,17 +185,24 @@ export default function OrdersPage() {
                       {t.status}
                     </span>
                   </div>
-                  <button
-                    onClick={() => handleTwapCancel(t.id)}
-                    disabled={twapCancelling === t.id}
-                    style={{
-                      padding: '6px 12px', borderRadius: '8px', fontSize: '12px', fontWeight: 600,
-                      border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.08)',
-                      color: '#ef4444', cursor: twapCancelling === t.id ? 'wait' : 'pointer',
-                    }}
-                  >
-                    {twapCancelling === t.id ? 'Cancelling…' : 'Cancel · refund rest'}
-                  </button>
+                  {/* Only Active orders can be cancelled — a Cancelled/
+                      Completed order keeping its button implied there was
+                      something left to do (there isn't; the refund is
+                      part of the cancel, so the label doesn't say it). */}
+                  {t.status === 'Active' && (
+                    <button
+                      onClick={() => handleTwapCancel(t.id)}
+                      disabled={twapCancelling === t.id}
+                      style={{
+                        padding: '6px 12px', borderRadius: '8px', fontSize: '12px', fontWeight: 600,
+                        border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.08)',
+                        color: '#ef4444', cursor: twapCancelling === t.id ? 'wait' : 'pointer',
+                      }}
+                      title="Stops the schedule; whatever hasn't been swapped is refunded to your wallet in the same transaction."
+                    >
+                      {twapCancelling === t.id ? 'Cancelling…' : 'Cancel'}
+                    </button>
+                  )}
                 </div>
 
                 {/* Progress: fill vs schedule */}
@@ -190,14 +213,16 @@ export default function OrdersPage() {
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', color: '#8a8f9c' }}>
                   <span>
-                    Filled {(parseInt(t.filledIn) / 1e7).toLocaleString(undefined, { maximumFractionDigits: 2 })} / {(parseInt(t.totalIn) / 1e7).toLocaleString(undefined, { maximumFractionDigits: 2 })} ({pctFilled.toFixed(1)}%)
+                    {/* significant-digit formatting: a SolvBTC TWAP must
+                        not render as 0.00 / 0.00 */}
+                    Filled {formatUnits(t.filledIn, t.tokenInDecimals ?? 7)} / {formatUnits(t.totalIn, t.tokenInDecimals ?? 7)} {t.tokenInSymbol || ''} ({pctFilled.toFixed(1)}%)
                   </span>
                   <span>
                     {pctElapsed.toFixed(0)}% of window elapsed{behind ? ' · catching up' : ''}
                   </span>
                 </div>
                 <div style={{ marginTop: '6px', fontSize: '12px', color: '#565b68' }}>
-                  Received so far: {(parseInt(t.receivedOut) / 1e7).toLocaleString(undefined, { maximumFractionDigits: 4 })} (streams to your wallet each slice)
+                  Received so far: {formatUnits(t.receivedOut, t.tokenOutDecimals ?? 7)} {t.tokenOutSymbol || ''} (streams to your wallet each slice)
                 </div>
               </div>
             );
