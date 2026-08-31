@@ -207,6 +207,9 @@ export class Pathfinder {
         { in: this.decimalsForSac(tin), out: this.decimalsForSac(tout) }
       );
       if (route.segments.length === 0 || route.netAmountOut <= 0n) return null;
+      if (process.env.PATHFINDER_DEBUG) {
+        console.log(`[pf] hop ${tin.slice(0,4)}->${tout.slice(0,4)} in=${amt} out=${route.netAmountOut} segs=${route.segments.map((s) => `${s.venueName}:${s.amountIn}->${s.expectedAmountOut}`).join('|')}`);
+      }
       const minOut = (route.netAmountOut * BigInt(10000 - slippageBps)) / 10000n;
       if (minOut <= 0n) return null;
       hops.push({ tokenIn: tin, tokenOut: tout, amountIn: amt, minOut, route });
