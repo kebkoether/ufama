@@ -14,6 +14,8 @@ interface RoutePreviewProps {
     blendedBps: number;
     /** True price impact vs small-size spot rate (unit-safe) */
     priceImpactBps?: number;
+    /** All-in cost vs oracle fair value (negative = better than fair) */
+    vsOracleBps?: number | null;
     /** Symbols + decimals attached by SwapWidget for labeling amounts */
     tokenInSymbol?: string;
     tokenOutSymbol?: string;
@@ -314,21 +316,52 @@ export default function RoutePreview({ route }: RoutePreviewProps) {
         </>
       )}
 
-      {/* Footer: true price impact (falls back to hiding when unavailable) */}
+      {/* Footer: cost breakdown mirroring the quote panel — price impact
+          (how much THIS SIZE moves the pool) plus, when oracles cover
+          both tokens, the all-in cost vs fair value (venue fees
+          included). Two-line convention per Uniswap (impact + fees),
+          upgraded with the aggregator-style external reference price
+          (Jupiter warns vs CoinGecko; we use on-chain RedStone/Reflector). */}
       {route.priceImpactBps !== undefined && (
         <div
           style={{
-            display: 'flex',
-            justifyContent: 'space-between',
             marginTop: '12px',
             paddingTop: '12px',
             borderTop: '1px solid #1a1f2e',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '4px',
           }}
         >
-          <span style={{ fontSize: '12px', color: '#565b68' }}>Price impact</span>
-          <span style={{ fontSize: '13px', fontWeight: 600, color: '#6366f1' }}>
-            ~{Math.max(0, route.priceImpactBps).toFixed(1)} bps
-          </span>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ fontSize: '12px', color: '#565b68' }}>Price impact</span>
+            <span style={{ fontSize: '13px', fontWeight: 600, color: '#eab308' }}>
+              ~{Math.max(0, route.priceImpactBps).toFixed(1)} bps
+            </span>
+          </div>
+          {typeof route.vsOracleBps === 'number' && (
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ fontSize: '12px', color: '#565b68' }}>Total cost (vs oracle)</span>
+              <span
+                style={{
+                  fontSize: '13px',
+                  fontWeight: 600,
+                  color:
+                    route.vsOracleBps < 0
+                      ? '#22c55e' // better than fair value
+                      : route.vsOracleBps > 300
+                      ? '#dc2626' // strong deviation from fair — warn
+                      : route.vsOracleBps > 100
+                      ? '#eab308'
+                      : '#6366f1',
+                }}
+              >
+                {route.vsOracleBps < 0
+                  ? `${(-route.vsOracleBps).toFixed(1)} bps better than fair`
+                  : `${route.vsOracleBps.toFixed(1)} bps`}
+              </span>
+            </div>
+          )}
         </div>
       )}
     </div>
