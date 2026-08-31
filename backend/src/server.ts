@@ -25,6 +25,7 @@ import { OraclePriceService } from './services/oracle.js';
 import { TimerSweepService } from './services/timer-sweep.js';
 import { assertNotBlocked, isBlocked, BlockedAddressError } from './services/screening.js';
 import { Sep1Verifier } from './services/sep1-verify.js';
+import { FairValueService } from './services/fair-value.js';
 import { TokenDiscoveryService } from './services/token-discovery.js';
 import { TwapKeeperService } from './services/twap-keeper.js';
 
@@ -246,6 +247,9 @@ console.log('');
 const routingEngine = new RoutingEngine(registry);
 // Multi-hop pathfinder (deferred init: needs decimalsForSac, defined below)
 let pathfinder: Pathfinder;
+
+// Oracle fair-value reads (RedStone + Reflector) for quote honesty
+const fairValue = new FairValueService(stellar);
 
 // ─── Background Services ───────────────────────────────
 
@@ -660,12 +664,30 @@ app.get('/api/quote', async (req, res) => {
       return;
     }
 
+    // Honest cost figure: net output vs ORACLE fair value (RedStone /
+    // Reflector). Raw unit-count bps mislead on non-pegged pairs and
+    // price impact excludes venue fees — this is what the trade actually
+    // cost. null (field omitted) when a token has no feed.
+    const vsOracleBps = await fairValue
+      .vsOracleBps({
+        tokenInSac: tokenIn,
+        tokenOutSac: tokenOut,
+        symbolIn: symbolForSac(tokenIn),
+        symbolOut: symbolForSac(tokenOut),
+        amountIn,
+        netAmountOut: multi && multiOut > directOut ? multiOut : directOut,
+        decimalsIn: decimalsForSac(tokenIn),
+        decimalsOut: decimalsForSac(tokenOut),
+      })
+      .catch(() => null);
+
     if (multi && multiOut > directOut) {
       const label = pathLabel(multi.path);
       res.json({
         tokenIn,
         tokenOut,
         amountIn: amountIn.toString(),
+        vsOracleBps,
         expectedOut: multiOut.toString(),
         netAmountOut: multiOut.toString(),
         protocolFee: '0',
@@ -711,6 +733,7 @@ app.get('/api/quote', async (req, res) => {
       tokenIn: route.tokenIn,
       tokenOut: route.tokenOut,
       amountIn: route.totalAmountIn.toString(),
+      vsOracleBps,
       expectedOut: route.totalExpectedOut.toString(),
       netAmountOut: route.netAmountOut.toString(),
       protocolFee: route.protocolFee.toString(),
