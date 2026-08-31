@@ -1654,14 +1654,23 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
               // Protocol fee expressed against the output, in bps.
               const feeBps = outAmt > 0 ? (Number(quote.protocolFee ?? 0) / outAmt) * 10000 : 0;
               const impactBps = Math.max(0, quote.priceImpactBps ?? 0);
-              // Total cost in OUTPUT-TOKEN units — concrete beats abstract.
-              // $-prefixed only when the output token is a USD stable.
-              const totalBps = impactBps + feeBps;
-              const costUnits = (totalBps / 10000) * fromBaseUnits(String(outAmt), decimalsOf(tokenOut));
+              // Total cost: the backend's oracle-referenced figure (net
+              // output vs RedStone/Reflector fair value — the honest
+              // all-in number, venue fees included) when a feed covers
+              // both tokens; impact+fee fallback otherwise. Negative
+              // means the pool paid better than fair.
+              const vsOracle =
+                typeof quote.vsOracleBps === 'number' ? quote.vsOracleBps : null;
+              const totalBps = vsOracle ?? impactBps + feeBps;
+              const costUnits = (Math.abs(totalBps) / 10000) * fromBaseUnits(String(outAmt), decimalsOf(tokenOut));
               const isUsdStable = ['USDC', 'PYUSD', 'USDT0', 'USDY'].includes(tokenOut);
-              const costStr = costUnits > 0
-                ? `≈ ${isUsdStable ? '$' : ''}${costUnits.toLocaleString('en-US', { maximumFractionDigits: costUnits < 1 ? 4 : 2 })}${isUsdStable ? '' : ' ' + tokenOut} (${totalBps.toFixed(1)} bps)`
-                : `${totalBps.toFixed(1)} bps`;
+              const suffix = vsOracle !== null ? ' vs fair value' : '';
+              const costStr =
+                vsOracle !== null && vsOracle < 0
+                  ? `${(-vsOracle).toFixed(1)} bps BETTER than fair value`
+                  : costUnits > 0
+                  ? `≈ ${isUsdStable ? '$' : ''}${costUnits.toLocaleString('en-US', { maximumFractionDigits: costUnits < 1 ? 4 : 2 })}${isUsdStable ? '' : ' ' + tokenOut} (${totalBps.toFixed(1)} bps${suffix})`
+                  : `${totalBps.toFixed(1)} bps${suffix}`;
               return [
                 { label: 'Rate', value: rateStr },
                 {
@@ -1672,7 +1681,12 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
                   color: parseInt(quote.swapBookAmountOut ?? '0') > 0 ? '#22c55e' : '#8a8f9c',
                 },
                 { label: 'Price impact', value: `~${impactBps.toFixed(1)} bps`, color: '#eab308' },
-                { label: 'Total cost', value: costStr, color: '#6366f1', bold: true },
+                {
+                  label: vsOracle !== null ? 'Total cost (vs oracle)' : 'Total cost',
+                  value: costStr,
+                  color: vsOracle !== null && vsOracle < 0 ? '#22c55e' : '#6366f1',
+                  bold: true,
+                },
               ];
             })().map((row: any) => (
               <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', padding: '3px 0' }}>
