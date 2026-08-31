@@ -263,14 +263,45 @@ export class RoutingEngine {
   ): Tranche[] {
     const tranches: Tranche[] = [];
 
-    for (let i = 0; i < quotes.length; i++) {
-      const from = i === 0 ? 0n : depthLevels[i - 1];
-      const to = depthLevels[i];
-      const amount = to - from;
+    // Marginal math must diff against the last level whose quote
+    // SUCCEEDED. Diffing against a failed (zero-output) level attributed
+    // the entire cumulative output to one thin slice — a phantom
+    // better-than-spot rate that made junk multi-hop paths (XLM→SHX→…)
+    // look like arbitrage and beat honest direct routes.
+    let lastGood = -1;
 
-      // Marginal output for this tranche
-      const prevOut = i === 0 ? 0n : quotes[i - 1].amountOut;
-      const marginalOut = quotes[i].amountOut - prevOut;
+    // Hard AMM invariant: no marginal rate can beat the smallest-probe
+    // (≈spot) rate. Caps whatever slips past the baseline fix (e.g. a
+    // failed FIRST level).
+    const firstGood = quotes.findIndex((q) => q.amountOut > 0n);
+    const spotOut = firstGood >= 0 ? quotes[firstGood].amountOut : 0n;
+    const spotIn = firstGood >= 0 ? depthLevels[firstGood] : 0n;
+
+    for (let i = 0; i < quotes.length; i++) {
+      const to = depthLevels[i];
+      if (quotes[i].amountOut <= 0n) {
+        // Failed/empty level: unusable range, never a baseline.
+        const from = i === 0 ? 0n : depthLevels[i - 1];
+        tranches.push({
+          venueId: adapter.venueId,
+          venueName: adapter.name,
+          from,
+          to,
+          amount: to - from,
+          marginalBps: Infinity,
+          expectedOut: 0n,
+        });
+        continue;
+      }
+
+      const from = lastGood < 0 ? 0n : depthLevels[lastGood];
+      const amount = to - from;
+      const prevOut = lastGood < 0 ? 0n : quotes[lastGood].amountOut;
+      let marginalOut = quotes[i].amountOut - prevOut;
+      if (spotOut > 0n && spotIn > 0n) {
+        const cap = (amount * spotOut) / spotIn;
+        if (marginalOut > cap) marginalOut = cap;
+      }
       const marginalBps =
         amount > 0n
           ? Number(((amount - marginalOut) * 10000n) / amount)
@@ -285,6 +316,7 @@ export class RoutingEngine {
         marginalBps,
         expectedOut: marginalOut,
       });
+      lastGood = i;
     }
 
     return tranches;
