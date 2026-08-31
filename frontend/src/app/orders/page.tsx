@@ -68,9 +68,24 @@ export default function OrdersPage() {
   }, [address]);
 
   useEffect(() => {
-    if (connected && address) {
-      fetchOrders();
-    }
+    if (!(connected && address)) return;
+    fetchOrders();
+    // Live progress: TWAP slices land every ~30s, so poll quietly (no
+    // loading flicker) — the first fill shows up moments after placement
+    // instead of waiting for a manual refresh.
+    const timer = setInterval(async () => {
+      try {
+        const [userOrders, userTwaps] = await Promise.all([
+          getUserOrders(address),
+          getTwapOrders(address).catch(() => []),
+        ]);
+        setOrders(userOrders || []);
+        setTwapOrders(userTwaps || []);
+      } catch {
+        // transient — keep the previous snapshot
+      }
+    }, 15_000);
+    return () => clearInterval(timer);
   }, [connected, address, fetchOrders]);
 
   const handleCancel = useCallback(
@@ -169,17 +184,24 @@ export default function OrdersPage() {
                       {t.status}
                     </span>
                   </div>
-                  <button
-                    onClick={() => handleTwapCancel(t.id)}
-                    disabled={twapCancelling === t.id}
-                    style={{
-                      padding: '6px 12px', borderRadius: '8px', fontSize: '12px', fontWeight: 600,
-                      border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.08)',
-                      color: '#ef4444', cursor: twapCancelling === t.id ? 'wait' : 'pointer',
-                    }}
-                  >
-                    {twapCancelling === t.id ? 'Cancelling…' : 'Cancel · refund rest'}
-                  </button>
+                  {/* Only Active orders can be cancelled — a Cancelled/
+                      Completed order keeping its button implied there was
+                      something left to do (there isn't; the refund is
+                      part of the cancel, so the label doesn't say it). */}
+                  {t.status === 'Active' && (
+                    <button
+                      onClick={() => handleTwapCancel(t.id)}
+                      disabled={twapCancelling === t.id}
+                      style={{
+                        padding: '6px 12px', borderRadius: '8px', fontSize: '12px', fontWeight: 600,
+                        border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.08)',
+                        color: '#ef4444', cursor: twapCancelling === t.id ? 'wait' : 'pointer',
+                      }}
+                      title="Stops the schedule; whatever hasn't been swapped is refunded to your wallet in the same transaction."
+                    >
+                      {twapCancelling === t.id ? 'Cancelling…' : 'Cancel'}
+                    </button>
+                  )}
                 </div>
 
                 {/* Progress: fill vs schedule */}

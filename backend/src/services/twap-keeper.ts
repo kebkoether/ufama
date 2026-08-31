@@ -42,6 +42,11 @@ function muldivCeil(a: bigint, b: bigint, d: bigint): bigint {
   return (a * b + d - 1n) / d;
 }
 
+/** Sizing up is allowed when the market is within this many bps of
+ *  oracle fair value (vsOracleBps ≤ threshold; negative = better than
+ *  fair, always qualifies). */
+const OPPORTUNITY_BPS = Number(process.env.TWAP_OPPORTUNITY_BPS ?? '10');
+
 export class TwapKeeperService {
   private stellar: StellarClient;
   private twapBookContractId: string;
@@ -50,6 +55,8 @@ export class TwapKeeperService {
   private timer: ReturnType<typeof setInterval> | null = null;
   private keeper: InstanceType<typeof Keypair> | null = null;
   private ticking = false;
+  private fairValue?: import('./fair-value.js').FairValueService;
+  private tokenMeta?: (sac: string) => { decimals: number; symbol: string };
 
   constructor(opts: {
     stellar: StellarClient;
@@ -59,11 +66,17 @@ export class TwapKeeperService {
     intervalMs?: number;
     /** Keeper signing key. Omit for dry-run mode. */
     keeperSecretKey?: string;
+    /** Oracle fair-value reads — enables opportunistic slice sizing. */
+    fairValue?: import('./fair-value.js').FairValueService;
+    /** Token decimals+symbol lookup for oracle comparisons. */
+    tokenMeta?: (sac: string) => { decimals: number; symbol: string };
   }) {
     this.stellar = opts.stellar;
     this.twapBookContractId = opts.twapBookContractId;
     this.routingEngine = opts.routingEngine;
     this.intervalMs = opts.intervalMs ?? 30 * 1000;
+    this.fairValue = opts.fairValue;
+    this.tokenMeta = opts.tokenMeta;
     if (opts.keeperSecretKey) {
       try {
         this.keeper = Keypair.fromSecret(opts.keeperSecretKey);
@@ -193,6 +206,50 @@ export class TwapKeeperService {
     let slice = endGame
       ? onSchedule + headroom - order.filledIn
       : onSchedule - order.filledIn;
+
+    // Opportunistic (VWAP-flavored) sizing: when the market currently
+    // pays at/near oracle fair value, fill up to the pace CEILING
+    // (schedule + the maker's tolerance band) instead of just to the
+    // schedule line — capture good liquidity while it's there, drift
+    // back toward schedule when pricing is poor. The contract enforces
+    // the ceiling regardless; tolerance-0 makers have opted out.
+    if (!endGame && this.fairValue && this.tokenMeta && order.paceToleranceBps > 0) {
+      let ceiling = onSchedule + headroom - order.filledIn;
+      if (ceiling > order.maxSliceIn) ceiling = order.maxSliceIn;
+      if (ceiling > remaining) ceiling = remaining;
+      if (ceiling > slice && ceiling > 0n) {
+        try {
+          const probe = await this.routingEngine.computeRoute(
+            order.tokenIn,
+            order.tokenOut,
+            ceiling,
+            50,
+            { executableOnly: true }
+          );
+          const inMeta = this.tokenMeta(order.tokenIn);
+          const outMeta = this.tokenMeta(order.tokenOut);
+          const vs = await this.fairValue.vsOracleBps({
+            tokenInSac: order.tokenIn,
+            tokenOutSac: order.tokenOut,
+            symbolIn: inMeta.symbol,
+            symbolOut: outMeta.symbol,
+            amountIn: ceiling,
+            netAmountOut: probe.netAmountOut,
+            decimalsIn: inMeta.decimals,
+            decimalsOut: outMeta.decimals,
+          });
+          if (vs !== null && vs <= OPPORTUNITY_BPS) {
+            console.log(
+              `[TwapKeeper] order #${id}: market at fair (${vs}bps vs oracle) — sizing up ${slice} → ${ceiling}`
+            );
+            slice = ceiling;
+          }
+        } catch {
+          // probe failed — keep the schedule-paced slice
+        }
+      }
+    }
+
     if (slice <= 0n) return; // on pace (or at ceiling) — wait
     if (slice > order.maxSliceIn) slice = order.maxSliceIn;
     if (slice > remaining) slice = remaining;

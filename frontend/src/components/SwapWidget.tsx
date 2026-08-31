@@ -528,6 +528,36 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
   const [instantSlippageBps, setInstantSlippageBps] = useState(50);
   // TWAP controls
   const [twapDurationMin, setTwapDurationMin] = useState(360); // 6h default
+  // Size-aware window suggestion (estimate only — rendered with its
+  // disclaimer). Fetched debounced whenever the TWAP inputs change.
+  const [twapRec, setTwapRec] = useState<{
+    recommendedMinutes: number;
+    slices: number;
+    estimatedOut?: number | null;
+    note: string;
+    disclaimer: string;
+  } | null>(null);
+  useEffect(() => {
+    if (mode !== 'twap' || !amountIn || parseFloat(amountIn) <= 0) {
+      setTwapRec(null);
+      return;
+    }
+    const t = setTimeout(async () => {
+      try {
+        const params = new URLSearchParams({
+          tokenIn: tokenParam(tokenIn),
+          tokenOut: tokenParam(tokenOut),
+          amountIn: toBaseUnits(amountIn, decimalsOf(tokenIn)),
+        });
+        const res = await fetch(`${API_BASE}/api/twap/recommend?${params}`);
+        setTwapRec(res.ok ? await res.json() : null);
+      } catch {
+        setTwapRec(null);
+      }
+    }, 700);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, amountIn, tokenIn, tokenOut]);
   const [twapLimitPrice, setTwapLimitPrice] = useState('');
   const [twapMaxSlicePct, setTwapMaxSlicePct] = useState(10);
   const [twapFeeBps, setTwapFeeBps] = useState<number | null>(null);
@@ -1318,6 +1348,23 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
                 ))}
               </div>
 
+              {/* Size-aware window suggestion, with its liability language */}
+              {twapRec && (
+                <div style={{ marginTop: '10px', padding: '8px 10px', borderRadius: '8px', background: 'rgba(99,102,241,0.06)', border: '1px solid rgba(99,102,241,0.25)' }}>
+                  <div style={{ fontSize: '12px', color: '#a5b4fc' }}>
+                    {twapRec.recommendedMinutes <= 0
+                      ? '💡 For this size, an instant swap likely beats a TWAP.'
+                      : `💡 Suggested window for this size: ~${twapRec.recommendedMinutes >= 60 ? `${Math.round(twapRec.recommendedMinutes / 60)}h` : `${twapRec.recommendedMinutes}m`} (≈${twapRec.slices} slices).`}
+                    {typeof twapRec.estimatedOut === 'number' && twapRec.estimatedOut > 0 && (
+                      <> Est. receive ≈ {twapRec.estimatedOut.toLocaleString('en-US', { maximumFractionDigits: 4 })} {tokenOut} after fees (slice gas is paid by the protocol, not you).</>
+                    )}
+                  </div>
+                  <div style={{ fontSize: '10px', color: '#565b68', marginTop: '3px' }}>
+                    {twapRec.note} {twapRec.disclaimer}
+                  </div>
+                </div>
+              )}
+
               <div style={{ marginTop: '12px', display: 'flex', gap: '10px' }}>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: '12px', color: '#8a8f9c', marginBottom: '6px' }}>
@@ -1336,7 +1383,12 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
                   />
                 </div>
                 <div>
-                  <div style={{ fontSize: '12px', color: '#8a8f9c', marginBottom: '6px' }}>Max slice</div>
+                  <div
+                    style={{ fontSize: '12px', color: '#8a8f9c', marginBottom: '6px', cursor: 'help' }}
+                    title="A safety cap, not the pace: slicing is automatic (the keeper swaps just enough every ~30s to finish exactly on schedule). This only limits how large any single slice may be — e.g. if it has to catch up after a stall — as a % of your total order."
+                  >
+                    Max single slice ⓘ
+                  </div>
                   <div style={{ display: 'flex', gap: '4px' }}>
                     {[5, 10, 25].map((pct) => (
                       <button
