@@ -1704,7 +1704,12 @@ app.get('/api/twap/orders', async (req, res) => {
         maxSlippageBps: Number(raw.max_slippage_bps),
         lastSliceLedger: Number(raw.last_slice_ledger),
         status: scEnum(raw.status),
-        // convenience for the UI
+        // convenience for the UI — decimals/symbols so amounts render
+        // correctly for non-7-decimal and high-unit-price tokens
+        tokenInSymbol: symbolForSac(String(raw.token_in)),
+        tokenOutSymbol: symbolForSac(String(raw.token_out)),
+        tokenInDecimals: decimalsForSac(String(raw.token_in)),
+        tokenOutDecimals: decimalsForSac(String(raw.token_out)),
         pctFilled: Number((BigInt(raw.filled_in) * 10000n) / BigInt(raw.total_in)) / 100,
         pctElapsed: Math.min(
           100,

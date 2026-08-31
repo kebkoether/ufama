@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useWallet } from '@/context/WalletContext';
 import { getUserOrders, buildCancelOrder, submitTransaction, getTwapOrders, buildTwapCancel } from '@/lib/api';
+import { formatUnits } from '@/lib/units';
 
 interface Order {
   id: number;
@@ -212,14 +213,16 @@ export default function OrdersPage() {
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', color: '#8a8f9c' }}>
                   <span>
-                    Filled {(parseInt(t.filledIn) / 1e7).toLocaleString(undefined, { maximumFractionDigits: 2 })} / {(parseInt(t.totalIn) / 1e7).toLocaleString(undefined, { maximumFractionDigits: 2 })} ({pctFilled.toFixed(1)}%)
+                    {/* significant-digit formatting: a SolvBTC TWAP must
+                        not render as 0.00 / 0.00 */}
+                    Filled {formatUnits(t.filledIn, t.tokenInDecimals ?? 7)} / {formatUnits(t.totalIn, t.tokenInDecimals ?? 7)} {t.tokenInSymbol || ''} ({pctFilled.toFixed(1)}%)
                   </span>
                   <span>
                     {pctElapsed.toFixed(0)}% of window elapsed{behind ? ' · catching up' : ''}
                   </span>
                 </div>
                 <div style={{ marginTop: '6px', fontSize: '12px', color: '#565b68' }}>
-                  Received so far: {(parseInt(t.receivedOut) / 1e7).toLocaleString(undefined, { maximumFractionDigits: 4 })} (streams to your wallet each slice)
+                  Received so far: {formatUnits(t.receivedOut, t.tokenOutDecimals ?? 7)} {t.tokenOutSymbol || ''} (streams to your wallet each slice)
                 </div>
               </div>
             );
