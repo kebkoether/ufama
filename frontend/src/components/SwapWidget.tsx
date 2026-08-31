@@ -5,6 +5,7 @@ import { toBaseUnits, fromBaseUnits, formatUnits } from '@/lib/units';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 import { useWallet } from '@/context/WalletContext';
+import OrderBook from './OrderBook';
 import { getQuote as fetchQuote, buildPeerSwap, getOraclePrice } from '@/lib/api';
 
 // ─── Token Data ─────────────────────────────────────────
@@ -1379,6 +1380,18 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         {/* P2P Options: Price Mode + Timer */}
         {mode === 'p2p' && (
           <div style={{ marginTop: '14px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {/* Resting orders for this pair */}
+            {p2pLive(tokenIn) && p2pLive(tokenOut) && (
+              <OrderBook
+                baseSymbol={tokenIn}
+                quoteSymbol={tokenOut}
+                baseSac={tokenParam(tokenIn)}
+                quoteSac={tokenParam(tokenOut)}
+                baseDecimals={decimalsOf(tokenIn)}
+                quoteDecimals={decimalsOf(tokenOut)}
+              />
+            )}
+
             {/* Price Mode Toggle */}
             <div
               style={{
