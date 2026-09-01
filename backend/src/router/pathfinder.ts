@@ -201,12 +201,25 @@ export class Pathfinder {
     for (let i = 0; i < path.length - 1; i++) {
       const tin = path[i];
       const tout = path[i + 1];
-      const route = await this.engine.computeRoute(
-        tin, tout, amt, slippageBps,
-        { executableOnly: true },
-        { in: this.decimalsForSac(tin), out: this.decimalsForSac(tout) }
-      );
-      if (route.segments.length === 0 || route.netAmountOut <= 0n) return null;
+      let route;
+      try {
+        route = await this.engine.computeRoute(
+          tin, tout, amt, slippageBps,
+          { executableOnly: true },
+          { in: this.decimalsForSac(tin), out: this.decimalsForSac(tout) }
+        );
+      } catch (err) {
+        if (process.env.PATHFINDER_DEBUG) {
+          console.log(`[pf] hop ${tin.slice(0,4)}->${tout.slice(0,4)} in=${amt} THREW: ${(err as Error)?.message?.slice(0, 120)}`);
+        }
+        return null;
+      }
+      if (route.segments.length === 0 || route.netAmountOut <= 0n) {
+        if (process.env.PATHFINDER_DEBUG) {
+          console.log(`[pf] hop ${tin.slice(0,4)}->${tout.slice(0,4)} in=${amt} EMPTY (segs=${route.segments.length})`);
+        }
+        return null;
+      }
       if (process.env.PATHFINDER_DEBUG) {
         console.log(`[pf] hop ${tin.slice(0,4)}->${tout.slice(0,4)} in=${amt} out=${route.netAmountOut} segs=${route.segments.map((s) => `${s.venueName}:${s.amountIn}->${s.expectedAmountOut}`).join('|')}`);
       }
@@ -246,6 +259,9 @@ export class Pathfinder {
     let multi: PathResult | null = null;
     try {
       const candidates = this.candidatePaths(tokenIn, tokenOut);
+      if (process.env.PATHFINDER_DEBUG) {
+        console.log(`[pf] ${candidates.length} candidates ${tokenIn.slice(0,4)}->${tokenOut.slice(0,4)}; first: ${candidates.slice(0,3).map((p) => p.map((t) => t.slice(0,4)).join('>')).join(' | ')}`);
+      }
       if (candidates.length > 0) {
         const ranked = this.rankPaths(candidates);
         // Verify finalists CONCURRENTLY. The BEST-ranKED path always

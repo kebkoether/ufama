@@ -1928,12 +1928,24 @@ app.get('/api/screen/:address', async (req, res) => {
   }
 });
 
+const bootedAt = Date.now();
 app.get('/api/health', async (_req, res) => {
   const venues = await registry.getAvailable();
-  res.json({
-    status: 'ok',
+  const disc = tokenDiscovery.getStatus();
+  // Warm-up gate: until the first venue sweeps land, the path graph is
+  // partial and multi-hop quotes answer "no route" for pairs that route
+  // fine a minute later. Railway's healthcheck (railway.json) holds the
+  // deploy cutover on a 503, so the OLD instance keeps serving until
+  // this one actually knows the pools. Escape hatch after 4 minutes so
+  // a venue-API outage can't block deploys forever — we go live
+  // degraded rather than not at all.
+  const discoveryReady =
+    disc.lastRefresh !== null && disc.pools > 0 && disc.sushiPools > 0;
+  const warmingUp = !discoveryReady && Date.now() - bootedAt < 240_000;
+  res.status(warmingUp ? 503 : 200).json({
+    status: warmingUp ? 'warming_up' : discoveryReady ? 'ok' : 'degraded',
     venues: venues.map((v) => ({ name: v.name, executable: v.executable })),
-    discovery: tokenDiscovery.getStatus(),
+    discovery: disc,
     contracts: {
       swapbook: config.swapbookContractId,
       router: config.routerContractId,
