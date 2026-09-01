@@ -98,8 +98,20 @@ const P2P_ALLOWED_TOKENS = (process.env.P2P_ALLOWED_TOKENS ?? 'USDC,USDT0')
   .filter(Boolean);
 
 function assertP2pAllowed(raw: unknown, field: string): void {
-  const token = typeof raw === 'string' ? resolveToken(raw) : undefined;
-  if (!token || !P2P_ALLOWED_TOKENS.includes(token.symbol.toUpperCase())) {
+  // Resolve through the curated registry first, then the discovery
+  // universe — corridor tokens like deJAAA/deJTRSY are venue-discovered
+  // (Soroban-native, no curated entry) and arrive as SAC addresses.
+  let symbol: string | undefined =
+    typeof raw === 'string' ? resolveToken(raw)?.symbol : undefined;
+  if (!symbol && typeof raw === 'string') {
+    const upper = raw.toUpperCase();
+    symbol = tokenDiscovery
+      .getTokens()
+      .find(
+        (t) => t.sacAddress === raw || t.symbol.toUpperCase() === upper
+      )?.symbol;
+  }
+  if (!symbol || !P2P_ALLOWED_TOKENS.includes(symbol.toUpperCase())) {
     throw new BadRequest(
       `${field}: P2P swaps are limited to ${P2P_ALLOWED_TOKENS.join(', ')}`
     );
