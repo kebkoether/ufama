@@ -778,7 +778,11 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     };
   }, []);
 
-  const p2pTokens = allTokens.filter((t) => p2pAllowed.includes(t.symbol));
+  // The corridor list arrives uppercased — match case-insensitively so
+  // mixed-case discovered symbols (deJAAA, deJTRSY) gate correctly.
+  const p2pTokens = allTokens.filter((t) =>
+    p2pAllowed.some((a) => a.toUpperCase() === t.symbol.toUpperCase())
+  );
   const twapTokens = allTokens.filter((t) => t.twapEligible);
   const p2pLive = (symbol: string) =>
     p2pTokens.find((t) => t.symbol === symbol)?.status === 'live';
@@ -890,8 +894,9 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
       const baseAmount = toBaseUnits(amountIn, decimalsOf(tokenIn));
       const data = await buildPeerSwap({
         sourceAddress: walletAddress || 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
-        tokenIn,
-        tokenOut,
+        // SAC addresses — discovered tokens aren't symbol-resolvable
+        tokenIn: tokenParam(tokenIn),
+        tokenOut: tokenParam(tokenOut),
         amountIn: baseAmount,
         minAmountOut: priceMode === 'market' ? '0' : baseAmount,
         priceMode: priceMode === 'market' ? 1 : 0,
@@ -904,7 +909,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     } finally {
       setLoading(false);
     }
-  }, [amountIn, tokenIn, tokenOut, walletAddress, priceMode, maxSlippageBps, autoRouteMinutes]);
+  }, [amountIn, tokenIn, tokenOut, walletAddress, priceMode, maxSlippageBps, autoRouteMinutes, tokenParam]);
 
   // Place a TWAP order: build → sign (escrows total) → submit
   const handleTwapSubmit = useCallback(async () => {
@@ -958,8 +963,9 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
       const baseAmount = toBaseUnits(amountIn, decimalsOf(tokenIn));
       const data = await buildPeerSwap({
         sourceAddress: walletAddress,
-        tokenIn,
-        tokenOut,
+        // SAC addresses — discovered tokens aren't symbol-resolvable
+        tokenIn: tokenParam(tokenIn),
+        tokenOut: tokenParam(tokenOut),
         amountIn: baseAmount,
         minAmountOut: priceMode === 'market' ? '0' : baseAmount,
         priceMode: priceMode === 'market' ? 1 : 0,
@@ -1010,7 +1016,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     } finally {
       setSubmitting(false);
     }
-  }, [walletAddress, p2pPlan, amountIn, tokenIn, tokenOut, priceMode, maxSlippageBps, autoRouteMinutes, signTransaction, fetchBalances]);
+  }, [walletAddress, p2pPlan, amountIn, tokenIn, tokenOut, priceMode, maxSlippageBps, autoRouteMinutes, signTransaction, fetchBalances, tokenParam]);
 
   // Handle instant swap execution
   const handleInstantSwap = useCallback(async () => {
