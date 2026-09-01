@@ -756,7 +756,20 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         if (cancelled) return;
         if (Array.isArray(assets) && assets.length > 0) {
           const mapped = assets.map(assetToToken);
-          mapped.sort((a, b) => (b.venueVolume ?? 0) - (a.venueVolume ?? 0));
+          // Curated display order: flagship assets pinned first, the
+          // rest alphabetical. (Search ranking still reorders while the
+          // user is typing.)
+          const PINNED = ['XLM', 'USDC', 'USDT0', 'SOLVBTC', 'DEJTRSY', 'DEJAAA', 'USTRY', 'USDY', 'CETES', 'TESOURO'];
+          const pinRank = (sym: string) => {
+            const i = PINNED.indexOf(sym.toUpperCase());
+            return i === -1 ? PINNED.length : i;
+          };
+          mapped.sort((a, b) => {
+            const pa = pinRank(a.symbol);
+            const pb = pinRank(b.symbol);
+            if (pa !== pb) return pa - pb;
+            return a.symbol.localeCompare(b.symbol, 'en', { sensitivity: 'base' });
+          });
           setAllTokens(mapped);
           assetsLoaded.current = true;
         }
