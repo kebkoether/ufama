@@ -84,6 +84,9 @@ export class TokenDiscoveryService {
   /** sacAddress -> discovered token */
   private discovered: Map<string, AggregatedToken> = new Map();
   private lastRefresh: Date | null = null;
+  private readDecimals?: (sac: string) => Promise<number | null>;
+  /** decimals() results — immutable per contract, cached forever */
+  private decimalsCache = new Map<string, number>();
 
   constructor(opts: {
     aquaApiUrl: string;
@@ -95,12 +98,17 @@ export class TokenDiscoveryService {
     minTxCount?: number;
     /** Ignore Sushi pools below this USD liquidity (spam floor, default $500) */
     minSushiLiquidityUsd?: number;
+    /** On-chain decimals() reader for Soroban-native tokens (classic
+     *  assets are always 7; native ones — SolvBTC is 8, deRWA are 18 —
+     *  must be read from the contract or every amount is off by 10^k). */
+    readDecimals?: (sac: string) => Promise<number | null>;
   }) {
     this.aquaApiUrl = opts.aquaApiUrl.replace(/\/$/, '');
     this.sushiGraphqlUrl = (opts.sushiGraphqlUrl ?? '').replace(/\/$/, '');
     this.intervalMs = opts.intervalMs ?? 10 * 60 * 1000;
     this.minTxCount = opts.minTxCount ?? 10;
     this.minSushiLiquidityUsd = opts.minSushiLiquidityUsd ?? 500;
+    this.readDecimals = opts.readDecimals;
   }
 
   start(): void {
@@ -409,6 +417,30 @@ export class TokenDiscoveryService {
           verified: false,
           venueVolume: 0, // filled from the pool sweep in getTokens()
         });
+      }
+    }
+
+    // Soroban-native tokens (no classic issuer) can have any decimals —
+    // SolvBTC is 8 — and assuming 7 corrupts every displayed amount and
+    // oracle comparison by a power of ten. Read decimals() on-chain once
+    // per contract (cached forever; classic-issuer tokens stay 7).
+    if (this.readDecimals) {
+      for (const t of discovered.values()) {
+        if (t.issuer) continue; // classic asset — 7 by protocol
+        const cached = this.decimalsCache.get(t.sacAddress);
+        if (cached !== undefined) {
+          t.decimals = cached;
+          continue;
+        }
+        try {
+          const d = await this.readDecimals(t.sacAddress);
+          if (typeof d === 'number' && Number.isInteger(d) && d > 0 && d <= 30) {
+            this.decimalsCache.set(t.sacAddress, d);
+            t.decimals = d;
+          }
+        } catch {
+          // keep 7 this round; retried on the next sweep
+        }
       }
     }
 

@@ -239,6 +239,9 @@ const tokenDiscovery = new TokenDiscoveryService({
   intervalMs: 10 * 60 * 1000, // 10 minutes
   minTxCount: parseInt(process.env.DISCOVERY_MIN_TX_COUNT ?? '10'),
   minSushiLiquidityUsd: parseInt(process.env.SUSHI_MIN_LIQUIDITY_USD ?? '500'),
+  // Soroban-native tokens carry their own decimals (SolvBTC: 8) — read
+  // from the contract instead of assuming Stellar's classic 7
+  readDecimals: (sac) => stellar.simulateAndParse<number>(sac, 'decimals', []),
 });
 tokenDiscovery.start();
 
