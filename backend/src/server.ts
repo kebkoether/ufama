@@ -15,7 +15,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import { Asset, TransactionBuilder } from '@stellar/stellar-sdk';
+import { Address, Asset, Transaction, TransactionBuilder } from '@stellar/stellar-sdk';
 import { RoutingEngine } from './router/engine.js';
 import { Pathfinder, PathResult } from './router/pathfinder.js';
 import { createVenueRegistry } from './venues/index.js';
@@ -30,10 +30,14 @@ import { TokenDiscoveryService } from './services/token-discovery.js';
 import { TwapKeeperService } from './services/twap-keeper.js';
 
 const app = express();
+// Railway terminates TLS at one proxy hop — without this every client
+// shares the proxy's IP and one abuser exhausts the whole rate-limit
+// bucket for everyone (and per-IP limiting is meaningless).
+app.set('trust proxy', 1);
 app.use(helmet());
 app.use(cors({
   origin: process.env.CORS_ORIGIN
-    ? process.env.CORS_ORIGIN.split(',')
+    ? process.env.CORS_ORIGIN.split(',').map((o) => o.trim()).filter(Boolean)
     : ['http://localhost:3000', 'http://localhost:3001'],
   credentials: true,
 }));
@@ -43,6 +47,17 @@ app.use(
   rateLimit({
     windowMs: 60 * 1000,
     limit: 120, // per IP per minute
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
+// /v1 previously had only the per-key limiter, which starts AFTER a valid
+// key — invalid-key brute force was unthrottled.
+app.use(
+  '/v1/',
+  rateLimit({
+    windowMs: 60 * 1000,
+    limit: 300, // per IP per minute (pre-auth)
     standardHeaders: true,
     legacyHeaders: false,
   })
@@ -305,7 +320,9 @@ const timerSweep = new TimerSweepService({
   routerContractId: config.routerContractId,
   routingEngine,
   intervalMs: 60 * 1000, // 60 seconds
-  keeperSecretKey: process.env.KEEPER_SECRET_KEY ?? process.env.ADMIN_SECRET_KEY,
+  // No ADMIN_SECRET_KEY fallback: the admin key can withdraw the fee
+  // vault and must never live in the hot web process.
+  keeperSecretKey: process.env.KEEPER_SECRET_KEY,
 });
 timerSweep.start();
 
@@ -314,11 +331,17 @@ const twapKeeper = new TwapKeeperService({
   twapBookContractId: config.twapBookContractId,
   routingEngine,
   intervalMs: 30 * 1000, // 30 seconds
-  keeperSecretKey: process.env.KEEPER_SECRET_KEY ?? process.env.ADMIN_SECRET_KEY,
+  keeperSecretKey: process.env.KEEPER_SECRET_KEY,
   // Opportunistic slice sizing: fill to the pace ceiling when the market
   // is at/near oracle fair value (hoisted fns — resolved at tick time)
   fairValue,
   tokenMeta: (sac) => ({ decimals: decimalsForSac(sac), symbol: symbolForSac(sac) }),
+  // place_twap is permissionless on-chain: without this gate, junk-pair
+  // orders make OUR keeper pay inclusion fees forever slicing them.
+  isPairEligible: (a, b) => {
+    const known = new Set(tokenDiscovery.getTokens().map((t) => t.sacAddress));
+    return known.has(a) && known.has(b);
+  },
 });
 twapKeeper.start();
 
@@ -631,7 +654,9 @@ app.get('/api/assets', (_req, res) => {
         !t.homeDomain && t.issuer ? sep1.getDomain(t.symbol, t.issuer) : null;
       return {
         ...t,
-        ...(earned ? { homeDomain: earned, verified: true } : {}),
+        // selfAttested: the vouching domain is set by the issuer itself —
+        // weaker than a curated listing, and the UI can badge it apart
+        ...(earned ? { homeDomain: earned, verified: true, selfAttested: true } : {}),
         twapEligible: eligibleSacs.has(t.sacAddress),
       };
     }),
@@ -1595,6 +1620,14 @@ app.post('/api/twap/build', async (req, res) => {
     const tokenOut = resolveTokenParam(req.body.tokenOut, 'tokenOut');
     const amountIn = parseAmount(req.body.amountIn, 'amountIn');
 
+    // Only pairs the keeper will actually slice: an order on an unknown
+    // token would escrow funds into a TWAP nobody executes (and junk
+    // pairs are the keeper-gas-drain vector).
+    const knownSacs = new Set(tokenDiscovery.getTokens().map((t) => t.sacAddress));
+    if (!knownSacs.has(tokenIn) || !knownSacs.has(tokenOut)) {
+      throw new BadRequest('Both tokens must be in the supported token universe for TWAP orders');
+    }
+
     const durationMinutes = Number(req.body.durationMinutes);
     if (!Number.isFinite(durationMinutes) || durationMinutes < 5 || durationMinutes > 43_200) {
       throw new BadRequest('durationMinutes must be between 5 and 43200 (30 days)');
@@ -1803,6 +1836,72 @@ app.post('/api/trustline/build', async (req, res) => {
 });
 
 /**
+ * The submit endpoints relay user-signed XDR through OUR RPC. Without a
+ * shape check they are an open relay: any Stellar transaction (payments,
+ * account merges, txs this server never built) could ride our quota and
+ * poll budget, and an address refused at build time by screening could
+ * still settle here. Only the transaction shapes this server actually
+ * builds pass: ufama contract invocations, classic path payments with
+ * their fee-mirror payment, trustlines, and Soroban footprint recovery.
+ */
+const RELAY_MAX_OPS = 10;
+async function assertRelayable(signedXdr: string): Promise<void> {
+  let tx;
+  try {
+    tx = TransactionBuilder.fromXDR(signedXdr, config.networkPassphrase);
+  } catch {
+    throw new BadRequest('xdr is not a valid transaction envelope for this network');
+  }
+  if (!(tx instanceof Transaction)) {
+    throw new BadRequest('fee-bump transactions are not accepted');
+  }
+  await assertNotBlocked(tx.source);
+  if (tx.operations.length === 0 || tx.operations.length > RELAY_MAX_OPS) {
+    throw new BadRequest(`transaction must have 1-${RELAY_MAX_OPS} operations`);
+  }
+  const allowedContracts = new Set(
+    [
+      config.routerContractId,
+      config.swapbookContractId,
+      config.twapBookContractId,
+      config.aquaAdapterContractId,
+      config.sushiAdapterContractId,
+    ].filter(Boolean)
+  );
+  for (const op of tx.operations) {
+    if (op.source && op.source !== tx.source) {
+      throw new BadRequest('operation source must match the transaction source');
+    }
+    switch (op.type) {
+      case 'invokeHostFunction': {
+        const fn = (op as any).func;
+        if (fn?.switch?.().name !== 'hostFunctionTypeInvokeContract') {
+          throw new BadRequest('only contract invocations are relayed');
+        }
+        const target = Address.fromScAddress(
+          fn.invokeContract().contractAddress()
+        ).toString();
+        if (!allowedContracts.has(target)) {
+          throw new BadRequest('transaction invokes a contract outside the ufama set');
+        }
+        break;
+      }
+      case 'pathPaymentStrictSend':
+      case 'payment':
+        await assertNotBlocked((op as any).destination);
+        break;
+      case 'changeTrust':
+      // Soroban archived-entry recovery preambles are benign to relay
+      case 'restoreFootprint':
+      case 'extendFootprintTtl':
+        break;
+      default:
+        throw new BadRequest(`operation type ${op.type} is not relayed by this server`);
+    }
+  }
+}
+
+/**
  * POST /api/swap/submit
  *
  * Submit a signed transaction XDR to the Stellar network.
@@ -1813,6 +1912,7 @@ app.post('/api/swap/submit', async (req, res) => {
     if (typeof signedXdr !== 'string' || signedXdr.length === 0 || signedXdr.length > 100_000) {
       throw new BadRequest('signedXdr must be a transaction XDR string');
     }
+    await assertRelayable(signedXdr);
 
     const result = await stellar.submitTransaction(signedXdr);
     // Hash lets the UI link the settled tx on an explorer. Computed from
@@ -2041,7 +2141,9 @@ app.get('/v1/tokens', v1Auth, (_req, res) => {
       name: t.name,
       contract: t.sacAddress,
       issuer: t.issuer ?? null,
-      decimals: 7,
+      // Real per-token decimals — deRWA tokens are 18-dec, SolvBTC 8-dec;
+      // a hardcoded 7 here was an integrator amount-scaling bug in waiting
+      decimals: t.decimals ?? 7,
       verified: t.verified ?? false,
       venueVolume: t.venueVolume ?? 0,
     })),
@@ -2187,6 +2289,7 @@ app.post('/v1/send', v1Auth, async (req, res) => {
     if (typeof xdr !== 'string' || xdr.length === 0 || xdr.length > 100_000) {
       throw new BadRequest('xdr must be a signed transaction XDR string');
     }
+    await assertRelayable(xdr);
     const result = await stellar.submitTransaction(xdr);
     res.json({ status: result.status, result });
   } catch (error) {

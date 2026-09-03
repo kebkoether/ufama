@@ -47,6 +47,12 @@ function muldivCeil(a: bigint, b: bigint, d: bigint): bigint {
  *  fair, always qualifies). */
 const OPPORTUNITY_BPS = Number(process.env.TWAP_OPPORTUNITY_BPS ?? '10');
 
+/** Cap on orders processed per tick — place_twap is permissionless, so
+ *  without a ceiling an order-spam attack turns every tick into a gas
+ *  drain and starves honest makers' slices. Rotation (below) guarantees
+ *  every active order still gets regular turns. */
+const MAX_ORDERS_PER_TICK = Number(process.env.TWAP_MAX_ORDERS_PER_TICK ?? '25');
+
 export class TwapKeeperService {
   private stellar: StellarClient;
   private twapBookContractId: string;
@@ -57,6 +63,9 @@ export class TwapKeeperService {
   private ticking = false;
   private fairValue?: import('./fair-value.js').FairValueService;
   private tokenMeta?: (sac: string) => { decimals: number; symbol: string };
+  private isPairEligible?: (tokenIn: string, tokenOut: string) => boolean;
+  private rotation = 0;
+  private ineligibleLogged = new Set<number>();
 
   constructor(opts: {
     stellar: StellarClient;
@@ -70,6 +79,12 @@ export class TwapKeeperService {
     fairValue?: import('./fair-value.js').FairValueService;
     /** Token decimals+symbol lookup for oracle comparisons. */
     tokenMeta?: (sac: string) => { decimals: number; symbol: string };
+    /**
+     * Gate: only orders whose pair passes are sliced. place_twap is
+     * permissionless, so junk-token orders would otherwise make THIS
+     * keeper pay inclusion fees forever routing worthless pairs.
+     */
+    isPairEligible?: (tokenIn: string, tokenOut: string) => boolean;
   }) {
     this.stellar = opts.stellar;
     this.twapBookContractId = opts.twapBookContractId;
@@ -77,6 +92,7 @@ export class TwapKeeperService {
     this.intervalMs = opts.intervalMs ?? 30 * 1000;
     this.fairValue = opts.fairValue;
     this.tokenMeta = opts.tokenMeta;
+    this.isPairEligible = opts.isPairEligible;
     if (opts.keeperSecretKey) {
       try {
         this.keeper = Keypair.fromSecret(opts.keeperSecretKey);
@@ -121,8 +137,15 @@ export class TwapKeeperService {
 
     const currentLedger = await this.stellar.getLatestLedger();
 
-    for (const rawId of activeIds) {
-      const id = Number(rawId);
+    // Rotate the starting index so a capped tick still gives every
+    // active order regular turns instead of starving the tail.
+    const ids = activeIds.map((raw) => Number(raw));
+    const count = Math.min(ids.length, MAX_ORDERS_PER_TICK);
+    const start = ids.length > 0 ? this.rotation % ids.length : 0;
+    this.rotation += count;
+
+    for (let i = 0; i < count; i++) {
+      const id = ids[(start + i) % ids.length];
       try {
         await this.processOrder(id, currentLedger);
       } catch (err) {
@@ -160,6 +183,16 @@ export class TwapKeeperService {
   private async processOrder(id: number, currentLedger: number): Promise<void> {
     const order = await this.fetchOrder(id);
     if (!order || order.status !== 'Active') return;
+
+    // Never spend keeper gas on pairs outside the discovery universe —
+    // the maker keeps cancel/expire (permissionless) for their refund.
+    if (this.isPairEligible && !this.isPairEligible(order.tokenIn, order.tokenOut)) {
+      if (!this.ineligibleLogged.has(id)) {
+        this.ineligibleLogged.add(id);
+        console.log(`[TwapKeeper] order #${id} pair not in the token universe — skipping (not sliced by this keeper)`);
+      }
+      return;
+    }
 
     // Past the window → permissionless refund
     if (currentLedger > order.endLedger) {

@@ -64,6 +64,12 @@ export interface AggregatedToken {
   /** Curated entries are verified; venue-discovered ones are not */
   verified: boolean;
   /**
+   * Set when this token's bare symbol is contested by another discovered
+   * token — the served symbol carries a contract-derived ~XXXX suffix and
+   * the UI should surface the contract so users can tell claimants apart.
+   */
+  duplicateSymbol?: boolean;
+  /**
    * Aggregate venue volume across all pools containing this token
    * (Aqua's lifetime total_volume units). Free byproduct of the pool
    * sweep — used by the UI to rank the "hot" tokens first without any
@@ -157,20 +163,36 @@ export class TokenDiscoveryService {
     const curatedSacs = new Set(curated.map((t) => t.sacAddress).filter(Boolean));
 
     const extras: AggregatedToken[] = [];
-    const bySymbol = new Map<string, AggregatedToken>();
+    const bySymbol = new Map<string, AggregatedToken[]>();
     for (const token of this.discovered.values()) {
       if (curatedSacs.has(token.sacAddress)) continue; // already curated
       if (curatedSymbols.has(token.symbol.toUpperCase())) continue; // spoof guard
       const cand = { ...token, venueVolume: volumeBySac.get(token.sacAddress) ?? 0 };
-      // The symbol is the app-wide identifier (selection, balances,
-      // quoting) — duplicate symbols from different issuers are
-      // AMBIGUOUS, not just ugly. Keep the highest-volume claimant.
-      const prev = bySymbol.get(cand.symbol.toUpperCase());
-      if (!prev || cand.venueVolume > prev.venueVolume) {
-        bySymbol.set(cand.symbol.toUpperCase(), cand);
+      const key = cand.symbol.toUpperCase();
+      const list = bySymbol.get(key);
+      if (list) list.push(cand);
+      else bySymbol.set(key, [cand]);
+    }
+    for (const claimants of bySymbol.values()) {
+      if (claimants.length === 1) {
+        extras.push(claimants[0]);
+        continue;
+      }
+      // The symbol is the app-wide identifier (selection, quoting) and
+      // this one is CONTESTED. Volume must never decide identity — pool
+      // volume is attacker-inflatable, so "highest-volume claimant wins"
+      // let a fake token silently take over a real one's symbol and every
+      // UI selection with it. Nobody gets the bare symbol: each claimant
+      // is served under a contract-derived suffix, so a spoof attempt
+      // becomes VISIBLE (two suffixed entries) instead of a substitution.
+      for (const c of claimants) {
+        extras.push({
+          ...c,
+          symbol: `${c.symbol}~${c.sacAddress.slice(-4)}`,
+          duplicateSymbol: true,
+        });
       }
     }
-    extras.push(...bySymbol.values());
     extras.sort((a, b) => a.symbol.localeCompare(b.symbol));
 
     return [...curated, ...extras];
