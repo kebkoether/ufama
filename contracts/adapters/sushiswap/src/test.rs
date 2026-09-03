@@ -4,6 +4,7 @@ use super::*;
 use soroban_sdk::{
     contract as sdk_contract, contractimpl as sdk_contractimpl,
     testutils::Address as _,
+    token::StellarAssetClient,
     Env,
 };
 
@@ -71,9 +72,19 @@ fn setup() -> Ctx {
         SushiSwapAdapter,
         (admin, router, quoter, factory.clone()),
     );
-    let token_a = Address::generate(&env);
-    let token_b = Address::generate(&env);
+    // Real token contracts — the factory fallback reads pool balances
+    let token_a = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
     Ctx { env, adapter, factory, token_a, token_b }
+}
+
+fn seed_pool(c: &Ctx, pool: &Address, amount: i128) {
+    StellarAssetClient::new(&c.env, &c.token_a).mint(pool, &amount);
+    StellarAssetClient::new(&c.env, &c.token_b).mint(pool, &amount);
 }
 
 #[test]
@@ -105,5 +116,29 @@ fn registered_pair_wins_over_factory() {
     adapter.set_pair(&c.token_a, &c.token_b, &500, &pinned_pool);
 
     // The pinned registration takes precedence (fee 500, not 3000)
+    assert_eq!(adapter.quote(&c.token_a, &c.token_b, &100), 100 * 500);
+}
+
+#[test]
+fn factory_fallback_picks_deepest_tier_not_first_probed() {
+    let c = setup();
+    let adapter = SushiSwapAdapterClient::new(&c.env, &c.adapter);
+    let mock = MockFactoryClient::new(&c.env, &c.factory);
+
+    // A shallow pool on the first-probed tier (3000) must not shadow a
+    // deep pool on a later tier (500) — an attacker can create the
+    // shallow one permissionlessly.
+    let shallow = Address::generate(&c.env);
+    mock.set(&c.token_a, &c.token_b, &3000, &shallow);
+    seed_pool(&c, &shallow, 10);
+    let deep = Address::generate(&c.env);
+    mock.set(&c.token_a, &c.token_b, &500, &deep);
+    seed_pool(&c, &deep, 1_000_000);
+
+    assert_eq!(adapter.quote(&c.token_a, &c.token_b, &100), 100 * 500);
+
+    // One-sided depth doesn't count: draining shallow's token_b side and
+    // topping up token_a still loses on the min-side ranking
+    StellarAssetClient::new(&c.env, &c.token_a).mint(&shallow, &100_000_000);
     assert_eq!(adapter.quote(&c.token_a, &c.token_b, &100), 100 * 500);
 }

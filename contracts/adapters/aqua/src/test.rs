@@ -104,7 +104,7 @@ fn resolver_prefers_deepest_pool_and_registered_pin_wins() {
     let router = MockAquaRouterClient::new(&c.env, &c.aqua_router);
 
     // Shallow pool pays better rate; deep pool pays worse. Resolver picks
-    // by output-side DEPTH (liquidity), min_out guards the price.
+    // by min-side DEPTH (liquidity), min_out guards the price.
     let shallow = c.env.register(
         MockAquaPool,
         (tokens.clone(), soroban_sdk::vec![&c.env, 10u128, 10u128], 10_000u128),
@@ -123,4 +123,27 @@ fn resolver_prefers_deepest_pool_and_registered_pin_wins() {
         &tokens, &hash(&c.env, 1), &shallow,
     );
     assert_eq!(adapter.quote(&c.token_a, &c.token_b, &100), 100); // pinned 1:1
+}
+
+#[test]
+fn resolver_min_side_ranking_beats_skewed_pool() {
+    let c = setup();
+    let adapter = AquaAdapterClient::new(&c.env, &c.adapter);
+    let tokens = soroban_sdk::vec![&c.env, c.token_a.clone(), c.token_b.clone()];
+    let router = MockAquaRouterClient::new(&c.env, &c.aqua_router);
+
+    // An attacker pool seeded with a mountain of token_out against dust
+    // of token_in — the cheap way to fake "deep". The old output-side
+    // ranking picked it over the honest two-sided pool.
+    let honest = c.env.register(
+        MockAquaPool,
+        (tokens.clone(), soroban_sdk::vec![&c.env, 1_000_000u128, 1_000_000u128], 9_900u128),
+    );
+    let skewed = c.env.register(
+        MockAquaPool,
+        (tokens.clone(), soroban_sdk::vec![&c.env, 1u128, 1_000_000_000u128], 5_000u128),
+    );
+    router.add_pool(&tokens, &hash(&c.env, 1), &skewed);
+    router.add_pool(&tokens, &hash(&c.env, 2), &honest);
+    assert_eq!(adapter.quote(&c.token_a, &c.token_b, &100), 99);
 }

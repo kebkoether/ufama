@@ -173,8 +173,11 @@ fn test_dust_fill_cannot_round_to_free() {
 
     // Paying zero is always rejected
     assert!(client.try_partial_fill(&t.taker, &order_id, &61_999, &0).is_err());
-    // Ceiling math demands at least 1 stroop for any nonzero fill
-    client.partial_fill(&t.taker, &order_id, &61_999, &1);
+    // A 1-stroop payment is consumed whole by the fee — the maker would
+    // net zero, so the fill is rejected outright
+    assert!(client.try_partial_fill(&t.taker, &order_id, &61_999, &1).is_err());
+    // Smallest fill that nets the maker something: 2 stroops (1 fee + 1)
+    client.partial_fill(&t.taker, &order_id, &124_000, &2);
 }
 
 #[test]
@@ -683,8 +686,8 @@ fn test_sep40_preferred_over_pushed_price_and_fails_closed() {
     sep40.set_price(&feed_a, &2_0000000, &now);
     sep40.set_price(&feed_b, &1_0000000, &now);
     client.set_sep40_max_age(&300u64);
-    client.set_sep40_feed(&t.token_a, &sep40_id, &feed_a);
-    client.set_sep40_feed(&t.token_b, &sep40_id, &feed_b);
+    client.set_sep40_feed(&t.token_a, &sep40_id, &feed_a, &0u64);
+    client.set_sep40_feed(&t.token_b, &sep40_id, &feed_b, &0u64);
 
     // Oracle-mode order at 1% slippage: required payment follows SEP-40
     let order_id = client.place_order(
@@ -717,4 +720,193 @@ fn test_sep40_preferred_over_pushed_price_and_fails_closed() {
     let pushed_floor = (62_000_0000000i128 * 9_900 + 10_000 - 1) / 10_000;
     StellarAssetClient::new(&t.env, &t.token_b).mint(&t.taker, &62_000_0000000);
     client.fill_order(&t.taker, &order3, &pushed_floor);
+}
+
+// ─── v1.2 hardening ──────────────────────────────────────
+
+/// Token stub with 18 decimals — enough for the read_oracle cross-rate
+/// path, which only asks tokens for decimals().
+#[sdk_contract]
+pub struct MockToken18;
+
+#[sdk_contractimpl]
+impl MockToken18 {
+    pub fn decimals(_env: Env) -> u32 {
+        18
+    }
+}
+
+#[test]
+fn test_sep40_cross_rate_18_decimal_token_fits_i128() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+
+    // BTC-priced 18-dec token vs a 7-dec dollar SAC, both on a 14-decimal
+    // (Reflector-style) feed: the naive p * 10^(dec+oracle_dec) product
+    // needs 10^32 and overflowed i128 before exponent cancellation.
+    let token18 = t.env.register(MockToken18, ());
+    let sep40_id = t.env.register(MockSep40, ());
+    let sep40 = MockSep40Client::new(&t.env, &sep40_id);
+    let now = t.env.ledger().timestamp();
+    let feed_18 = OracleAsset::Stellar(token18.clone());
+    let feed_b = OracleAsset::Stellar(t.token_b.clone());
+    sep40.set_price(&feed_18, &7_700_000_000_000_000_000, &now); // $77,000 @14dec
+    sep40.set_price(&feed_b, &100_000_000_000_000, &now); // $1 @14dec
+    client.set_sep40_max_age(&300u64);
+    client.set_sep40_feed(&token18, &sep40_id, &feed_18, &0u64);
+    client.set_sep40_feed(&t.token_b, &sep40_id, &feed_b, &0u64);
+
+    let (num, den, _) = client.get_oracle_price(&token18, &t.token_b);
+    // 1 whole token18 (1e18 base units) = $77,000 = 7.7e11 token_b units
+    assert_eq!(num, 7_700_000_000_000_000_000);
+    assert_eq!(den, 10_000_000_000_000_000_000_000_000);
+
+    // Reverse direction exercises the other operand ordering
+    let (rnum, rden, _) = client.get_oracle_price(&t.token_b, &token18);
+    assert_eq!(rnum, 100_000_000_000_000 * 100_000_000_000);
+    assert_eq!(rden, 7_700_000_000_000_000_000);
+}
+
+#[test]
+fn test_per_feed_max_age_overrides_global() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+
+    let sep40_id = t.env.register(MockSep40, ());
+    let sep40 = MockSep40Client::new(&t.env, &sep40_id);
+    let now = t.env.ledger().timestamp();
+    let feed_a = OracleAsset::Stellar(t.token_a.clone());
+    let feed_b = OracleAsset::Stellar(t.token_b.clone());
+    sep40.set_price(&feed_a, &2_0000000, &now);
+    sep40.set_price(&feed_b, &1_0000000, &now);
+    client.set_sep40_max_age(&300u64);
+    // a: slow-heartbeat feed with its own generous bound; b: global
+    client.set_sep40_feed(&t.token_a, &sep40_id, &feed_a, &1000u64);
+    client.set_sep40_feed(&t.token_b, &sep40_id, &feed_b, &0u64);
+
+    // Fresh: readable
+    client.get_oracle_price(&t.token_a, &t.token_b);
+
+    // 500s later feed a (bound 1000) is fine but b is stale per the
+    // global 300 — the pair fails closed.
+    t.env.ledger().with_mut(|li| li.timestamp += 500);
+    assert!(client.try_get_oracle_price(&t.token_a, &t.token_b).is_err());
+
+    // Widening b's own bound heals the pair without touching the global
+    client.set_sep40_feed(&t.token_b, &sep40_id, &feed_b, &1000u64);
+    client.get_oracle_price(&t.token_a, &t.token_b);
+}
+
+#[test]
+fn test_min_order_floor() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+
+    client.set_min_order(&t.token_a, &1_0000000);
+    assert!(client
+        .try_place_order(
+            &t.maker, &t.token_a, &t.token_b,
+            &9_999_999, &9_999_999, &10_000,
+            &0, &0, &0, &no_excl(&t.env),
+        )
+        .is_err());
+    client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &1_0000000, &1_0000000, &10_000,
+        &0, &0, &0, &no_excl(&t.env),
+    );
+
+    // Clearing the floor re-allows dust
+    client.set_min_order(&t.token_a, &0);
+    client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &1, &1, &10_000,
+        &0, &0, &0, &no_excl(&t.env),
+    );
+}
+
+#[test]
+fn test_expiry_capped() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+    let seq = t.env.ledger().sequence();
+
+    assert!(client
+        .try_place_order(
+            &t.maker, &t.token_a, &t.token_b,
+            &1_0000000, &1_0000000, &(seq + 1_555_200 + 1),
+            &0, &0, &0, &no_excl(&t.env),
+        )
+        .is_err());
+    client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &1_0000000, &1_0000000, &(seq + 1_555_200),
+        &0, &0, &0, &no_excl(&t.env),
+    );
+}
+
+#[test]
+fn test_claim_expired_timer_rejects_lapsed_order() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+    let router = Address::generate(&t.env);
+    client.set_router(&router);
+
+    // Timer at 150, expiry at 200
+    let order_id = client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &100_0000000, &100_0000000, &200,
+        &0, &0, &150, &no_excl(&t.env),
+    );
+
+    // Past expiry the claim must refuse — refund path only
+    advance_to(&t.env, 250);
+    assert!(client.try_claim_expired_timer(&order_id).is_err());
+    client.expire_order(&order_id);
+    assert_eq!(client.get_order(&order_id).status, OrderStatus::Expired);
+
+    // Control: timer expired but order still live claims fine
+    let order2 = client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &100_0000000, &100_0000000, &1000,
+        &0, &0, &300, &no_excl(&t.env),
+    );
+    advance_to(&t.env, 400);
+    let claimed = client.claim_expired_timer(&order2);
+    assert_eq!(claimed.amount, 100_0000000);
+}
+
+#[test]
+fn test_fill_paying_maker_nothing_rejected() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+
+    let order_id = client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &100_0000000, &100_0000000, &10_000,
+        &0, &0, &0, &no_excl(&t.env),
+    );
+    // 1-stroop fill: required payment 1, fee 1 — the maker would net 0
+    assert!(client
+        .try_partial_fill(&t.taker, &order_id, &1, &1)
+        .is_err());
+}
+
+#[test]
+fn test_admin_two_step_rotation() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+
+    // No pending transfer yet
+    assert!(client.try_accept_admin().is_err());
+
+    let new_admin = Address::generate(&t.env);
+    client.transfer_admin(&new_admin);
+    client.accept_admin();
+
+    // Consumed: a second accept has nothing pending
+    assert!(client.try_accept_admin().is_err());
+
+    // The rotated admin can operate (mock auths: flow-level check)
+    client.set_fee(&0);
 }
