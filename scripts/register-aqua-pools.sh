@@ -5,7 +5,9 @@
 # Generated 2026-08-24 from Aqua's live pool list. Idempotent (set_pool
 # overwrites). Run: bash scripts/register-aqua-pools.sh
 set -e
-ADAPTER="CCTL6C4PYDTXT6GL5YTE6CG4ZH2EXKJONUP4445SMTY5AYQPNQY666HZ"
+# Default: the v1.2 Aqua adapter (deployed 2026-09-03). Override with
+# ADAPTER=... for another deployment (v1.1 was CCTL6C4P…66HZ).
+ADAPTER="${ADAPTER:-CBYQV73IOS3KFIXZV6TC3LC7CPQQGTFQG2UEJ5EF5LFBMVBF7XRSUJCE}"
 SRC="mainnet-deployer"
 NET="mainnet"
 FEE=1000000
