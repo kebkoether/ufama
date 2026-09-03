@@ -36,6 +36,8 @@ pub enum DataKey {
     SwapBook,
     /// Protocol fee numerator per FEE_DENOMINATOR (settable ≤ cap)
     FeePer100k,
+    /// Two-step admin rotation: proposed new admin, pending acceptance.
+    PendingAdmin,
 }
 
 // ─── Types ──────────────────────────────────────────────
@@ -107,6 +109,7 @@ pub enum RouterError {
     PartnerFeeAboveCap = 13,
     PathTooLong = 14,
     InvalidPath = 15,
+    NoPendingAdmin = 16,
 }
 
 // ─── Contract ───────────────────────────────────────────
@@ -130,6 +133,39 @@ impl Router {
         env.storage()
             .instance()
             .set(&DataKey::VenueIds, &Vec::<u32>::new(&env));
+    }
+
+    /// Propose a new admin (two-step rotation). Admin only. The proposed
+    /// address must call `accept_admin` to take over, so a mistyped
+    /// transfer is recoverable until accepted.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), RouterError> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("proposed")),
+            new_admin,
+        );
+        Ok(())
+    }
+
+    /// Complete an admin rotation — callable only by the proposed admin,
+    /// proving the new key is live before it holds power.
+    pub fn accept_admin(env: Env) -> Result<(), RouterError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(RouterError::NoPendingAdmin)?;
+        pending.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("accepted")),
+            pending,
+        );
+        Ok(())
     }
 
     /// Set the protocol fee (per 100,000 of total output). Admin only,

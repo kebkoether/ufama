@@ -15,7 +15,7 @@ use soroban_sdk::{
 ///
 /// Pool resolution (v1.2): an admin-registered pool wins (ops can pin a
 /// specific pool); otherwise the adapter asks Aqua's own router ON-CHAIN
-/// via get_pools(tokens) and picks the pool with the deepest output-side
+/// via get_pools(tokens) and picks the pool with the deepest MIN-SIDE
 /// reserves — every pool Aqua has or ever creates is tradeable here
 /// permissionlessly, mirroring the Sushi adapter's factory fallback.
 /// Safe because the caller's min_amount_out bounds the outcome whichever
@@ -38,6 +38,8 @@ pub enum DataKey {
     AquaRouter,
     /// Registered pool for a directed pair (token_in, token_out)
     Pool(Address, Address),
+    /// Two-step admin rotation: proposed new admin, pending acceptance.
+    PendingAdmin,
 }
 
 /// An Aquarius pool used for a pair.
@@ -64,6 +66,7 @@ pub enum AquaAdapterError {
     PoolNotSet = 6,
     TokenNotInPool = 7,
     Overflow = 8,
+    NoPendingAdmin = 9,
 }
 
 // ─── Contract ───────────────────────────────────────────
@@ -230,6 +233,39 @@ impl AquaAdapter {
         Ok(())
     }
 
+    /// Propose a new admin (two-step rotation). Admin only. The proposed
+    /// address must call `accept_admin` to take over, so a mistyped
+    /// transfer is recoverable until accepted.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), AquaAdapterError> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("proposed")),
+            new_admin,
+        );
+        Ok(())
+    }
+
+    /// Complete an admin rotation — callable only by the proposed admin,
+    /// proving the new key is live before it holds power.
+    pub fn accept_admin(env: Env) -> Result<(), AquaAdapterError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(AquaAdapterError::NoPendingAdmin)?;
+        pending.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("accepted")),
+            pending,
+        );
+        Ok(())
+    }
+
     // ─── Internal ───────────────────────────────────────
 
     fn require_admin(env: &Env) -> Result<(), AquaAdapterError> {
@@ -258,7 +294,7 @@ impl AquaAdapter {
     }
 
     /// Ask Aqua's router for the pair's pools and pick the one with the
-    /// deepest output-side reserves. Bounded to the first few pools per
+    /// deepest min-side reserves. Bounded to the first few pools per
     /// pair (Aqua rarely has more than 2-3 per pair).
     fn resolve_pool(
         env: &Env,
@@ -293,29 +329,37 @@ impl AquaAdapter {
                     soroban_sdk::vec![env],
                 );
                 // both sides must be in the pool
+                let mut in_idx: Option<u32> = None;
                 let mut out_idx: Option<u32> = None;
-                let mut has_in = false;
                 for k in 0..tokens.len() {
                     let t = tokens.get(k).unwrap();
                     if &t == token_in {
-                        has_in = true;
+                        in_idx = Some(k);
                     } else if &t == token_out {
                         out_idx = Some(k);
                     }
                 }
-                let Some(out_idx) = out_idx else { continue };
-                if !has_in {
+                let (Some(in_idx), Some(out_idx)) = (in_idx, out_idx) else {
                     continue;
-                }
+                };
                 let reserves: soroban_sdk::Vec<u128> = env.invoke_contract(
                     &pool_addr,
                     &Symbol::new(env, "get_reserves"),
                     soroban_sdk::vec![env],
                 );
-                let depth = reserves
-                    .get(out_idx)
-                    .map(|r| i128::try_from(r).unwrap_or(i128::MAX))
-                    .unwrap_or(0);
+                // Rank by the SHALLOWER side: pool creation is
+                // permissionless, and judging depth by the output side
+                // alone let anyone win the contest with a skewed pool —
+                // a mountain of token_out against dust of token_in.
+                // Beating a min-side ranking needs real capital on BOTH
+                // sides at the skewed price, which is just an arb gift.
+                let side = |idx: u32| {
+                    reserves
+                        .get(idx)
+                        .map(|r| i128::try_from(r).unwrap_or(i128::MAX))
+                        .unwrap_or(0)
+                };
+                let depth = side(in_idx).min(side(out_idx));
                 if best.as_ref().map(|(d, _)| depth > *d).unwrap_or(true) {
                     best = Some((
                         depth,

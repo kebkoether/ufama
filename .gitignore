@@ -31,3 +31,6 @@ node-compile-cache/
 
 # TypeScript build info
 *.tsbuildinfo
+
+# Local debug/deploy logs
+*.log

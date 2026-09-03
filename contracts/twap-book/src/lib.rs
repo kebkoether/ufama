@@ -62,6 +62,8 @@ pub enum DataKey {
     Venue(u32),
     /// Protocol fee numerator per FEE_DENOMINATOR (100,000)
     FeePer100k,
+    /// Two-step admin rotation: proposed new admin, pending acceptance.
+    PendingAdmin,
 }
 
 // ─── Types ──────────────────────────────────────────────
@@ -140,6 +142,7 @@ pub enum TwapError {
     OrderExpired = 19,
     OrderNotExpired = 20,
     Overflow = 21,
+    NoPendingAdmin = 22,
 }
 
 // ─── Contract ───────────────────────────────────────────
@@ -161,6 +164,39 @@ impl TwapBook {
         env.storage()
             .instance()
             .set(&DataKey::FeePer100k, &DEFAULT_FEE_PER_100K);
+    }
+
+    /// Propose a new admin (two-step rotation). Admin only. The proposed
+    /// address must call `accept_admin` to take over, so a mistyped
+    /// transfer is recoverable until accepted.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), TwapError> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("proposed")),
+            new_admin,
+        );
+        Ok(())
+    }
+
+    /// Complete an admin rotation — callable only by the proposed admin,
+    /// proving the new key is live before it holds power.
+    pub fn accept_admin(env: Env) -> Result<(), TwapError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(TwapError::NoPendingAdmin)?;
+        pending.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("accepted")),
+            pending,
+        );
+        Ok(())
     }
 
     /// Set the protocol fee (per 100,000 of slice output). Admin only,

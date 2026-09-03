@@ -9,6 +9,10 @@
 #     unlocks MARKET-PRICE P2P orders on the USDC/USDT0 corridor.
 # The backend/status half ships via the tokens.ts flip (same PR).
 # Idempotent. Run: bash scripts/activate-usdt0.sh
+#
+# NOTE: targets the DEPLOYED v1.1 contracts, whose set_sep40_feed takes
+# (token, feed). The v1.2 signature is (token, oracle, asset,
+# max_age_secs) — do not reuse this invocation against a v1.2 SwapBook.
 set -e
 SRC="mainnet-deployer"
 NET="mainnet"

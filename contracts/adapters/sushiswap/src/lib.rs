@@ -43,10 +43,13 @@ pub enum DataKey {
     /// Sushi factory — enables permissionless pair resolution: pairs the
     /// admin never registered fall back to factory.get_pool lookups.
     SushiFactory,
+    /// Two-step admin rotation: proposed new admin, pending acceptance.
+    PendingAdmin,
 }
 
-/// Fee tiers probed (most liquid first) when resolving a pair through the
-/// factory. Mirrors Uniswap-V3 canonical tiers as deployed by Sushi.
+/// Fee tiers probed when resolving a pair through the factory (every tier
+/// is checked; the deepest pool wins). Mirrors Uniswap-V3 canonical tiers
+/// as deployed by Sushi.
 const FACTORY_FEE_TIERS: [u32; 4] = [3000, 500, 10_000, 100];
 
 #[contracttype]
@@ -84,6 +87,7 @@ pub enum SushiAdapterError {
     SwapFailed = 4,
     InvalidAmount = 5,
     PairNotSet = 6,
+    NoPendingAdmin = 7,
 }
 
 // ─── Contract ───────────────────────────────────────────
@@ -282,6 +286,39 @@ impl SushiSwapAdapter {
         Ok(())
     }
 
+    /// Propose a new admin (two-step rotation). Admin only. The proposed
+    /// address must call `accept_admin` to take over, so a mistyped
+    /// transfer is recoverable until accepted.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), SushiAdapterError> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("proposed")),
+            new_admin,
+        );
+        Ok(())
+    }
+
+    /// Complete an admin rotation — callable only by the proposed admin,
+    /// proving the new key is live before it holds power.
+    pub fn accept_admin(env: Env) -> Result<(), SushiAdapterError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(SushiAdapterError::NoPendingAdmin)?;
+        pending.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("accepted")),
+            pending,
+        );
+        Ok(())
+    }
+
     // ─── Internal ───────────────────────────────────────
 
     fn require_admin(env: &Env) -> Result<(), SushiAdapterError> {
@@ -317,6 +354,12 @@ impl SushiSwapAdapter {
             .instance()
             .get(&DataKey::SushiFactory)
             .ok_or(SushiAdapterError::PairNotSet)?;
+        // Check EVERY tier and rank by the shallower of the pool's two
+        // token balances. Pool creation is permissionless, and taking the
+        // first tier that resolves let a fresh attacker pool at a skewed
+        // price (probed earlier in the tier order) shadow the liquid one;
+        // beating a min-side ranking needs real two-sided capital.
+        let mut best: Option<(i128, PairInfo)> = None;
         for fee in FACTORY_FEE_TIERS {
             let pool: Option<Address> = env.invoke_contract(
                 &factory,
@@ -329,10 +372,15 @@ impl SushiSwapAdapter {
                 ],
             );
             if let Some(pool) = pool {
-                return Ok(PairInfo { fee, pool });
+                let bal_in = token::Client::new(env, token_in).balance(&pool);
+                let bal_out = token::Client::new(env, token_out).balance(&pool);
+                let depth = bal_in.min(bal_out);
+                if best.as_ref().map(|(d, _)| depth > *d).unwrap_or(true) {
+                    best = Some((depth, PairInfo { fee, pool }));
+                }
             }
         }
-        Err(SushiAdapterError::PairNotSet)
+        best.map(|(_, info)| info).ok_or(SushiAdapterError::PairNotSet)
     }
 }
 

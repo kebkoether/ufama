@@ -42,6 +42,11 @@ const MAX_ORACLE_JUMP_BPS: i128 = 2000;
 /// Cap on open orders per pair index — keeps the index ledger entry bounded.
 const MAX_ORDERS_PER_PAIR: u32 = 200;
 
+/// Cap on how far ahead an order's expiry may sit (~90 days at 5s/ledger).
+/// Together with the per-token dust floor this stops 1-stroop forever
+/// orders from squatting the bounded pair index.
+const MAX_EXPIRY_LEDGERS: u32 = 1_555_200;
+
 /// Storage TTL management (ledgers): extend when below threshold, up to target.
 const TTL_THRESHOLD: u32 = 100_000;
 const TTL_EXTEND_TO: u32 = 518_400; // ~30 days at 5s/ledger
@@ -72,6 +77,10 @@ pub enum DataKey {
     /// external-markets oracle for XLM/USDC/EURC, their Stellar-DEX
     /// oracle for the Etherfuse stablebonds).
     Sep40Feed(Address),
+    /// Two-step admin rotation: the proposed new admin, pending acceptance.
+    PendingAdmin,
+    /// Minimum order size (base units) for orders escrowing this token.
+    MinOrder(Address),
 }
 
 // ─── Types ──────────────────────────────────────────────
@@ -118,6 +127,12 @@ pub struct FeedConfig {
     pub oracle: Address,
     pub asset: OracleAsset,
     pub oracle_decimals: u32,
+    /// Max acceptable price age (seconds) for THIS feed; 0 = use the
+    /// global Sep40MaxAge. Providers push on very different cadences
+    /// (Reflector ~5 min, RedStone 12-24h heartbeat) — a single global
+    /// age either rejects healthy RedStone feeds or waves through a
+    /// half-day-stale Reflector one.
+    pub max_age_secs: u64,
 }
 
 /// Mirror of the SEP-40 `PriceData` struct (field names must match).
@@ -224,6 +239,9 @@ pub enum SwapBookError {
     FeeAboveCap = 24,
     MatchWrongPair = 25,
     MatchExceedsBudget = 26,
+    BelowMinimumOrder = 27,
+    ExpiryTooFar = 28,
+    NoPendingAdmin = 29,
 }
 
 // ─── Contract ───────────────────────────────────────────
@@ -246,6 +264,73 @@ impl SwapBook {
     pub fn set_router(env: Env, router: Address) -> Result<(), SwapBookError> {
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Router, &router);
+        // The router receives claimed escrow — a redirect must be visible
+        // on-chain the moment it happens.
+        env.events().publish(
+            (symbol_short!("book"), symbol_short!("router")),
+            router,
+        );
+        Ok(())
+    }
+
+    /// Propose a new admin (two-step rotation). Admin only. The proposed
+    /// address must call `accept_admin` to take over, so a mistyped
+    /// transfer is recoverable until accepted.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), SwapBookError> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("proposed")),
+            new_admin,
+        );
+        Ok(())
+    }
+
+    /// Complete an admin rotation — callable only by the proposed admin,
+    /// proving the new key is live before it holds power.
+    pub fn accept_admin(env: Env) -> Result<(), SwapBookError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(SwapBookError::NoPendingAdmin)?;
+        pending.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("accepted")),
+            pending,
+        );
+        Ok(())
+    }
+
+    /// Set the minimum order size (base units) for orders escrowing
+    /// `token` — the dust floor that keeps 1-stroop orders from squatting
+    /// the bounded pair index. Admin only; 0 clears the floor.
+    pub fn set_min_order(
+        env: Env,
+        token: Address,
+        min_amount: i128,
+    ) -> Result<(), SwapBookError> {
+        Self::require_admin(&env)?;
+        if min_amount < 0 {
+            return Err(SwapBookError::InvalidAmount);
+        }
+        let key = DataKey::MinOrder(token.clone());
+        if min_amount == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &min_amount);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        env.events().publish(
+            (symbol_short!("book"), symbol_short!("min_order")),
+            (token, min_amount),
+        );
         Ok(())
     }
 
@@ -393,6 +478,18 @@ impl SwapBook {
         }
         if expiry <= env.ledger().sequence() {
             return Err(SwapBookError::OrderExpired);
+        }
+        if expiry > env.ledger().sequence().saturating_add(MAX_EXPIRY_LEDGERS) {
+            return Err(SwapBookError::ExpiryTooFar);
+        }
+        if let Some(min) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::MinOrder(token_in.clone()))
+        {
+            if amount_in < min {
+                return Err(SwapBookError::BelowMinimumOrder);
+            }
         }
 
         // If Oracle mode, verify that a fresh oracle price exists for this pair
@@ -575,11 +672,15 @@ impl SwapBook {
     /// whose tokens use DIFFERENT oracles still cross-rate correctly.
     /// Pairs where BOTH tokens have feeds price exclusively off SEP-40
     /// (fail closed); others keep the pushed price.
+    /// `max_age_secs`: per-feed freshness bound; 0 = use the global
+    /// Sep40MaxAge (set it per the provider's push cadence — e.g. ~600 for
+    /// Reflector's 5-min updates, 86400+ for RedStone's 12-24h heartbeat).
     pub fn set_sep40_feed(
         env: Env,
         token: Address,
         oracle: Address,
         asset: OracleAsset,
+        max_age_secs: u64,
     ) -> Result<(), SwapBookError> {
         Self::require_admin(&env)?;
         let oracle_decimals: u32 = env.invoke_contract(
@@ -587,7 +688,7 @@ impl SwapBook {
             &Symbol::new(&env, "decimals"),
             soroban_sdk::vec![&env],
         );
-        let cfg = FeedConfig { oracle: oracle.clone(), asset, oracle_decimals };
+        let cfg = FeedConfig { oracle: oracle.clone(), asset, oracle_decimals, max_age_secs };
         env.storage()
             .persistent()
             .set(&DataKey::Sep40Feed(token.clone()), &cfg);
@@ -811,6 +912,11 @@ impl SwapBook {
         if env.ledger().sequence() <= order.auto_route_after {
             return Err(SwapBookError::TimerNotExpired);
         }
+        // Past its own expiry the maker's instruction has lapsed — the
+        // order must be refunded via expire_order, never routed.
+        if env.ledger().sequence() > order.expiry {
+            return Err(SwapBookError::OrderExpired);
+        }
 
         let remaining = order.amount_in_remaining;
         // The maker's price floor for the routed swap
@@ -926,8 +1032,8 @@ impl SwapBook {
                 .persistent()
                 .get(&DataKey::Sep40Feed(token_out.clone()));
             if let (Some(feed_in), Some(feed_out)) = (feed_in, feed_out) {
-                let p_in = Self::sep40_lastprice(env, &feed_in.oracle, feed_in.asset.clone())?;
-                let p_out = Self::sep40_lastprice(env, &feed_out.oracle, feed_out.asset.clone())?;
+                let p_in = Self::sep40_lastprice(env, &feed_in)?;
+                let p_out = Self::sep40_lastprice(env, &feed_out)?;
                 // Cross rate with TWO normalizations: the tokens' own
                 // decimals (fair value maps token_in base units to
                 // token_out base units), AND — since each feed may come
@@ -935,15 +1041,19 @@ impl SwapBook {
                 // (identical oracles cancel; mixed ones must not skew).
                 let dec_in = token::Client::new(env, token_in).decimals();
                 let dec_out = token::Client::new(env, token_out).decimals();
+                // Cancel the shared power of ten BEFORE multiplying: an
+                // 18-decimal token against a 14-decimal feed would need
+                // p * 10^32, past i128 range. After cancellation only the
+                // exponent DIFFERENCE remains (≤ ~17 across 7/8/18-dec
+                // tokens and 8/14-dec oracles), which always fits.
+                let e_num = dec_out + feed_out.oracle_decimals;
+                let e_den = dec_in + feed_in.oracle_decimals;
+                let common = if e_num < e_den { e_num } else { e_den };
                 let num = p_in
-                    .checked_mul(Self::pow10(dec_out)?)
-                    .ok_or(SwapBookError::Overflow)?
-                    .checked_mul(Self::pow10(feed_out.oracle_decimals)?)
+                    .checked_mul(Self::pow10(e_num - common)?)
                     .ok_or(SwapBookError::Overflow)?;
                 let den = p_out
-                    .checked_mul(Self::pow10(dec_in)?)
-                    .ok_or(SwapBookError::Overflow)?
-                    .checked_mul(Self::pow10(feed_in.oracle_decimals)?)
+                    .checked_mul(Self::pow10(e_den - common)?)
                     .ok_or(SwapBookError::Overflow)?;
                 return Ok(OraclePriceData {
                     num,
@@ -962,20 +1072,23 @@ impl SwapBook {
     }
 
     /// Fetch one SEP-40 lastprice, enforcing positivity and max age.
+    /// The feed's own max_age wins; 0 falls back to the global Sep40MaxAge.
     fn sep40_lastprice(
         env: &Env,
-        oracle: &Address,
-        asset: OracleAsset,
+        feed: &FeedConfig,
     ) -> Result<i128, SwapBookError> {
-        let max_age: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Sep40MaxAge)
-            .ok_or(SwapBookError::OraclePriceNotSet)?;
+        let max_age: u64 = if feed.max_age_secs > 0 {
+            feed.max_age_secs
+        } else {
+            env.storage()
+                .instance()
+                .get(&DataKey::Sep40MaxAge)
+                .ok_or(SwapBookError::OraclePriceNotSet)?
+        };
         let price: Option<Sep40PriceData> = env.invoke_contract(
-            oracle,
+            &feed.oracle,
             &Symbol::new(env, "lastprice"),
-            soroban_sdk::vec![env, asset.into_val(env)],
+            soroban_sdk::vec![env, feed.asset.clone().into_val(env)],
         );
         let price = price.ok_or(SwapBookError::OraclePriceNotSet)?;
         if price.price <= 0 {
@@ -1048,8 +1161,6 @@ impl SwapBook {
             return Err(SwapBookError::ExcludedCounterparty);
         }
         if env.ledger().sequence() > order.expiry {
-            order.status = OrderStatus::Expired;
-            Self::write_order(env, order_id, &order);
             return Err(SwapBookError::OrderExpired);
         }
         if fill_amount_in <= 0 || amount_out <= 0 {
@@ -1071,6 +1182,11 @@ impl SwapBook {
         // Fee rounds up (min 1 stroop) so no fill is fee-free
         let fee = Self::calculate_fee(env, amount_out);
         let maker_receives = amount_out - fee;
+        // A fill so small the fee consumes the whole payment would strip
+        // escrow while paying the maker nothing.
+        if maker_receives <= 0 {
+            return Err(SwapBookError::InvalidAmount);
+        }
 
         let token_out_client = token::Client::new(env, &order.token_out);
         token_out_client.transfer(&taker, &order.maker, &maker_receives);
