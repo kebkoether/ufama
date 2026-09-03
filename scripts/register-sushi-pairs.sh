@@ -16,7 +16,9 @@
 # Idempotent (set_pair overwrites, registers both directions).
 # Run: bash scripts/register-sushi-pairs.sh
 set -e
-ADAPTER="CDFNVWKR6BO57LR3PMGGDK456FOAOILKSPE56GYRFGIY2Q5JPUULL3IY"
+# Default: the v1.2 Sushi adapter (deployed 2026-09-03, live factory).
+# Override with ADAPTER=... for another deployment (v1.1 was CDFNVWKR…L3IY).
+ADAPTER="${ADAPTER:-CAWVG65APH5K56AS7FWXKKDLSJQUO5WIGCVFUFFFRA2JOJ35OYERLCVR}"
 SRC="mainnet-deployer"
 NET="mainnet"
 FEE=1000000

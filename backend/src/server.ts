@@ -2054,9 +2054,19 @@ app.get('/api/health', async (_req, res) => {
       router: config.routerContractId,
       feeVault: config.feeVaultContractId,
     },
-    network: config.rpcUrl,
+    // Host only — QuickNode-style RPC URLs carry the API key in the path,
+    // and this endpoint is public.
+    network: rpcHostOnly(),
   });
 });
+
+function rpcHostOnly(): string {
+  try {
+    return new URL(config.rpcUrl).host;
+  } catch {
+    return 'configured';
+  }
+}
 
 // ─── Integrator API v1 ──────────────────────────────────
 //
@@ -2130,7 +2140,7 @@ function parsePartnerFee(body: any): { feeBps: number; referralAddress: string |
 
 /** GET /v1/health — auth check + which partner the key belongs to. */
 app.get('/v1/health', v1Auth, (req: any, res) => {
-  res.json({ status: 'ok', partner: req.partner, network: config.rpcUrl });
+  res.json({ status: 'ok', partner: req.partner, network: rpcHostOnly() });
 });
 
 /** GET /v1/tokens — tradeable token universe with venue-volume ranking. */
