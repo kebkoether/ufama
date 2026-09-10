@@ -15,6 +15,7 @@
 
 import { VenueAdapter, Quote, DepthQuote, SwapInstruction } from './adapter.js';
 import { TOKENS } from '../stellar/tokens.js';
+import { QuoteCurveCache } from '../services/quote-curve-cache.js';
 
 // Horizon SDK types
 import { Horizon, Asset } from '@stellar/stellar-sdk';
@@ -27,8 +28,48 @@ export class StellarDexAdapter implements VenueAdapter {
 
   private horizon: Horizon.Server;
 
-  constructor(horizonUrl: string) {
+  constructor(
+    horizonUrl: string,
+    /** Depth-point cache — one Horizon path query per novel size instead
+     *  of one per depth level per hop. Orderbook fills are concave in
+     *  size (deeper levels only worsen the marginal price), so the
+     *  cache's chord interpolation stays a conservative lower bound. */
+    private curveCache?: QuoteCurveCache
+  ) {
     this.horizon = new Horizon.Server(horizonUrl);
+  }
+
+  /** One strictSendPaths query — Horizon's own best-path answer. */
+  private async fetchPathOut(
+    assetIn: Asset,
+    assetOut: Asset,
+    amountIn: bigint
+  ): Promise<bigint> {
+    const paths = await this.horizon
+      .strictSendPaths(assetIn, this.toDisplayAmount(amountIn), [assetOut])
+      .call();
+    if (!paths.records || paths.records.length === 0) return 0n;
+    const best = paths.records.reduce((a, b) =>
+      parseFloat(a.destination_amount) > parseFloat(b.destination_amount) ? a : b
+    );
+    return this.fromDisplayAmount(best.destination_amount);
+  }
+
+  private async quoteOut(
+    tokenIn: string,
+    tokenOut: string,
+    assetIn: Asset,
+    assetOut: Asset,
+    amountIn: bigint
+  ): Promise<bigint> {
+    if (this.curveCache) {
+      return this.curveCache.quote(
+        `sdex|${tokenIn}|${tokenOut}`,
+        amountIn,
+        (amt) => this.fetchPathOut(assetIn, assetOut, amt)
+      );
+    }
+    return this.fetchPathOut(assetIn, assetOut, amountIn).catch(() => 0n);
   }
 
   async isAvailable(): Promise<boolean> {
@@ -54,24 +95,10 @@ export class StellarDexAdapter implements VenueAdapter {
     }
 
     try {
-      const displayAmount = this.toDisplayAmount(amountIn);
-
-      const paths = await this.horizon
-        .strictSendPaths(assetIn, displayAmount, [assetOut])
-        .call();
-
-      if (!paths.records || paths.records.length === 0) {
+      const amountOut = await this.quoteOut(tokenIn, tokenOut, assetIn, assetOut, amountIn);
+      if (amountOut <= 0n) {
         return this.emptyQuote(tokenIn, tokenOut, amountIn);
       }
-
-      // Pick the best path (highest destination_amount)
-      const best = paths.records.reduce((a, b) =>
-        parseFloat(a.destination_amount) > parseFloat(b.destination_amount)
-          ? a
-          : b
-      );
-
-      const amountOut = this.fromDisplayAmount(best.destination_amount);
       const effectiveBps =
         amountIn > 0n && amountOut > 0n
           ? Number(((amountIn - amountOut) * 10000n) / amountIn)
@@ -104,30 +131,18 @@ export class StellarDexAdapter implements VenueAdapter {
       return amounts.map((a) => ({ amountIn: a, amountOut: 0n, marginalBps: Infinity }));
     }
 
-    // Query paths for each depth level
+    // Query paths for each depth level (point-cached: only novel sizes
+    // reach Horizon; the rest interpolate).
     const quotes: DepthQuote[] = [];
     let prevAmountOut = 0n;
 
     for (const amount of amounts) {
       try {
-        const displayAmount = this.toDisplayAmount(amount);
-
-        const paths = await this.horizon
-          .strictSendPaths(assetIn, displayAmount, [assetOut])
-          .call();
-
-        if (!paths.records || paths.records.length === 0) {
+        const amountOut = await this.quoteOut(tokenIn, tokenOut, assetIn, assetOut, amount);
+        if (amountOut <= 0n) {
           quotes.push({ amountIn: amount, amountOut: prevAmountOut, marginalBps: Infinity });
           continue;
         }
-
-        const best = paths.records.reduce((a, b) =>
-          parseFloat(a.destination_amount) > parseFloat(b.destination_amount)
-            ? a
-            : b
-        );
-
-        const amountOut = this.fromDisplayAmount(best.destination_amount);
         const marginalOut = amountOut - prevAmountOut;
         const marginalIn = quotes.length > 0 ? amount - amounts[quotes.length - 1] : amount;
 

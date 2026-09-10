@@ -17,6 +17,7 @@
 
 import { VenueAdapter, Quote, DepthQuote, SwapInstruction } from './adapter.js';
 import { StellarClient } from '../stellar/client.js';
+import { QuoteCurveCache } from '../services/quote-curve-cache.js';
 
 export interface DiscoveredAquaPool {
   poolAddress: string;
@@ -36,7 +37,14 @@ export class AquaAdapter implements VenueAdapter {
     private adapterContractId: string,
     private aquaApiUrl: string,
     stellar: StellarClient,
-    private poolsProvider?: AquaPoolsProvider
+    private poolsProvider?: AquaPoolsProvider,
+    /** Depth-point cache: memoizes estimate_swap results per (pool,
+     *  direction) and interpolates tightly-bracketed amounts, so depth
+     *  ladders, candidate paths, hops and repeat quotes share simulations
+     *  instead of each paying their own. Points come from the pool's own
+     *  estimate_swap, so Aqua's constant-product, stableswap AND
+     *  concentrated pools all quote correctly — no reimplemented math. */
+    private curveCache?: QuoteCurveCache
   ) {
     this.stellar = stellar;
   }
@@ -129,16 +137,22 @@ export class AquaAdapter implements VenueAdapter {
       const inIdx = pool.tokenAddresses.indexOf(tokenIn);
       const outIdx = pool.tokenAddresses.indexOf(tokenOut);
       if (inIdx < 0 || outIdx < 0) continue;
-      const est = await this.stellar.simulateAndParse<bigint>(
-        pool.poolAddress,
-        'estimate_swap',
-        [
-          StellarClient.toU32(inIdx),
-          StellarClient.toU32(outIdx),
-          StellarClient.toU128(amountIn),
-        ]
-      );
-      if (est && BigInt(est) > 0n) return BigInt(est);
+
+      if (this.curveCache) {
+        // Hybrid path: memoized points + conservative interpolation for
+        // tightly-bracketed amounts (see quote-curve-cache.ts) — never
+        // over-quotes, never simulates more than the uncached path would.
+        const out = await this.curveCache.quote(
+          `aqua|${pool.poolAddress}|${inIdx}>${outIdx}`,
+          amountIn,
+          (amt) => this.simulateEstimate(pool.poolAddress, inIdx, outIdx, amt)
+        );
+        if (out > 0n) return out;
+        continue;
+      }
+
+      const est = await this.simulateEstimate(pool.poolAddress, inIdx, outIdx, amountIn);
+      if (est > 0n) return est;
     }
 
     // Last resort: the adapter contract's registered pool
@@ -152,6 +166,25 @@ export class AquaAdapter implements VenueAdapter {
       ]
     );
     return onChainResult ? BigInt(onChainResult) : 0n;
+  }
+
+  /** One on-chain estimate_swap simulation — the venue's own math. */
+  private async simulateEstimate(
+    poolAddress: string,
+    inIdx: number,
+    outIdx: number,
+    amountIn: bigint
+  ): Promise<bigint> {
+    const est = await this.stellar.simulateAndParse<bigint>(
+      poolAddress,
+      'estimate_swap',
+      [
+        StellarClient.toU32(inIdx),
+        StellarClient.toU32(outIdx),
+        StellarClient.toU128(amountIn),
+      ]
+    );
+    return est ? BigInt(est) : 0n;
   }
 
 }

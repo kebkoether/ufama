@@ -46,6 +46,15 @@ export class SushiSwapAdapter implements VenueAdapter {
   private envPairs: SushiPair[] = [];
   private pairsProvider: SushiPairsProvider | null;
   private token0Cache = new Map<string, string>(); // pool -> token0
+  /** slot0 (sqrt price) cache: quoting a depth ladder used to re-simulate
+   *  slot0 once PER LEVEL, sequentially — one pool state answers them all
+   *  for a ledger. Single-flight so concurrent path verification doesn't
+   *  stampede the RPC. */
+  private slot0Cache = new Map<string, { v: any; ts: number }>();
+  private slot0InFlight = new Map<string, Promise<any | null>>();
+  private static readonly SLOT0_TTL_MS = parseInt(
+    process.env.QUOTE_CURVE_TTL_MS ?? '5000'
+  );
 
   constructor(
     private adapterContractId: string,
@@ -100,6 +109,24 @@ export class SushiSwapAdapter implements VenueAdapter {
     return t0 ? String(t0) : null;
   }
 
+  private async slot0(pool: string): Promise<any | null> {
+    const hit = this.slot0Cache.get(pool);
+    if (hit && Date.now() - hit.ts < SushiSwapAdapter.SLOT0_TTL_MS) return hit.v;
+    const pending = this.slot0InFlight.get(pool);
+    if (pending) return pending;
+    const p = (async () => {
+      try {
+        const v = await this.stellar.simulateAndParse<any>(pool, 'slot0', []);
+        if (v) this.slot0Cache.set(pool, { v, ts: Date.now() });
+        return v ?? null;
+      } finally {
+        this.slot0InFlight.delete(pool);
+      }
+    })();
+    this.slot0InFlight.set(pool, p);
+    return p;
+  }
+
   /** Spot quote from pool slot0: price = (sqrtP / 2^96)^2, minus pool fee. */
   private async spotQuote(
     tokenIn: string,
@@ -110,7 +137,7 @@ export class SushiSwapAdapter implements VenueAdapter {
     if (!pair) return 0n;
 
     const [slot0, t0] = await Promise.all([
-      this.stellar.simulateAndParse<any>(pair.pool, 'slot0', []),
+      this.slot0(pair.pool),
       this.token0(pair.pool),
     ]);
     if (!slot0 || !t0) return 0n;

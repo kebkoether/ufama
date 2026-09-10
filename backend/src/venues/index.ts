@@ -8,9 +8,19 @@ import { AquaAdapter, AquaPoolsProvider } from './aqua.js';
 import { SushiSwapAdapter, SushiPairsProvider } from './sushiswap.js';
 import { StellarDexAdapter } from './stellar-dex.js';
 import { StellarClient } from '../stellar/client.js';
+import { QuoteCurveCache } from '../services/quote-curve-cache.js';
+
+/** Availability is a health signal, not per-quote data — memoize it.
+ *  Un-memoized, every computeRoute (per hop, per candidate path) paid an
+ *  Aqua HTTP health check plus a Horizon ledger fetch before quoting. */
+const AVAILABILITY_TTL_MS = parseInt(
+  process.env.VENUE_AVAILABILITY_TTL_MS ?? '30000'
+);
 
 export class VenueRegistry {
   private venues: Map<number, VenueAdapter> = new Map();
+  private availableMemo: { ts: number; val: VenueAdapter[] } | null = null;
+  private availableInFlight: Promise<VenueAdapter[]> | null = null;
 
   register(adapter: VenueAdapter): void {
     this.venues.set(adapter.venueId, adapter);
@@ -26,11 +36,32 @@ export class VenueRegistry {
   }
 
   async getAvailable(): Promise<VenueAdapter[]> {
-    const all = this.getAll();
-    const checks = await Promise.all(
-      all.map(async (v) => ({ adapter: v, available: await v.isAvailable() }))
-    );
-    return checks.filter((c) => c.available).map((c) => c.adapter);
+    if (
+      this.availableMemo &&
+      Date.now() - this.availableMemo.ts < AVAILABILITY_TTL_MS
+    ) {
+      return this.availableMemo.val;
+    }
+    if (this.availableInFlight) return this.availableInFlight;
+    this.availableInFlight = (async () => {
+      try {
+        const all = this.getAll();
+        const checks = await Promise.all(
+          all.map(async (v) => ({
+            adapter: v,
+            available: await v.isAvailable().catch(() => false),
+          }))
+        );
+        const val = checks.filter((c) => c.available).map((c) => c.adapter);
+        // An empty result is not memoized: a transient outage should not
+        // blank every venue for a whole TTL window.
+        if (val.length > 0) this.availableMemo = { ts: Date.now(), val };
+        return val;
+      } finally {
+        this.availableInFlight = null;
+      }
+    })();
+    return this.availableInFlight;
   }
 }
 
@@ -55,6 +86,16 @@ export function createVenueRegistry(config: {
     networkPassphrase: config.networkPassphrase,
   });
 
+  // Shared depth-curve cache (the hybrid quoting layer): pool quote
+  // curves are sampled once per TTL and shared across depth levels,
+  // candidate paths, hops and repeat quotes. QUOTE_CURVE_DISABLE=1
+  // restores per-amount simulation (rollback / benchmarking knob).
+  const curveCache = ['1', 'true'].includes(
+    (process.env.QUOTE_CURVE_DISABLE ?? '').toLowerCase()
+  )
+    ? undefined
+    : new QuoteCurveCache();
+
   if (config.swapbookContractId) {
     registry.register(new SwapBookAdapter(config.swapbookContractId, stellar));
   }
@@ -65,7 +106,8 @@ export function createVenueRegistry(config: {
         config.aquaAdapterContractId,
         config.aquaApiUrl,
         stellar,
-        config.aquaPoolsProvider
+        config.aquaPoolsProvider,
+        curveCache
       )
     );
   }
@@ -83,7 +125,7 @@ export function createVenueRegistry(config: {
 
   // Stellar DEX — always available, uses Horizon (no contract needed)
   if (config.horizonUrl) {
-    registry.register(new StellarDexAdapter(config.horizonUrl));
+    registry.register(new StellarDexAdapter(config.horizonUrl, curveCache));
   }
 
   return registry;
