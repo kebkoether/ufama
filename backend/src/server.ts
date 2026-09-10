@@ -743,7 +743,9 @@ app.get('/api/quote', async (req, res) => {
           path: multi.path,
           label,
           hopCount: multi.hops.length,
-          note: `Best rate routes ${label} (${multi.hops.length} transactions to sign; any surplus intermediate tokens stay in your wallet)`,
+          note: config.routerV12
+            ? `Best rate routes ${label} — one atomic transaction, all hops or nothing`
+            : `Best rate routes ${label} (${multi.hops.length} transactions to sign; any surplus intermediate tokens stay in your wallet)`,
           // Per-hop venue splits — everything the route diagram needs,
           // all already computed (zero extra latency)
           hops: multi.hops.map((h) => ({
