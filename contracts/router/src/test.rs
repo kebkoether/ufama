@@ -131,7 +131,7 @@ fn test_execute_route_fee_on_total() {
 
     let received = client.execute_route(
         &t.user, &t.token_a, &t.token_b,
-        &amount, &expected_net, &segments,
+        &amount, &expected_net, &segments, &0,
     );
     assert_eq!(received, expected_net);
 
@@ -152,7 +152,7 @@ fn test_execute_route_insufficient_output_reverts() {
     let segments = soroban_sdk::vec![&t.env, seg(1, amount, 0)];
     let res = client.try_execute_route(
         &t.user, &t.token_a, &t.token_b,
-        &amount, &(amount - 5_000_000), &segments,
+        &amount, &(amount - 5_000_000), &segments, &0,
     );
     assert!(res.is_err());
     // Revert means the user kept their funds
@@ -171,19 +171,19 @@ fn test_execute_route_segment_validation() {
     // Sum mismatch
     let bad_sum = soroban_sdk::vec![&t.env, seg(1, amount / 2, 0)];
     assert!(client
-        .try_execute_route(&t.user, &t.token_a, &t.token_b, &amount, &1, &bad_sum)
+        .try_execute_route(&t.user, &t.token_a, &t.token_b, &amount, &1, &bad_sum, &0)
         .is_err());
 
     // Non-positive segment amount
     let bad_seg = soroban_sdk::vec![&t.env, seg(1, -1, 0), seg(1, amount + 1, 0)];
     assert!(client
-        .try_execute_route(&t.user, &t.token_a, &t.token_b, &amount, &1, &bad_seg)
+        .try_execute_route(&t.user, &t.token_a, &t.token_b, &amount, &1, &bad_seg, &0)
         .is_err());
 
     // Unknown venue
     let bad_venue = soroban_sdk::vec![&t.env, seg(99, amount, 0)];
     assert!(client
-        .try_execute_route(&t.user, &t.token_a, &t.token_b, &amount, &1, &bad_venue)
+        .try_execute_route(&t.user, &t.token_a, &t.token_b, &amount, &1, &bad_venue, &0)
         .is_err());
 }
 
@@ -307,7 +307,7 @@ fn test_router_fee_settable_within_cap() {
     let segments = soroban_sdk::vec![&t.env, seg(1, amount, amount)];
     let received = client.execute_route(
         &t.user, &t.token_a, &t.token_b,
-        &amount, &amount, &segments,
+        &amount, &amount, &segments, &0,
     );
     assert_eq!(received, amount);
     assert_eq!(TokenClient::new(&t.env, &t.token_b).balance(&t.fee_vault), 0);
@@ -335,7 +335,7 @@ fn test_partner_fee_split_is_additive() {
     let received = client.execute_route_partner(
         &t.user, &t.token_a, &t.token_b,
         &amount, &expected_net, &segments,
-        &partner, &100,
+        &partner, &100, &0,
     );
     assert_eq!(received, expected_net);
     // Partner got their cut, protocol got its full fee — additive, not split
@@ -349,7 +349,7 @@ fn test_partner_fee_split_is_additive() {
         .try_execute_route_partner(
             &t.user, &t.token_a, &t.token_b,
             &amount, &1, &soroban_sdk::vec![&t.env, seg(1, amount, 0)],
-            &partner, &1_001,
+            &partner, &1_001, &0,
         )
         .is_err());
     assert!(client
@@ -357,7 +357,7 @@ fn test_partner_fee_split_is_additive() {
             &t.user, &t.token_a, &t.token_b,
             &amount, &(expected_net + 1),
             &soroban_sdk::vec![&t.env, seg(1, amount, 0)],
-            &partner, &100,
+            &partner, &100, &0,
         )
         .is_err());
 }
@@ -392,7 +392,7 @@ fn test_execute_path_two_hops_one_invocation() {
     // 1:1 both hops; fee (5/100k from setup) applies ONCE, on the final out
     let fee = (amount * 5 + 100_000 - 1) / 100_000;
     let received = client.execute_path(
-        &t.user, &t.token_a, &amount, &(amount - fee), &hops,
+        &t.user, &t.token_a, &amount, &(amount - fee), &hops, &0,
     );
     assert_eq!(received, amount - fee);
     assert_eq!(TokenClient::new(&t.env, &token_c).balance(&t.user), amount - fee);
@@ -430,7 +430,7 @@ fn test_execute_path_split_hop_weights() {
     let expected_out = leg1_in + leg2_in * 10_100 / 10_000;
     let fee = (expected_out * 5 + 100_000 - 1) / 100_000;
     let received = client.execute_path(
-        &t.user, &t.token_a, &amount, &(expected_out - fee), &hops,
+        &t.user, &t.token_a, &amount, &(expected_out - fee), &hops, &0,
     );
     assert_eq!(received, expected_out - fee);
 }
@@ -451,7 +451,7 @@ fn test_execute_path_atomic_revert_and_validation() {
     ];
     // Demand full 1:1 — venue pays 95% — WHOLE path reverts
     assert!(client
-        .try_execute_path(&t.user, &t.token_a, &amount, &amount, &hops)
+        .try_execute_path(&t.user, &t.token_a, &amount, &amount, &hops, &0)
         .is_err());
     assert_eq!(TokenClient::new(&t.env, &t.token_a).balance(&t.user), user_before);
 
@@ -464,7 +464,7 @@ fn test_execute_path_atomic_revert_and_validation() {
         },
     ];
     assert!(client
-        .try_execute_path(&t.user, &t.token_a, &amount, &1, &bad_weights)
+        .try_execute_path(&t.user, &t.token_a, &amount, &1, &bad_weights, &0)
         .is_err());
 
     // Hop into the same token is nonsense
@@ -476,6 +476,151 @@ fn test_execute_path_atomic_revert_and_validation() {
         },
     ];
     assert!(client
-        .try_execute_path(&t.user, &t.token_a, &amount, &1, &self_hop)
+        .try_execute_path(&t.user, &t.token_a, &amount, &1, &self_hop, &0)
+        .is_err());
+}
+
+// ─── v1.2.1: positive-slippage share ─────────────────────
+
+#[test]
+fn test_surplus_share_captured_above_estimate() {
+    let t = setup(10_000); // 1:1 venue; protocol fee 5/100k from setup
+    let client = RouterClient::new(&t.env, &t.router_id);
+
+    // Default share is 25%
+    assert_eq!(client.get_surplus_share(), (2_500, 10_000));
+
+    let amount = 10_000_0000000i128;
+    // Caller was quoted 1% below what the venue actually pays
+    let estimated = amount - amount / 100;
+    let flat_fee = (amount * 5 + 100_000 - 1) / 100_000;
+    let surplus = amount - estimated;
+    let surplus_fee = surplus * 2_500 / 10_000;
+    let expected_net = amount - flat_fee - surplus_fee;
+
+    let segments = soroban_sdk::vec![&t.env, seg(1, amount, 0)];
+    let received = client.execute_route(
+        &t.user, &t.token_a, &t.token_b,
+        &amount, &(estimated - flat_fee), &segments, &estimated,
+    );
+    assert_eq!(received, expected_net);
+    // User kept the full estimate (net of the flat fee) plus 75% of the
+    // surplus; the vault got flat fee + 25% of the surplus.
+    assert!(received >= estimated - flat_fee);
+    let token_b = TokenClient::new(&t.env, &t.token_b);
+    assert_eq!(token_b.balance(&t.fee_vault), flat_fee + surplus_fee);
+    assert_eq!(token_b.balance(&t.user), expected_net);
+}
+
+#[test]
+fn test_surplus_share_no_capture_cases() {
+    let t = setup(10_000);
+    let client = RouterClient::new(&t.env, &t.router_id);
+    let amount = 10_000_0000000i128;
+    let flat_fee = (amount * 5 + 100_000 - 1) / 100_000;
+
+    // estimated_out == 0 disables capture entirely
+    let segments = soroban_sdk::vec![&t.env, seg(1, amount, 0)];
+    let received = client.execute_route(
+        &t.user, &t.token_a, &t.token_b,
+        &amount, &1, &segments, &0,
+    );
+    assert_eq!(received, amount - flat_fee);
+
+    // Execution exactly AT the estimate: no surplus, no extra fee
+    let segments2 = soroban_sdk::vec![&t.env, seg(1, amount, 0)];
+    let received2 = client.execute_route(
+        &t.user, &t.token_a, &t.token_b,
+        &amount, &1, &segments2, &amount,
+    );
+    assert_eq!(received2, amount - flat_fee);
+}
+
+#[test]
+fn test_surplus_estimate_below_min_rejected() {
+    let t = setup(10_000);
+    let client = RouterClient::new(&t.env, &t.router_id);
+    let amount = 10_000_0000000i128;
+
+    // A lowballed estimate under the user's own floor is refused — it
+    // would reclassify honest output as "surplus".
+    let segments = soroban_sdk::vec![&t.env, seg(1, amount, 0)];
+    assert!(client
+        .try_execute_route(
+            &t.user, &t.token_a, &t.token_b,
+            &amount, &(amount / 2), &segments, &(amount / 2 - 1),
+        )
+        .is_err());
+}
+
+#[test]
+fn test_surplus_share_admin_settable_and_capped() {
+    let t = setup(10_000);
+    let client = RouterClient::new(&t.env, &t.router_id);
+
+    // Cap: 50% hard limit, negatives rejected
+    assert!(client.try_set_surplus_share(&5_001).is_err());
+    assert!(client.try_set_surplus_share(&-1).is_err());
+
+    // 10% share changes the math accordingly
+    client.set_surplus_share(&1_000);
+    let amount = 10_000_0000000i128;
+    let estimated = amount - amount / 100;
+    let flat_fee = (amount * 5 + 100_000 - 1) / 100_000;
+    let surplus_fee = (amount - estimated) * 1_000 / 10_000;
+
+    let segments = soroban_sdk::vec![&t.env, seg(1, amount, 0)];
+    let received = client.execute_route(
+        &t.user, &t.token_a, &t.token_b,
+        &amount, &1, &segments, &estimated,
+    );
+    assert_eq!(received, amount - flat_fee - surplus_fee);
+
+    // 0 = disabled even with an estimate supplied
+    client.set_surplus_share(&0);
+    let segments2 = soroban_sdk::vec![&t.env, seg(1, amount, 0)];
+    let received2 = client.execute_route(
+        &t.user, &t.token_a, &t.token_b,
+        &amount, &1, &segments2, &estimated,
+    );
+    assert_eq!(received2, amount - flat_fee);
+}
+
+#[test]
+fn test_execute_path_surplus_share() {
+    let t = setup(10_000); // 1:1 venue
+    let client = RouterClient::new(&t.env, &t.router_id);
+
+    let amount = 1_000_0000000i128;
+    let estimated = amount - amount / 200; // quoted 0.5% below actual
+    let flat_fee = (amount * 5 + 100_000 - 1) / 100_000;
+    let surplus_fee = (amount - estimated) * 2_500 / 10_000;
+
+    let hops = soroban_sdk::vec![
+        &t.env,
+        PathHop {
+            token_out: t.token_b.clone(),
+            legs: soroban_sdk::vec![&t.env, PathLeg { venue_id: 1, weight_bps: 10_000, min_amount_out: 0 }],
+        },
+    ];
+    let received = client.execute_path(
+        &t.user, &t.token_a, &amount, &1, &hops, &estimated,
+    );
+    assert_eq!(received, amount - flat_fee - surplus_fee);
+    assert_eq!(
+        TokenClient::new(&t.env, &t.token_b).balance(&t.fee_vault),
+        flat_fee + surplus_fee
+    );
+
+    // Estimate below the final min: refused
+    let hops2 = soroban_sdk::vec![
+        &t.env,
+        PathHop {
+            token_out: t.token_b.clone(),
+            legs: soroban_sdk::vec![&t.env, PathLeg { venue_id: 1, weight_bps: 10_000, min_amount_out: 0 }],
+        },
+    ];
+    assert!(client
+        .try_execute_path(&t.user, &t.token_a, &amount, &(amount / 2), &hops2, &(amount / 2 - 1))
         .is_err());
 }

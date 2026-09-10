@@ -22,6 +22,15 @@ const MAX_PATH_HOPS: u32 = 5;
 /// Weight denominator for splitting a hop across venues.
 const WEIGHT_DENOMINATOR: i128 = 10_000;
 
+/// Positive-slippage share: when execution beats the caller-supplied
+/// estimate, the protocol keeps a share of the SURPLUS ONLY — the user
+/// always receives at least the estimate they were quoted (net of the
+/// flat fee), and 100% of any shortfall protection stays with min_out.
+/// Admin-settable via set_surplus_share, HARD-CAPPED at 50%.
+const MAX_SURPLUS_SHARE_BPS: i128 = 5_000;
+const DEFAULT_SURPLUS_SHARE_BPS: i128 = 2_500;
+const BPS_DENOMINATOR: i128 = 10_000;
+
 // ─── Storage Keys ───────────────────────────────────────
 
 #[contracttype]
@@ -38,6 +47,8 @@ pub enum DataKey {
     FeePer100k,
     /// Two-step admin rotation: proposed new admin, pending acceptance.
     PendingAdmin,
+    /// Protocol's share of positive slippage, in bps (settable ≤ cap)
+    SurplusShareBps,
 }
 
 // ─── Types ──────────────────────────────────────────────
@@ -110,6 +121,9 @@ pub enum RouterError {
     PathTooLong = 14,
     InvalidPath = 15,
     NoPendingAdmin = 16,
+    InvalidEstimate = 17,
+    Overflow = 18,
+    SurplusShareAboveCap = 19,
 }
 
 // ─── Contract ───────────────────────────────────────────
@@ -258,6 +272,10 @@ impl Router {
     ///
     /// The protocol fee applies once, on the FINAL output, and
     /// `min_final_out` protects the user net of it.
+    /// `estimated_out`: the GROSS final output the caller was quoted —
+    /// execution above it splits the surplus per `get_surplus_share`
+    /// (0 disables capture for this call). Rejected below `min_final_out`
+    /// so a lowballed estimate can't reclassify honest output as surplus.
     pub fn execute_path(
         env: Env,
         user: Address,
@@ -265,11 +283,15 @@ impl Router {
         total_amount_in: i128,
         min_final_out: i128,
         hops: Vec<PathHop>,
+        estimated_out: i128,
     ) -> Result<i128, RouterError> {
         user.require_auth();
 
         if total_amount_in <= 0 || min_final_out <= 0 {
             return Err(RouterError::InvalidAmount);
+        }
+        if estimated_out > 0 && estimated_out < min_final_out {
+            return Err(RouterError::InvalidEstimate);
         }
         if hops.is_empty() {
             return Err(RouterError::InvalidPath);
@@ -355,21 +377,32 @@ impl Router {
             carry = hop_out;
         }
 
-        // Fee once, on the final output; user floor enforced net of it
+        // Fees once, on the final output; user floor enforced net of them
         let fee = Self::calculate_fee(&env, carry);
-        let user_receives = carry - fee;
+        let surplus_fee = Self::surplus_fee(&env, carry, estimated_out)?;
+        let user_receives = carry - fee - surplus_fee;
         if user_receives < min_final_out {
             return Err(RouterError::InsufficientOutput);
         }
         let out_client = token::Client::new(&env, &carry_token);
         out_client.transfer(&env.current_contract_address(), &user, &user_receives);
-        if fee > 0 {
+        if fee + surplus_fee > 0 {
             let fee_vault: Address = env
                 .storage()
                 .instance()
                 .get(&DataKey::FeeVault)
                 .ok_or(RouterError::NotInitialized)?;
-            out_client.transfer(&env.current_contract_address(), &fee_vault, &fee);
+            out_client.transfer(
+                &env.current_contract_address(),
+                &fee_vault,
+                &(fee + surplus_fee),
+            );
+        }
+        if surplus_fee > 0 {
+            env.events().publish(
+                (symbol_short!("route"), symbol_short!("surplus")),
+                (user.clone(), carry_token.clone(), surplus_fee),
+            );
         }
 
         env.events().publish(
@@ -379,11 +412,39 @@ impl Router {
         Ok(user_receives)
     }
 
+    /// Set the protocol's share of positive slippage (bps of the surplus
+    /// above the caller-supplied estimate). Admin only, hard-capped at
+    /// MAX_SURPLUS_SHARE_BPS (50%); 0 disables capture entirely.
+    pub fn set_surplus_share(env: Env, share_bps: i128) -> Result<(), RouterError> {
+        Self::require_admin(&env)?;
+        if !(0..=MAX_SURPLUS_SHARE_BPS).contains(&share_bps) {
+            return Err(RouterError::SurplusShareAboveCap);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::SurplusShareBps, &share_bps);
+        env.events().publish(
+            (symbol_short!("route"), symbol_short!("surshare")),
+            share_bps,
+        );
+        Ok(())
+    }
+
+    /// Current positive-slippage share as (numerator, denominator).
+    pub fn get_surplus_share(env: Env) -> (i128, i128) {
+        (Self::surplus_share_bps(&env), BPS_DENOMINATOR)
+    }
+
     /// Execute a multi-venue routed swap for `user`.
     ///
     /// Verifies: segments are positive and sum to total_amount_in; every
     /// venue exists; net output (after the 0.5 bps protocol fee on the
     /// TOTAL output) meets min_total_out — otherwise the whole tx reverts.
+    ///
+    /// `estimated_out`: the GROSS output the caller was quoted. When
+    /// execution beats it, the protocol keeps `get_surplus_share` of the
+    /// surplus (the user still receives at least the estimate net of the
+    /// flat fee). 0 disables surplus capture for this call.
     pub fn execute_route(
         env: Env,
         user: Address,
@@ -392,10 +453,11 @@ impl Router {
         total_amount_in: i128,
         min_total_out: i128,
         segments: Vec<RouteSegment>,
+        estimated_out: i128,
     ) -> Result<i128, RouterError> {
         Self::route_inner(
             &env, user, token_in, token_out, total_amount_in, min_total_out,
-            segments, None,
+            segments, None, estimated_out,
         )
     }
 
@@ -414,13 +476,14 @@ impl Router {
         segments: Vec<RouteSegment>,
         partner: Address,
         partner_fee_per_100k: i128,
+        estimated_out: i128,
     ) -> Result<i128, RouterError> {
         if !(0..=MAX_PARTNER_FEE_PER_100K).contains(&partner_fee_per_100k) {
             return Err(RouterError::PartnerFeeAboveCap);
         }
         Self::route_inner(
             &env, user, token_in, token_out, total_amount_in, min_total_out,
-            segments, Some((partner, partner_fee_per_100k)),
+            segments, Some((partner, partner_fee_per_100k)), estimated_out,
         )
     }
 
@@ -434,6 +497,7 @@ impl Router {
         min_total_out: i128,
         segments: Vec<RouteSegment>,
         partner: Option<(Address, i128)>,
+        estimated_out: i128,
     ) -> Result<i128, RouterError> {
         user.require_auth();
 
@@ -442,6 +506,11 @@ impl Router {
         }
         if token_in == token_out {
             return Err(RouterError::SameToken);
+        }
+        // A lowballed estimate would reclassify honest output as
+        // "surplus" — it may never sit below the user's own floor.
+        if estimated_out > 0 && estimated_out < min_total_out {
+            return Err(RouterError::InvalidEstimate);
         }
         Self::validate_segments(&segments, total_amount_in)?;
 
@@ -459,7 +528,8 @@ impl Router {
             }
             _ => 0,
         };
-        let user_receives = total_out - fee - partner_fee;
+        let surplus_fee = Self::surplus_fee(env, total_out, estimated_out)?;
+        let user_receives = total_out - fee - partner_fee - surplus_fee;
 
         if user_receives < min_total_out {
             return Err(RouterError::InsufficientOutput);
@@ -467,13 +537,23 @@ impl Router {
 
         let token_out_client = token::Client::new(env, &token_out);
         token_out_client.transfer(&env.current_contract_address(), &user, &user_receives);
-        if fee > 0 {
+        if fee + surplus_fee > 0 {
             let fee_vault: Address = env
                 .storage()
                 .instance()
                 .get(&DataKey::FeeVault)
                 .ok_or(RouterError::NotInitialized)?;
-            token_out_client.transfer(&env.current_contract_address(), &fee_vault, &fee);
+            token_out_client.transfer(
+                &env.current_contract_address(),
+                &fee_vault,
+                &(fee + surplus_fee),
+            );
+        }
+        if surplus_fee > 0 {
+            env.events().publish(
+                (symbol_short!("route"), symbol_short!("surplus")),
+                (user.clone(), token_out.clone(), surplus_fee),
+            );
         }
         if partner_fee > 0 {
             let (partner_addr, _) = partner.as_ref().unwrap();
@@ -515,6 +595,7 @@ impl Router {
             amount_in,
             min_amount_out,
             segments,
+            0, // no estimate — no surplus capture on the convenience path
         )
     }
 
@@ -711,6 +792,35 @@ impl Router {
             .ok_or(RouterError::NotInitialized)?;
         admin.require_auth();
         Ok(())
+    }
+
+    fn surplus_share_bps(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SurplusShareBps)
+            .unwrap_or(DEFAULT_SURPLUS_SHARE_BPS)
+    }
+
+    /// Protocol's cut of positive slippage: `share` bps of whatever the
+    /// actual output exceeds the caller-supplied estimate by. Floor
+    /// division — rounding always favors the user. estimated_out == 0
+    /// disables capture (keeper settlements, legacy integrations).
+    fn surplus_fee(
+        env: &Env,
+        total_out: i128,
+        estimated_out: i128,
+    ) -> Result<i128, RouterError> {
+        if estimated_out <= 0 || total_out <= estimated_out {
+            return Ok(0);
+        }
+        let share = Self::surplus_share_bps(env);
+        if share <= 0 {
+            return Ok(0);
+        }
+        (total_out - estimated_out)
+            .checked_mul(share)
+            .map(|v| v / BPS_DENOMINATOR)
+            .ok_or(RouterError::Overflow)
     }
 }
 
