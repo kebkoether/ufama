@@ -87,7 +87,23 @@ const config = {
   /** v1.2 Router deployed: multi-hop executes as ONE atomic execute_path
    *  transaction instead of a signed-per-leg blend plan. */
   routerV12: ['1', 'true'].includes((process.env.ROUTER_V12 ?? '').toLowerCase()),
+  /** v1.2.1 Router deployed: execute_route/execute_path take a trailing
+   *  estimated_out arg and share positive slippage above it (the user
+   *  always keeps at least the estimate). MUST stay unset against older
+   *  routers — the extra arg fails their signatures. */
+  routerSurplus: ['1', 'true'].includes((process.env.ROUTER_SURPLUS ?? '').toLowerCase()),
+  /** UI-disclosure mirror of the contract's surplus share (bps of the
+   *  surplus kept by the protocol). Keep in sync with get_surplus_share. */
+  surplusShareBps: parseInt(process.env.SURPLUS_SHARE_BPS ?? '2500'),
 };
+
+/** Trailing estimated_out arg for v1.2.1 Router builds — GROSS expected
+ *  output. Empty against older routers (extra args fail their ABI). */
+function surplusArg(estimatedOut: bigint) {
+  return config.routerSurplus
+    ? [StellarClient.toI128(estimatedOut > 0n ? estimatedOut : 0n)]
+    : [];
+}
 
 /**
  * Protocol-operated liquidity wallets (e.g. SDF-supported inventory).
@@ -732,6 +748,10 @@ app.get('/api/quote', async (req, res) => {
         tokenOut,
         amountIn: amountIn.toString(),
         vsOracleBps,
+        // Disclosure: when execution beats this quote, the protocol keeps
+        // surplusShareBps of the improvement — the user always receives at
+        // least the quote. Absent (undefined) until the v1.2.1 Router.
+        ...(config.routerSurplus ? { surplusShareBps: config.surplusShareBps } : {}),
         expectedOut: multiOut.toString(),
         netAmountOut: multiOut.toString(),
         protocolFee: '0',
@@ -780,6 +800,7 @@ app.get('/api/quote', async (req, res) => {
       tokenOut: route.tokenOut,
       amountIn: route.totalAmountIn.toString(),
       vsOracleBps,
+      ...(config.routerSurplus ? { surplusShareBps: config.surplusShareBps } : {}),
       expectedOut: route.totalExpectedOut.toString(),
       netAmountOut: route.netAmountOut.toString(),
       protocolFee: route.protocolFee.toString(),
@@ -950,6 +971,7 @@ app.post('/api/swap/build', async (req, res) => {
               minAmountOut: i.minAmountOut,
             }))
           ),
+          ...surplusArg(blend.ammNet),
         ]
       );
       res.json({
@@ -1016,6 +1038,7 @@ app.post('/api/swap/build', async (req, res) => {
               minAmountOut: i.minAmountOut,
             }))
           ),
+          ...surplusArg(h.route.totalExpectedOut),
         ]);
       const label = pathLabel(multi.path);
       const lastHop = multi.hops[multi.hops.length - 1];
@@ -1023,6 +1046,18 @@ app.post('/api/swap/build', async (req, res) => {
         // v1.2: the WHOLE path in one atomic transaction — one signature,
         // all-or-nothing, real outputs flow hop to hop on-chain.
         const finalMin = (multi.netAmountOut * BigInt(10000 - slippage)) / 10000n;
+        // GROSS unchained estimate for surplus sharing: what the path is
+        // expected to deliver when each hop swaps the previous hop's REAL
+        // output. The quote's netAmountOut chains conservatively (each hop
+        // sized from the prior min-out) — using it as the estimate would
+        // reclassify that built-in conservatism as "surplus" and quietly
+        // fee it. Scale each hop's expected rate onto the carried amount.
+        let estimatedGross = amountIn;
+        for (const h of multi.hops) {
+          if (h.amountIn > 0n) {
+            estimatedGross = (h.route.totalExpectedOut * estimatedGross) / h.amountIn;
+          }
+        }
         const pathXdr = await stellar.buildTransaction(
           sourceAddress,
           config.routerContractId,
@@ -1054,6 +1089,7 @@ app.post('/api/swap/build', async (req, res) => {
                 };
               })
             ),
+            ...surplusArg(estimatedGross),
           ]
         );
         res.json({
@@ -1186,6 +1222,7 @@ app.post('/api/swap/build', async (req, res) => {
             minAmountOut: i.minAmountOut,
           }))
         ),
+        ...surplusArg(route.totalExpectedOut),
       ]
     );
 
@@ -2280,8 +2317,12 @@ app.post('/v1/quote/build', v1Auth, async (req, res) => {
           StellarClient.toAddress(referralAddress as string),
           // Contract takes per-100k (0.1 bp granularity): bps * 10
           StellarClient.toI128(BigInt(feeBps * 10)),
+          ...surplusArg(route.totalExpectedOut),
         ])
-      : await stellar.buildTransaction(from, config.routerContractId, 'execute_route', baseArgs);
+      : await stellar.buildTransaction(from, config.routerContractId, 'execute_route', [
+          ...baseArgs,
+          ...surplusArg(route.totalExpectedOut),
+        ]);
     res.json({
       xdr,
       kind,

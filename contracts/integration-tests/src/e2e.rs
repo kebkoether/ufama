@@ -460,7 +460,7 @@ fn split_route_takes_fee_on_total_and_reverts_whole_on_shortfall() {
 
     let received = router.execute_route(
         &w.taker, &w.token_a, &w.token_b,
-        &total_in, &(expected_out - fee), &segments,
+        &total_in, &(expected_out - fee), &segments, &0,
     );
     assert_eq!(received, expected_out - fee);
     assert_eq!(vault.get_balance(&w.token_b), fee);
@@ -478,7 +478,7 @@ fn split_route_takes_fee_on_total_and_reverts_whole_on_shortfall() {
     assert!(router
         .try_execute_route(
             &w.taker, &w.token_a, &w.token_b,
-            &total_in, &(expected_out + 1), &greedy,
+            &total_in, &(expected_out + 1), &greedy, &0,
         )
         .is_err());
     assert_eq!(
