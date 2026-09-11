@@ -91,8 +91,19 @@ export class QuoteCurveCache {
 
     const p = (async () => {
       try {
-        const out = await sampler(amountIn).catch(() => 0n);
-        this.insert(key, { amountIn, amountOut: out, ts: Date.now() });
+        let failed = false;
+        const out = await sampler(amountIn).catch(() => {
+          failed = true;
+          return 0n;
+        });
+        // A FAILED simulation means "don't know", not "zero". Caching it
+        // as a point poisoned quotes and route selection for a whole TTL
+        // whenever the RPC hiccuped (observed in production as transient
+        // 20x-low quotes and failed builds right after deploy). Genuine
+        // zeros — the venue itself answered 0 — still memoize.
+        if (!failed) {
+          this.insert(key, { amountIn, amountOut: out, ts: Date.now() });
+        }
         return out;
       } finally {
         this.inFlight.delete(flightKey);
