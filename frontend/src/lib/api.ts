@@ -43,6 +43,13 @@ export interface QuoteResponse {
   blendedBps: number;
   segments: RouteSegment[];
   instructions: SwapInstruction[];
+  priceImpactBps?: number;
+  vsOracleBps?: number | null;
+  /** Server-side thresholds (PRICE_IMPACT_WARN_BPS / PRICE_IMPACT_MAX_BPS):
+   *  warning = show a banner; blocked = the build endpoint will refuse. */
+  priceImpactWarning?: boolean;
+  priceImpactBlocked?: boolean;
+  priceImpactMaxBps?: number;
 }
 
 export async function getQuote(

@@ -1699,6 +1699,28 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           </div>
         )}
 
+        {/* Price-impact warning / block (thresholds come from the backend) */}
+        {quote && mode === 'instant' && (quote.priceImpactWarning || quote.priceImpactBlocked) && (
+          <div
+            style={{
+              marginTop: '10px',
+              padding: '10px 12px',
+              borderRadius: '10px',
+              background: quote.priceImpactBlocked ? 'rgba(239, 68, 68, 0.1)' : 'rgba(234, 179, 8, 0.08)',
+              border: quote.priceImpactBlocked ? '1px solid rgba(239, 68, 68, 0.35)' : '1px solid rgba(234, 179, 8, 0.25)',
+              color: quote.priceImpactBlocked ? '#ef4444' : '#eab308',
+              fontSize: '13px',
+              lineHeight: 1.5,
+            }}
+          >
+            <strong>{quote.priceImpactBlocked ? 'Trade blocked: ' : 'High price impact: '}</strong>
+            this size moves the pool about {(Math.max(0, quote.priceImpactBps ?? 0) / 100).toFixed(1)}%.
+            {quote.priceImpactBlocked
+              ? ` That is above the ${((quote.priceImpactMaxBps ?? 1500) / 100).toFixed(0)}% safety cap. Reduce the amount, or use a TWAP order to spread it over time.`
+              : ' A TWAP order would spread it over time and usually fills better.'}
+          </div>
+        )}
+
         {/* Quote details */}
         {quote && mode === 'instant' && (
           <div
@@ -1751,7 +1773,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
                     : 'None — all via DEXs',
                   color: parseInt(quote.swapBookAmountOut ?? '0') > 0 ? '#22c55e' : '#8a8f9c',
                 },
-                { label: 'Price impact', value: `~${impactBps.toFixed(1)} bps`, color: '#eab308' },
+                { label: 'Price impact', value: `~${impactBps.toFixed(1)} bps`, color: quote.priceImpactWarning ? '#ef4444' : '#eab308' },
                 {
                   label: vsOracle !== null ? 'Total cost (vs oracle)' : 'Total cost',
                   value: costStr,
@@ -1779,9 +1801,12 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           // receive tokenOut until it's added, so the button becomes the
           // add-trustline action (clickable even while a quote loads).
           const trustlineGate = Boolean(missingTrustline && hasAmount && !addingTrustline);
+          // Server-side price-impact cap: the build endpoint refuses
+          // anyway, but the button should say why before the user tries.
+          const impactBlocked = mode === 'instant' && Boolean(quote?.priceImpactBlocked);
           const disabled = trustlineGate
             ? false
-            : !hasAmount || loading || submitting || addingTrustline || !p2pPairReady;
+            : !hasAmount || loading || submitting || addingTrustline || !p2pPairReady || impactBlocked;
 
           // Determine button action and label
           let onClick: (() => void) | undefined;
@@ -1810,7 +1835,9 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
               label = `Start TWAP · escrow ${parseFloat(amountIn).toLocaleString()} ${tokenIn} over ${dur}`;
             }
           } else if (mode === 'instant') {
-            if (quote && hasAmount) {
+            if (impactBlocked && hasAmount) {
+              label = `Price impact too high (${(Math.max(0, quote.priceImpactBps ?? 0) / 100).toFixed(1)}%) — reduce size or use TWAP`;
+            } else if (quote && hasAmount) {
               onClick = handleInstantSwap;
               label = `Swap ${parseFloat(amountIn).toLocaleString()} ${tokenIn} → ${formatOutput(quote.netAmountOut)} ${tokenOut}`;
               showGreen = true;

@@ -72,6 +72,8 @@ export function createVenueRegistry(config: {
   sushiAdapterContractId: string;
   horizonUrl: string;
   rpcUrl: string;
+  /** Secondary RPCs for transport-level failover (see StellarClient) */
+  fallbackRpcUrls?: string[];
   networkPassphrase: string;
   /** Live Sushi pair source (token discovery); env SUSHI_PAIRS overrides */
   sushiPairsProvider?: SushiPairsProvider;
@@ -83,6 +85,7 @@ export function createVenueRegistry(config: {
   // Shared Stellar RPC client
   const stellar = new StellarClient({
     rpcUrl: config.rpcUrl,
+    fallbackRpcUrls: config.fallbackRpcUrls,
     networkPassphrase: config.networkPassphrase,
   });
 

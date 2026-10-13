@@ -18,6 +18,7 @@ import rateLimit from 'express-rate-limit';
 import { Address, Asset, Transaction, TransactionBuilder } from '@stellar/stellar-sdk';
 import { RoutingEngine } from './router/engine.js';
 import { Pathfinder, PathResult } from './router/pathfinder.js';
+import { impactFlags, impactViolation, sumHopImpact } from './router/impact.js';
 import { createVenueRegistry } from './venues/index.js';
 import { StellarClient, scEnum } from './stellar/client.js';
 import { TOKENS, resolveToken, resolveSacAddress } from './stellar/tokens.js';
@@ -96,6 +97,30 @@ const config = {
    *  surplus kept by the protocol). Keep in sync with get_surplus_share. */
   surplusShareBps: parseInt(process.env.SURPLUS_SHARE_BPS ?? '2500'),
 };
+
+const MAINNET_PASSPHRASE = 'Public Global Stellar Network ; September 2015';
+/**
+ * Free public mainnet RPCs (rate-limited, no key) used ONLY when the
+ * primary fails at the transport level — see StellarClient.rpc(). Both
+ * answered getLatestLedger in ~2-3s from a cold connection on
+ * 2026-10-13. Override with SOROBAN_RPC_FALLBACK_URL (comma-separated;
+ * set it empty to disable failover).
+ */
+const DEFAULT_MAINNET_FALLBACK_RPCS = [
+  'https://mainnet.sorobanrpc.com',
+  'https://soroban-rpc.mainnet.stellar.gateway.fm',
+];
+function resolveFallbackRpcUrls(primary: string, passphrase: string): string[] {
+  const env = process.env.SOROBAN_RPC_FALLBACK_URL;
+  const list =
+    env !== undefined
+      ? env.split(',').map((u) => u.trim()).filter(Boolean)
+      : passphrase === MAINNET_PASSPHRASE
+      ? DEFAULT_MAINNET_FALLBACK_RPCS
+      : [];
+  return list.filter((u) => u !== primary);
+}
+const FALLBACK_RPC_URLS = resolveFallbackRpcUrls(config.rpcUrl, config.networkPassphrase);
 
 /** Trailing estimated_out arg for v1.2.1 Router builds — GROSS expected
  *  output. Empty against older routers (extra args fail their ABI). */
@@ -244,7 +269,10 @@ function handleError(res: express.Response, error: unknown, label: string): void
 // ─── Initialize Services ────────────────────────────────
 
 console.log('AtomicSwap Aggregator starting...');
-console.log(`  RPC: ${config.rpcUrl}`);
+console.log(`  RPC: ${StellarClient.hostOf(config.rpcUrl)}`);
+console.log(
+  `  RPC fallbacks: ${FALLBACK_RPC_URLS.map((u) => StellarClient.hostOf(u)).join(', ') || '(none)'}`
+);
 console.log(`  Network: ${config.networkPassphrase}`);
 console.log('');
 console.log('Contracts:');
@@ -257,6 +285,7 @@ console.log('');
 
 const stellar = new StellarClient({
   rpcUrl: config.rpcUrl,
+  fallbackRpcUrls: FALLBACK_RPC_URLS,
   networkPassphrase: config.networkPassphrase,
 });
 
@@ -284,6 +313,7 @@ const registry = createVenueRegistry({
   sushiAdapterContractId: config.sushiAdapterContractId,
   horizonUrl: config.horizonUrl,
   rpcUrl: config.rpcUrl,
+  fallbackRpcUrls: FALLBACK_RPC_URLS,
   networkPassphrase: config.networkPassphrase,
   sushiPairsProvider: () => tokenDiscovery.getSushiPairs(),
   aquaPoolsProvider: (a, b) => tokenDiscovery.getPoolsForPair(a, b),
@@ -757,8 +787,7 @@ app.get('/api/quote', async (req, res) => {
         protocolFee: '0',
         swapBookAmountOut: '0',
         blendedBps: 0,
-        priceImpactBps: multi.hops.reduce(
-          (s, h) => s + Math.max(0, h.route.priceImpactBps ?? 0), 0),
+        ...impactFlags(sumHopImpact(multi.hops)),
         multiHop: {
           path: multi.path,
           label,
@@ -806,7 +835,7 @@ app.get('/api/quote', async (req, res) => {
       protocolFee: route.protocolFee.toString(),
       swapBookAmountOut: route.swapBookAmountOut.toString(),
       blendedBps: route.blendedBps,
-      priceImpactBps: route.priceImpactBps,
+      ...impactFlags(route.priceImpactBps),
       segments: route.segments
         .filter((s) => s.amountIn > 0n)
         .map((s) => ({
@@ -949,6 +978,8 @@ app.post('/api/swap/build', async (req, res) => {
     // Router — two signatures, each leg min-out protected. Only returned
     // when the gain clears the gate (see computeBestExecution).
     if (kind === 'blend' && blend) {
+      const blendImpact = impactViolation(blend.mixed.priceImpactBps);
+      if (blendImpact) throw new BadRequest(blendImpact);
       const classicXdr = await buildClassicSwap(
         sourceAddress, tokenIn, tokenOut, blend.sdexIn, blend.sdexOut, slippage
       );
@@ -1024,6 +1055,8 @@ app.post('/api/swap/build', async (req, res) => {
       if (!multi) {
         throw new BadRequest('No executable venue liquidity for this pair (direct or multi-hop, up to 5 swaps searched)');
       }
+      const multiImpact = impactViolation(sumHopImpact(multi.hops));
+      if (multiImpact) throw new BadRequest(multiImpact);
       const buildLeg = (h: PathResult['hops'][number]) =>
         stellar.buildTransaction(sourceAddress, config.routerContractId, 'execute_route', [
           StellarClient.toAddress(sourceAddress),
@@ -1197,6 +1230,9 @@ app.post('/api/swap/build', async (req, res) => {
       });
       return;
     }
+
+    const directImpact = impactViolation(route.priceImpactBps);
+    if (directImpact) throw new BadRequest(directImpact);
 
     // min_total_out: expected net output with slippage tolerance applied
     const minTotalOut =
@@ -2084,8 +2120,18 @@ app.get('/api/health', async (_req, res) => {
   const discoveryReady =
     disc.lastRefresh !== null && disc.pools > 0 && disc.sushiPools > 0;
   const warmingUp = !discoveryReady && Date.now() - bootedAt < 240_000;
+  // RPC probe: the Oct-2026 outages reported "ok" here while every
+  // quote was failing — health now actually asks the primary RPC, and
+  // says which endpoint live traffic is using (failover is automatic).
+  const rpcStatus = await stellar.rpcStatus();
+  const status = warmingUp
+    ? 'warming_up'
+    : discoveryReady && rpcStatus.primaryOk
+    ? 'ok'
+    : 'degraded';
   res.status(warmingUp ? 503 : 200).json({
-    status: warmingUp ? 'warming_up' : discoveryReady ? 'ok' : 'degraded',
+    status,
+    rpc: rpcStatus,
     venues: venues.map((v) => ({ name: v.name, executable: v.executable })),
     discovery: disc,
     contracts: {
@@ -2231,6 +2277,7 @@ app.post('/v1/quote', v1Auth, async (req, res) => {
         (config.swapbookV11 && referralAddress !== null),
       minAmountOut: ((netOut * BigInt(10000 - slippage)) / 10000n).toString(),
       kind,
+      ...(kind === 'soroban' && route ? impactFlags(route.priceImpactBps) : {}),
       segments:
         kind === 'classic'
           ? [{ venue: 'StellarDEX (classic)', amountIn: amount.toString(), expectedOut: sdexOut.toString() }]
@@ -2285,6 +2332,8 @@ app.post('/v1/quote/build', v1Auth, async (req, res) => {
     if (!route || route.instructions.length === 0) {
       throw new BadRequest('No executable venue liquidity for this pair');
     }
+    const v1Impact = impactViolation(route.priceImpactBps);
+    if (v1Impact) throw new BadRequest(v1Impact);
     // v1.1 Router: partner fee carved on-chain via execute_route_partner
     // (additive — on top of the protocol fee, never out of it). Requires
     // SWAPBOOK_V11; against the v1.0 Router the fee is skipped as before.
