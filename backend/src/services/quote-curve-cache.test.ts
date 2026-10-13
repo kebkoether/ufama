@@ -173,4 +173,21 @@ describe('QuoteCurveCache memoization', () => {
     await cache.quote('pool-b', 1_000_0000000n, sampler);
     expect(sampler).toHaveBeenCalledTimes(2);
   });
+
+  it('never caches a FAILED simulation — the next quote retries', async () => {
+    const cache = new QuoteCurveCache(5_000);
+    let calls = 0;
+    const sampler = vi.fn(async (amt: bigint) => {
+      calls++;
+      if (calls === 1) throw new Error('rpc 429');
+      return cpmmTruth(amt);
+    });
+    // Failure returns 0 for THIS call but must not poison the cache…
+    expect(await cache.quote('flaky', 1_000_0000000n, sampler)).toBe(0n);
+    // …so the very next quote re-simulates and gets the real answer.
+    expect(await cache.quote('flaky', 1_000_0000000n, sampler)).toBe(
+      cpmmTruth(1_000_0000000n)
+    );
+    expect(sampler).toHaveBeenCalledTimes(2);
+  });
 });
