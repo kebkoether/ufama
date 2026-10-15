@@ -76,15 +76,29 @@ mis-ordered), plus one adapter v1 with the allowance-based flow.
 | Router | `CDHWQFVZ7CIUZQL334ZQW2IEINCM3H66SZD77WO2IQ2NBUTKO2UF35LR` |
 | TwapBook | `CCL6X6X5YWCHVFFDLX63TCIV4R2GTEHEZPEHG4TJLVIOP52DXJ7YQHMH` |
 | Aqua adapter | `CBJTYQG3V2VC2KSMNT4KRXRULU6FSGWXX2AT453QZBGI2AFHKZREIBUH` |
-| Curve adapter (venue 4, 2026-10-15) | `CDNLT3XWFE7BOVKPLFG636B6CRQ34XYXINWVSGLHHI5UD74ZQJFZU7TF` |
 
-Curve (StableSwap-NG) testnet references, 2026-10-15: factory
-`CANV76QKMKSQ26WZMLGVBGML5BCXKKZN2D2Q7HWFLKAEYZ6WWOJ6MHDS`, 3-pool
-USDX/USDY/USDZ `CB6PW7DRUI5GO652L7CRUOOPAZ4IBMWKQ7RCM7SGWFFF5YQKV6PIXFXN`
-(coins are classic assets issued by `GCAUOFV4…CPB2`; no public faucet, so
-execution could only be verified up to the trustline check — quotes and
-factory resolution verified live). Register on mainnet with
-`NET=mainnet FACTORY=… ROUTER=… bash scripts/deploy-curve-adapter.sh`.
+Curve (StableSwap-NG) is NOT registered on testnet by design. Its
+testnet factory `CANV76QKMKSQ26WZMLGVBGML5BCXKKZN2D2Q7HWFLKAEYZ6WWOJ6MHDS`
+and 3-pool `CB6PW7DRUI5GO652L7CRUOOPAZ4IBMWKQ7RCM7SGWFFF5YQKV6PIXFXN` were
+used once (2026-10-15) to verify the adapter's ABI assumptions and the
+quote path; the venue was then removed from the testnet Router.
+
+## Curve mainnet launch (pre-armed)
+
+The Curve adapter is built to be deployed BEFORE Curve's mainnet launch
+and switched on with a single call the moment their factory address is
+public. Nothing else changes on launch day.
+
+| Step | When | Command | What it does |
+|---|---|---|---|
+| 1 | now | `bash scripts/curve.sh deploy` | Deploys the adapter UNARMED (no factory), registers it as venue 4 on the Router. Prints `CURVE_ADAPTER_CONTRACT_ID` — set it on Railway and press Deploy once. The venue reports unavailable and costs nothing while unarmed. |
+| 2 | launch day | `bash scripts/curve.sh preflight <FACTORY>` | Confirms Curve's mainnet factory/pool ABI matches what the adapter was built for (`pool_count`, `pool_registration{pool,coins}`, `get_dy`, `get_balances`, `exchange(caller,i,j,dx,min_dy,receiver)`) and that the pool pulls input via a nested `transfer(caller → pool)` — the auth pattern the adapter pre-authorizes. Refuses to pass otherwise. |
+| 3 | launch day | `ADAPTER=<id> bash scripts/curve.sh arm <FACTORY>` | `set_factory` on the adapter, then quotes coin0→coin1 of the first pool through it. Within one discovery refresh (≤10 min) the backend reads `get_factory`, sweeps every registered pool, and Curve appears in `/api/health` as `curve.armed:true` with routes live. No Railway change. |
+
+If preflight fails (ABI drift between Curve's testnet and mainnet
+builds), the adapter needs a rebuild + redeploy before arming — the
+unarmed venue keeps doing nothing in the meantime. Admin pins
+(`set_pool`) remain available to force a specific pool.
 
 Test assets USDC / USDT0 issued by the testnet deployer
 `GBSFQ5KPAH76PGXVG2WIJFOAEYZNUIZDYVWACGLK7JXTBVKDA4H6MGDY`.

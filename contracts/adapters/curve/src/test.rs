@@ -115,7 +115,7 @@ fn setup() -> Ctx {
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let factory = env.register(MockCurveFactory, ());
-    let adapter = env.register(CurveAdapter, (admin, factory.clone()));
+    let adapter = env.register(CurveAdapter, (admin, Some(factory.clone())));
     let token_a = Address::generate(&env);
     let token_b = Address::generate(&env);
     let token_c = Address::generate(&env);
@@ -195,7 +195,7 @@ fn swap_pulls_via_exchange_and_pays_recipient_by_delta() {
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let factory = env.register(MockCurveFactory, ());
-    let adapter = env.register(CurveAdapter, (admin.clone(), factory.clone()));
+    let adapter = env.register(CurveAdapter, (admin.clone(), Some(factory.clone())));
 
     // Real SAC tokens so transfers actually move balances
     let sac_a = env.register_stellar_asset_contract_v2(admin.clone());
@@ -232,7 +232,7 @@ fn swap_rejects_below_min_out_and_bad_amounts() {
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let factory = env.register(MockCurveFactory, ());
-    let adapter = env.register(CurveAdapter, (admin.clone(), factory.clone()));
+    let adapter = env.register(CurveAdapter, (admin.clone(), Some(factory.clone())));
     let sac_a = env.register_stellar_asset_contract_v2(admin.clone());
     let sac_b = env.register_stellar_asset_contract_v2(admin.clone());
     let token_a = sac_a.address();
@@ -258,6 +258,40 @@ fn swap_rejects_below_min_out_and_bad_amounts() {
 }
 
 #[test]
+fn unarmed_adapter_quotes_pool_not_set_until_set_factory_arms_it() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let factory = env.register(MockCurveFactory, ());
+    // Deployed WITHOUT a factory — the mainnet launch posture.
+    let adapter_id = env.register(CurveAdapter, (admin, None::<Address>));
+    let adapter = CurveAdapterClient::new(&env, &adapter_id);
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+    let coins = soroban_sdk::vec![&env, token_a.clone(), token_b.clone()];
+    let pool = env.register(
+        MockCurvePool,
+        (coins.clone(), soroban_sdk::vec![&env, 1000i128, 1000i128], 9_990i128),
+    );
+    MockCurveFactoryClient::new(&env, &factory).add_pool(&pool, &coins);
+
+    assert_eq!(adapter.get_factory(), None);
+    assert_eq!(
+        adapter.try_quote(&token_a, &token_b, &1000).err().unwrap().unwrap(),
+        CurveAdapterError::PoolNotSet
+    );
+    assert_eq!(
+        adapter.try_swap(&token_a, &token_a, &token_b, &1000, &1).err().unwrap().unwrap(),
+        CurveAdapterError::PoolNotSet
+    );
+
+    // One admin call arms it: quotes flow through the factory from then on
+    adapter.set_factory(&factory);
+    assert_eq!(adapter.get_factory(), Some(factory.clone()));
+    assert_eq!(adapter.quote(&token_a, &token_b, &1000), 999);
+}
+
+#[test]
 fn admin_two_step_rotation() {
     let c = setup();
     let adapter = CurveAdapterClient::new(&c.env, &c.adapter);
@@ -268,6 +302,6 @@ fn admin_two_step_rotation() {
     // new admin can set the factory; a second accept has nothing pending
     let f2 = Address::generate(&c.env);
     adapter.set_factory(&f2);
-    assert_eq!(adapter.get_factory(), f2);
+    assert_eq!(adapter.get_factory(), Some(f2));
     assert_eq!(adapter.try_accept_admin().err().unwrap().unwrap(), CurveAdapterError::NoPendingAdmin);
 }

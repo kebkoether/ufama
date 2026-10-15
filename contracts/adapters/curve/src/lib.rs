@@ -30,6 +30,12 @@ use soroban_sdk::{
 /// tokens with the deepest MIN-side balance — a skewed attacker pool
 /// can't win on one fat side. min_amount_out bounds the outcome either
 /// way. Multi-hop composes ABOVE this adapter (Router.execute_path).
+///
+/// Launch readiness: the adapter deploys UNARMED (no factory) and sits
+/// registered on the Router doing nothing — every quote answers
+/// PoolNotSet until the admin calls `set_factory` with Curve's mainnet
+/// factory. That single call is the whole activation: the backend reads
+/// `get_factory` on its discovery cadence and starts sweeping pools.
 
 // ─── Storage ────────────────────────────────────────────
 
@@ -81,10 +87,13 @@ pub struct CurveAdapter;
 
 #[contractimpl]
 impl CurveAdapter {
-    /// Deploy-time constructor.
-    pub fn __constructor(env: Env, admin: Address, factory: Address) {
+    /// Deploy-time constructor. `factory` may be None: the adapter is
+    /// then dormant until `set_factory` arms it (mainnet launch pattern).
+    pub fn __constructor(env: Env, admin: Address, factory: Option<Address>) {
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::Factory, &factory);
+        if let Some(f) = factory {
+            env.storage().instance().set(&DataKey::Factory, &f);
+        }
     }
 
     /// Pin the pool to use for a pair (both directions). Admin only.
@@ -217,18 +226,19 @@ impl CurveAdapter {
         Ok(actual_out)
     }
 
-    /// Update the factory address. Admin only.
+    /// Set (arm) or update the factory address. Admin only. On mainnet
+    /// this is the launch-day activation call.
     pub fn set_factory(env: Env, new_factory: Address) -> Result<(), CurveAdapterError> {
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Factory, &new_factory);
+        env.events()
+            .publish((symbol_short!("curve"), symbol_short!("factory")), new_factory);
         Ok(())
     }
 
-    pub fn get_factory(env: Env) -> Result<Address, CurveAdapterError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Factory)
-            .ok_or(CurveAdapterError::NotInitialized)
+    /// Current factory; None while the adapter is unarmed.
+    pub fn get_factory(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Factory)
     }
 
     /// The pool this adapter would use for a pair (pin or resolver).
@@ -302,11 +312,13 @@ impl CurveAdapter {
         token_in: &Address,
         token_out: &Address,
     ) -> Result<PoolInfo, CurveAdapterError> {
+        // Unarmed adapter: no factory yet → nothing resolves (clean
+        // PoolNotSet; the backend reads this as "no quote", not an outage).
         let factory: Address = env
             .storage()
             .instance()
             .get(&DataKey::Factory)
-            .ok_or(CurveAdapterError::NotInitialized)?;
+            .ok_or(CurveAdapterError::PoolNotSet)?;
 
         let count: u32 = env.invoke_contract(
             &factory,

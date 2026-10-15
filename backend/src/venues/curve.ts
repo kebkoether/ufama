@@ -48,15 +48,18 @@ export class CurveAdapter implements VenueAdapter {
     stellar: StellarClient,
     private poolsProvider?: CurvePoolsProvider,
     /** Depth-point cache shared with the other venues (see Aqua adapter). */
-    private curveCache?: QuoteCurveCache
+    private curveCache?: QuoteCurveCache,
+    /** Whether discovery currently knows ANY Curve pool. Unarmed (pre-
+     *  launch) the venue reports unavailable, so the engine never spends
+     *  simulations on it — one adapter.quote per depth level per pair
+     *  would otherwise burn RPC budget answering PoolNotSet. */
+    private anyPools?: () => boolean
   ) {
     this.stellar = stellar;
   }
 
   async isAvailable(): Promise<boolean> {
-    // Pools come from on-chain discovery; with none discovered we can
-    // still answer through the adapter contract's factory resolver.
-    return true;
+    return this.anyPools ? this.anyPools() : true;
   }
 
   async getQuote(tokenIn: string, tokenOut: string, amountIn: bigint): Promise<Quote> {

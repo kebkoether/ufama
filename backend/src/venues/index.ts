@@ -84,6 +84,8 @@ export function createVenueRegistry(config: {
   curveAdapterContractId?: string;
   /** Discovered Curve pools per pair (factory sweep) — quoting source */
   curvePoolsProvider?: CurvePoolsProvider;
+  /** True once discovery holds at least one Curve pool (venue armed) */
+  curveHasPools?: () => boolean;
 }): VenueRegistry {
   const registry = new VenueRegistry();
 
@@ -137,7 +139,8 @@ export function createVenueRegistry(config: {
         config.curveAdapterContractId,
         stellar,
         config.curvePoolsProvider,
-        curveCache
+        curveCache,
+        config.curveHasPools
       )
     );
   }

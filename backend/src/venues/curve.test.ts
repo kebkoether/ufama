@@ -114,6 +114,16 @@ describe('CurveAdapter', () => {
     expect(dirs).toEqual([[0, 1], [1, 0]]);
   });
 
+  it('reports unavailable while unarmed (no discovered pools) so the engine skips it', async () => {
+    let pools = 0;
+    const venue = new CurveAdapter(ADAPTER, fakeStellar({}) as any, () => [], undefined, () => pools > 0);
+    expect(await venue.isAvailable()).toBe(false);
+    pools = 1; // factory armed, first sweep landed
+    expect(await venue.isAvailable()).toBe(true);
+    // without a gate (tests / env-only setups) it stays opt-in available
+    expect(await new CurveAdapter(ADAPTER, fakeStellar({}) as any).isAvailable()).toBe(true);
+  });
+
   it('builds a Router instruction pointing at the adapter contract (venue 4)', async () => {
     const venue = new CurveAdapter(ADAPTER, fakeStellar({}) as any, () => []);
     const ins = await venue.buildSwapInstruction(A, B, 500n, 490n);

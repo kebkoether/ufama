@@ -77,9 +77,11 @@ const config = {
   aquaAdapterContractId: process.env.AQUA_ADAPTER_CONTRACT_ID ?? '',
   aquaApiUrl: process.env.AQUA_API_URL ?? 'https://amm-api-testnet.aqua.network/api/external/v1',
   sushiAdapterContractId: process.env.SUSHI_ADAPTER_CONTRACT_ID ?? '',
-  /** Curve venue (StableSwap-NG on Soroban): adapter contract (venue 4)
-   *  and the Curve factory used for pool discovery. Both unset = venue
-   *  dormant (no discovery, no quotes). */
+  /** Curve venue (StableSwap-NG on Soroban): the ufama Curve adapter
+   *  (venue 4). The factory used for discovery is read from the adapter's
+   *  own get_factory on every refresh, so arming the adapter on-chain
+   *  (set_factory) activates the venue with NO backend change.
+   *  CURVE_FACTORY_CONTRACT_ID is an optional override. */
   curveAdapterContractId: process.env.CURVE_ADAPTER_CONTRACT_ID ?? '',
   curveFactoryContractId: process.env.CURVE_FACTORY_CONTRACT_ID ?? '',
   twapBookContractId: process.env.TWAP_BOOK_CONTRACT_ID ?? '',
@@ -310,10 +312,26 @@ const tokenDiscovery = new TokenDiscoveryService({
   // Soroban-native tokens carry their own decimals (SolvBTC: 8) — read
   // from the contract instead of assuming Stellar's classic 7
   readDecimals: (sac) => stellar.simulateAndParse<number>(sac, 'decimals', []),
-  curveSweep: config.curveFactoryContractId
-    ? () => sweepCurveFactory(stellar, config.curveFactoryContractId)
-    : undefined,
+  curveSweep:
+    config.curveAdapterContractId || config.curveFactoryContractId
+      ? async () => {
+          // Env override first; else ask the adapter contract. None/null
+          // = unarmed → empty sweep (venue stays dormant, no RPC spend).
+          const factory =
+            config.curveFactoryContractId ||
+            (await stellar.simulateAndParse<string | null>(
+              config.curveAdapterContractId,
+              'get_factory',
+              []
+            ));
+          curveFactoryInUse = factory ? String(factory) : null;
+          if (!curveFactoryInUse) return { pools: [], tokens: [] };
+          return sweepCurveFactory(stellar, curveFactoryInUse);
+        }
+      : undefined,
 });
+/** Factory the last Curve sweep used (null = adapter unarmed). */
+let curveFactoryInUse: string | null = null;
 tokenDiscovery.start();
 
 console.log('Registering venues:');
@@ -329,6 +347,7 @@ const registry = createVenueRegistry({
   sushiPairsProvider: () => tokenDiscovery.getSushiPairs(),
   curveAdapterContractId: config.curveAdapterContractId,
   curvePoolsProvider: (a, b) => tokenDiscovery.getCurvePoolsForPair(a, b),
+  curveHasPools: () => tokenDiscovery.getCurvePools().length > 0,
   aquaPoolsProvider: (a, b) => tokenDiscovery.getPoolsForPair(a, b),
 });
 console.log('');
@@ -2160,6 +2179,15 @@ app.get('/api/health', async (_req, res) => {
       router: config.routerContractId,
       feeVault: config.feeVaultContractId,
     },
+    // Launch-readiness readout: adapter registered, factory armed or not.
+    curve: config.curveAdapterContractId
+      ? {
+          adapter: config.curveAdapterContractId,
+          factory: curveFactoryInUse,
+          armed: curveFactoryInUse !== null,
+          pools: disc.curvePools,
+        }
+      : null,
     // Host only — QuickNode-style RPC URLs carry the API key in the path,
     // and this endpoint is public.
     network: rpcHostOnly(),
