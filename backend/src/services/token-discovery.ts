@@ -26,6 +26,7 @@
  */
 
 import { TOKENS, TokenConfig } from '../stellar/tokens.js';
+import type { DiscoveredCurvePool } from '../venues/curve.js';
 
 export interface SushiPool {
   poolAddress: string;
@@ -60,7 +61,7 @@ export interface AggregatedToken {
   homeDomain?: string;
   status: 'live' | 'coming_soon';
   /** Where this listing came from */
-  source: 'curated' | 'aqua' | 'sushi';
+  source: 'curated' | 'aqua' | 'sushi' | 'curve';
   /** Curated entries are verified; venue-discovered ones are not */
   verified: boolean;
   /**
@@ -87,6 +88,8 @@ export class TokenDiscoveryService {
   private timer: ReturnType<typeof setInterval> | null = null;
   private pools: AquaPool[] = [];
   private sushiPools: SushiPool[] = [];
+  private curvePools: DiscoveredCurvePool[] = [];
+  private curveSweep?: () => Promise<{ pools: DiscoveredCurvePool[]; tokens: AggregatedToken[] }>;
   /** sacAddress -> discovered token */
   private discovered: Map<string, AggregatedToken> = new Map();
   private lastRefresh: Date | null = null;
@@ -108,6 +111,10 @@ export class TokenDiscoveryService {
      *  assets are always 7; native ones — SolvBTC is 8, deRWA are 18 —
      *  must be read from the contract or every amount is off by 10^k). */
     readDecimals?: (sac: string) => Promise<number | null>;
+    /** On-chain Curve factory sweep (pools + the tokens they hold) —
+     *  implemented by the server with its RPC client (see
+     *  services/curve-discovery.ts). Undefined disables Curve discovery. */
+    curveSweep?: () => Promise<{ pools: DiscoveredCurvePool[]; tokens: AggregatedToken[] }>;
   }) {
     this.aquaApiUrl = opts.aquaApiUrl.replace(/\/$/, '');
     this.sushiGraphqlUrl = (opts.sushiGraphqlUrl ?? '').replace(/\/$/, '');
@@ -115,6 +122,7 @@ export class TokenDiscoveryService {
     this.minTxCount = opts.minTxCount ?? 10;
     this.minSushiLiquidityUsd = opts.minSushiLiquidityUsd ?? 500;
     this.readDecimals = opts.readDecimals;
+    this.curveSweep = opts.curveSweep;
   }
 
   start(): void {
@@ -252,10 +260,27 @@ export class TokenDiscoveryService {
     );
   }
 
-  getStatus(): { pools: number; sushiPools: number; discovered: number; lastRefresh: string | null } {
+  /** All discovered Curve pools (factory registry) — pathfinder graph. */
+  getCurvePools(): DiscoveredCurvePool[] {
+    return this.curvePools;
+  }
+
+  /** Curve pools holding both SACs (quoting source for the Curve venue). */
+  getCurvePoolsForPair(sacA: string, sacB: string): DiscoveredCurvePool[] {
+    return this.curvePools.filter((p) => p.coins.includes(sacA) && p.coins.includes(sacB));
+  }
+
+  getStatus(): {
+    pools: number;
+    sushiPools: number;
+    curvePools: number;
+    discovered: number;
+    lastRefresh: string | null;
+  } {
     return {
       pools: this.pools.length,
       sushiPools: this.sushiPools.length,
+      curvePools: this.curvePools.length,
       discovered: this.discovered.size,
       lastRefresh: this.lastRefresh?.toISOString() ?? null,
     };
@@ -287,8 +312,24 @@ export class TokenDiscoveryService {
       this.refreshSushi().catch((err) =>
         console.warn('[Discovery] Sushi refresh failed:', err)
       ),
+      this.refreshCurve().catch((err) =>
+        console.warn('[Discovery] Curve refresh failed:', err)
+      ),
     ]);
     this.lastRefresh = new Date();
+  }
+
+  /** Curve pool sweep via the factory registry (on-chain simulation). */
+  private async refreshCurve(): Promise<void> {
+    if (!this.curveSweep) return;
+    const { pools, tokens } = await this.curveSweep();
+    this.curvePools = pools;
+    // Merge: Aqua/Sushi entries win on SAC collision (they carry more
+    // metadata); anti-spoof vs curated happens in getTokens().
+    for (const t of tokens) {
+      if (!this.discovered.has(t.sacAddress)) this.discovered.set(t.sacAddress, t);
+    }
+    console.log(`[Discovery] Curve: ${pools.length} pools -> ${tokens.length} tokens`);
   }
 
   /** Sushi pool sweep via the stellarPools GraphQL query (chainId -4). */
@@ -467,11 +508,15 @@ export class TokenDiscoveryService {
     }
 
     this.pools = pools;
-    // Rebuild: fresh Aqua entries replace stale ones; Sushi-only tokens
-    // survive (Sushi's own refresh keeps them current).
+    // Rebuild: fresh Aqua entries replace stale ones; Sushi-/Curve-only
+    // tokens survive (their own refreshes keep them current). Curve was
+    // missing here at first and the Aqua sweep silently dropped the
+    // USDX/USDZ testnet coins moments after discovery listed them.
     const merged = new Map<string, AggregatedToken>(discovered);
     for (const [sac, token] of this.discovered) {
-      if (token.source === 'sushi' && !merged.has(sac)) merged.set(sac, token);
+      if ((token.source === 'sushi' || token.source === 'curve') && !merged.has(sac)) {
+        merged.set(sac, token);
+      }
     }
     this.discovered = merged;
     console.log(

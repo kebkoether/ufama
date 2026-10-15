@@ -51,10 +51,12 @@ flowchart LR
         FV[FeeVault]
         AA[Aqua adapter]
         SA[Sushi adapter]
+        CA[Curve adapter]
     end
     subgraph Venues["External venues"]
         AQ[Aquarius AMM]
         SU[SushiSwap V3]
+        CV[Curve StableSwap-NG]
         DEX[Stellar DEX / classic AMMs]
     end
 
@@ -70,6 +72,7 @@ flowchart LR
     TB -- get_oracle_price --> SB
     AA --> AQ
     SA --> SU
+    CA --> CV
     SB -- 0.5 bps --> FV
     R -- 0.5 bps --> FV
     TB -- ≤10 bps --> FV
@@ -201,6 +204,14 @@ funds at rest.
   `swap_chained` invocation. Output is measured by the adapter's own
   balance delta (robust to venue-side rounding), checked against
   `min_amount_out`, and pushed to the recipient.
+- **Curve adapter** (venue 4): quotes via the pool's own `get_dy`, executes
+  `exchange` with the nested `transfer(adapter → pool)` pull pre-authorized
+  (invoker auth, same mechanism as Aqua — read from testnet simulation
+  diagnostics). Pools resolve through the Curve factory registry
+  (`pool_count` / `pool_registration`), deepest min-side balance wins,
+  admin pins override. n-coin pools expose every coin pair as a direct
+  edge to the pathfinder. Backend discovery walks the same registry
+  on-chain (`services/curve-discovery.ts`).
 - **Sushi adapter**: calls the SushiSwap V3 **pool directly**
   (`pool.swap`) rather than Sushi's router — the router path requires an
   auth entry containing dynamic oracle-hint state no contract can

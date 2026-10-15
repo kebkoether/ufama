@@ -29,6 +29,7 @@ import { Sep1Verifier } from './services/sep1-verify.js';
 import { FairValueService } from './services/fair-value.js';
 import { TokenDiscoveryService } from './services/token-discovery.js';
 import { TwapKeeperService } from './services/twap-keeper.js';
+import { sweepCurveFactory } from './services/curve-discovery.js';
 
 const app = express();
 // Railway terminates TLS at one proxy hop — without this every client
@@ -76,6 +77,11 @@ const config = {
   aquaAdapterContractId: process.env.AQUA_ADAPTER_CONTRACT_ID ?? '',
   aquaApiUrl: process.env.AQUA_API_URL ?? 'https://amm-api-testnet.aqua.network/api/external/v1',
   sushiAdapterContractId: process.env.SUSHI_ADAPTER_CONTRACT_ID ?? '',
+  /** Curve venue (StableSwap-NG on Soroban): adapter contract (venue 4)
+   *  and the Curve factory used for pool discovery. Both unset = venue
+   *  dormant (no discovery, no quotes). */
+  curveAdapterContractId: process.env.CURVE_ADAPTER_CONTRACT_ID ?? '',
+  curveFactoryContractId: process.env.CURVE_FACTORY_CONTRACT_ID ?? '',
   twapBookContractId: process.env.TWAP_BOOK_CONTRACT_ID ?? '',
   horizonUrl: process.env.HORIZON_URL ?? 'https://horizon-testnet.stellar.org',
   /**
@@ -281,6 +287,8 @@ console.log(`  Router:   ${config.routerContractId || '(not set)'}`);
 console.log(`  FeeVault: ${config.feeVaultContractId || '(not set)'}`);
 console.log(`  Aqua:     ${config.aquaAdapterContractId || '(not set)'}`);
 console.log(`  Sushi:    ${config.sushiAdapterContractId || '(not set)'}`);
+console.log(`  Curve:    ${config.curveAdapterContractId || '(not set)'}`);
+console.log(`  Curve factory: ${config.curveFactoryContractId || '(not set)'}`);
 console.log('');
 
 const stellar = new StellarClient({
@@ -302,6 +310,9 @@ const tokenDiscovery = new TokenDiscoveryService({
   // Soroban-native tokens carry their own decimals (SolvBTC: 8) — read
   // from the contract instead of assuming Stellar's classic 7
   readDecimals: (sac) => stellar.simulateAndParse<number>(sac, 'decimals', []),
+  curveSweep: config.curveFactoryContractId
+    ? () => sweepCurveFactory(stellar, config.curveFactoryContractId)
+    : undefined,
 });
 tokenDiscovery.start();
 
@@ -316,6 +327,8 @@ const registry = createVenueRegistry({
   fallbackRpcUrls: FALLBACK_RPC_URLS,
   networkPassphrase: config.networkPassphrase,
   sushiPairsProvider: () => tokenDiscovery.getSushiPairs(),
+  curveAdapterContractId: config.curveAdapterContractId,
+  curvePoolsProvider: (a, b) => tokenDiscovery.getCurvePoolsForPair(a, b),
   aquaPoolsProvider: (a, b) => tokenDiscovery.getPoolsForPair(a, b),
 });
 console.log('');
@@ -690,6 +703,13 @@ app.get('/api/assets', (_req, res) => {
     for (const p of tokenDiscovery.getSushiPairs()) {
       eligibleSacs.add(p.tokenA);
       eligibleSacs.add(p.tokenB);
+    }
+  }
+  // Curve: the adapter resolves pools from the factory (no per-pair
+  // registration), so every discovered pool's coins are executable.
+  if (config.curveAdapterContractId) {
+    for (const p of tokenDiscovery.getCurvePools()) {
+      for (const c of p.coins) eligibleSacs.add(c);
     }
   }
   res.json({
@@ -1941,6 +1961,7 @@ async function assertRelayable(signedXdr: string): Promise<void> {
       config.twapBookContractId,
       config.aquaAdapterContractId,
       config.sushiAdapterContractId,
+      config.curveAdapterContractId,
     ].filter(Boolean)
   );
   for (const op of tx.operations) {

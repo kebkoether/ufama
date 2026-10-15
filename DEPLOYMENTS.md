@@ -76,6 +76,15 @@ mis-ordered), plus one adapter v1 with the allowance-based flow.
 | Router | `CDHWQFVZ7CIUZQL334ZQW2IEINCM3H66SZD77WO2IQ2NBUTKO2UF35LR` |
 | TwapBook | `CCL6X6X5YWCHVFFDLX63TCIV4R2GTEHEZPEHG4TJLVIOP52DXJ7YQHMH` |
 | Aqua adapter | `CBJTYQG3V2VC2KSMNT4KRXRULU6FSGWXX2AT453QZBGI2AFHKZREIBUH` |
+| Curve adapter (venue 4, 2026-10-15) | `CDNLT3XWFE7BOVKPLFG636B6CRQ34XYXINWVSGLHHI5UD74ZQJFZU7TF` |
+
+Curve (StableSwap-NG) testnet references, 2026-10-15: factory
+`CANV76QKMKSQ26WZMLGVBGML5BCXKKZN2D2Q7HWFLKAEYZ6WWOJ6MHDS`, 3-pool
+USDX/USDY/USDZ `CB6PW7DRUI5GO652L7CRUOOPAZ4IBMWKQ7RCM7SGWFFF5YQKV6PIXFXN`
+(coins are classic assets issued by `GCAUOFV4…CPB2`; no public faucet, so
+execution could only be verified up to the trustline check — quotes and
+factory resolution verified live). Register on mainnet with
+`NET=mainnet FACTORY=… ROUTER=… bash scripts/deploy-curve-adapter.sh`.
 
 Test assets USDC / USDT0 issued by the testnet deployer
 `GBSFQ5KPAH76PGXVG2WIJFOAEYZNUIZDYVWACGLK7JXTBVKDA4H6MGDY`.
