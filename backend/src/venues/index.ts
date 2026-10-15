@@ -6,6 +6,7 @@ import { VenueAdapter } from './adapter.js';
 import { SwapBookAdapter } from './swapbook.js';
 import { AquaAdapter, AquaPoolsProvider } from './aqua.js';
 import { SushiSwapAdapter, SushiPairsProvider } from './sushiswap.js';
+import { CurveAdapter, CurvePoolsProvider } from './curve.js';
 import { StellarDexAdapter } from './stellar-dex.js';
 import { StellarClient } from '../stellar/client.js';
 import { QuoteCurveCache } from '../services/quote-curve-cache.js';
@@ -79,6 +80,12 @@ export function createVenueRegistry(config: {
   sushiPairsProvider?: SushiPairsProvider;
   /** Discovered Aqua pools per pair (token discovery) — quoting source */
   aquaPoolsProvider?: AquaPoolsProvider;
+  /** Curve adapter contract (venue 4); unset = Curve venue not registered */
+  curveAdapterContractId?: string;
+  /** Discovered Curve pools per pair (factory sweep) — quoting source */
+  curvePoolsProvider?: CurvePoolsProvider;
+  /** True once discovery holds at least one Curve pool (venue armed) */
+  curveHasPools?: () => boolean;
 }): VenueRegistry {
   const registry = new VenueRegistry();
 
@@ -122,6 +129,18 @@ export function createVenueRegistry(config: {
         stellar,
         process.env.SUSHI_PAIRS,
         config.sushiPairsProvider
+      )
+    );
+  }
+
+  if (config.curveAdapterContractId) {
+    registry.register(
+      new CurveAdapter(
+        config.curveAdapterContractId,
+        stellar,
+        config.curvePoolsProvider,
+        curveCache,
+        config.curveHasPools
       )
     );
   }

@@ -42,7 +42,7 @@ const SEARCH_BUDGET_MS = parseInt(process.env.PATHFINDER_BUDGET_MS ?? '8000');
 export interface LiquidityEdge {
   a: string;
   b: string;
-  venue: 'aqua' | 'sushi';
+  venue: 'aqua' | 'sushi' | 'curve';
   pool: string;
   /** In-venue units; only compared within the same venue for pruning */
   liquidityProxy: number;
@@ -111,6 +111,24 @@ export class Pathfinder {
         liquidityProxy: p.liquidityUsd,
       });
     }
+    // Curve n-coin pools: every coin pair is a direct edge. Proxy =
+    // the shallower side in WHOLE tokens (stable pools, so ~USD).
+    for (const p of this.discovery.getCurvePools()) {
+      for (let i = 0; i < p.coins.length; i++) {
+        for (let j = i + 1; j < p.coins.length; j++) {
+          const whole = (k: number) =>
+            Number(BigInt(p.balances[k] ?? '0') / 10n ** BigInt(p.decimals[k] ?? 7));
+          out.push({
+            a: p.coins[i],
+            b: p.coins[j],
+            venue: 'curve',
+            pool: p.poolAddress,
+            liquidityProxy: Math.min(whole(i), whole(j)),
+            tokens: p.coins,
+          });
+        }
+      }
+    }
     return out;
   }
 
@@ -129,7 +147,8 @@ export class Pathfinder {
         .sort((x, y) => (y.liquidityProxy || 0) - (x.liquidityProxy || 0))
         .slice(0, BRANCH_CAP);
       const sushi = list.filter((e) => e.venue === 'sushi');
-      adj.set(t, [...aqua, ...sushi]);
+      const curve = list.filter((e) => e.venue === 'curve');
+      adj.set(t, [...aqua, ...sushi, ...curve]);
     }
     return adj;
   }

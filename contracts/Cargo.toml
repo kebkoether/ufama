@@ -7,6 +7,7 @@ members = [
     "twap-book",
     "adapters/aqua",
     "adapters/sushiswap",
+    "adapters/curve",
     "integration-tests",
 ]
 
