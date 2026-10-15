@@ -1,6 +1,29 @@
 # Deployments
 
-## Mainnet v1.1 — LIVE SET (deployed 2026-08-22)
+## Mainnet v1.2.1 — LIVE SET (v1.2 deployed 2026-09-03, Router v1.2.1 2026-09-11, Curve adapter 2026-10-15)
+
+| Contract | Address |
+|---|---|
+| FeeVault (reused from v1.1) | `CBNI2QR4LBM7GLLKSYOIASACBRSKNDMLDZAGUOTBBHMCAPCZH5HSHPXP` |
+| SwapBook v1.2 | `CB2KKROC2H6H757TY4H67ZAT3POFZWY532WOMQDQFWUFWK7PTJUTAEBN` |
+| Router v1.2.1 (surplus share) | `CCT3IA6HKUA5GCAR7XLSNR4N5V2WEKDM6G4OSZ4EDXNS56CLDFBT2BDO` |
+| TwapBook v1.2 | `CD7NOEXYJJKRPNADYM6C3AST33HF7WLYFOMWGQCX5MHD4CM7LYPB7U6I` |
+| Aqua adapter v1.2 (venue 1) | `CBYQV73IOS3KFIXZV6TC3LC7CPQQGTFQG2UEJ5EF5LFBMVBF7XRSUJCE` |
+| Sushi adapter v1.2 (venue 2) | `CAWVG65APH5K56AS7FWXKKDLSJQUO5WIGCVFUFFFRA2JOJ35OYERLCVR` |
+| Curve adapter (venue 4, UNARMED) | `CCTMKF4PIHIW6UKF3ETVNLE4Z3ZSGLI4HMDWVWCXKSHJHVZEILKGMG7O` |
+
+Admin/deployer: `GB3BIN23PHTOPHTEGTC4VCY2HVSY6HDYG3C6QXQQ3TCEJR74K6DWGMQT`.
+Router v1.2 `CBSF6G7HXYWHXQDGZROJU4MLONCTNZXF7U3LNURUYMWR5B75TZJGAUJW` is
+retired (still venue-wired, unreferenced). Router `get_venues` = [1, 2, 4].
+
+Curve adapter: deployed with NO factory (tx `544dde45…45ace`,
+`get_factory` = null). It answers PoolNotSet to every quote and the
+backend reports the venue unavailable until it is armed — see
+"Curve mainnet launch (pre-armed)" below. Railway needs
+`CURVE_ADAPTER_CONTRACT_ID=CCTMKF4PIHIW6UKF3ETVNLE4Z3ZSGLI4HMDWVWCXKSHJHVZEILKGMG7O`
+once the Curve-venue backend is deployed.
+
+## Mainnet v1.1 — SUPERSEDED by v1.2 (deployed 2026-08-22)
 
 | Contract | Address |
 |---|---|
