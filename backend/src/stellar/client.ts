@@ -24,6 +24,70 @@ import {
 export interface StellarClientConfig {
   rpcUrl: string;
   networkPassphrase: string;
+  /** Public/secondary RPCs tried in order when the primary fails at the
+   *  transport level (DNS/TLS/timeout/5xx/429). Empty = no failover. */
+  fallbackRpcUrls?: string[];
+  /** Per-call wall-clock cap; a hung RPC must not hang a request handler. */
+  rpcTimeoutMs?: number;
+}
+
+/** How long a failed endpoint is skipped before it's retried. */
+const RPC_FAILOVER_COOLDOWN_MS = parseInt(process.env.RPC_FAILOVER_COOLDOWN_MS ?? '60000');
+const DEFAULT_RPC_TIMEOUT_MS = parseInt(process.env.RPC_TIMEOUT_MS ?? '12000');
+/** Health-probe cap — tighter than a working call, so "degraded" shows
+ *  up on the health page long before user requests start timing out. */
+const RPC_PROBE_TIMEOUT_MS = parseInt(process.env.RPC_PROBE_TIMEOUT_MS ?? '3000');
+
+interface RpcEndpoint {
+  url: string;
+  host: string;
+  server: rpc.Server;
+}
+
+/**
+ * Process-wide "endpoint is down until" map, keyed by URL. Several
+ * StellarClient instances share the same endpoints (API handlers, venue
+ * adapters, keepers) — one of them discovering an outage should spare
+ * the others their own timeout.
+ */
+const endpointDownUntil = new Map<string, number>();
+
+/**
+ * Transport-level failures are the ones a different endpoint can cure.
+ * Deterministic answers (account not found, simulation errors, bad XDR)
+ * would just repeat elsewhere and must surface unchanged.
+ */
+export function isTransportError(err: unknown): boolean {
+  const e = err as any;
+  if (!e) return false;
+  if (e.name === 'AbortError' || e.name === 'RpcTimeoutError') return true;
+  const status: number | undefined = e.response?.status ?? e.status;
+  if (
+    typeof status === 'number' &&
+    (status >= 500 || status === 429 || status === 403 || status === 401)
+  ) {
+    return true;
+  }
+  const msg = String(e.message ?? e);
+  if (/account not found|not found: /i.test(msg)) return false;
+  return /fetch failed|ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|EPIPE|socket|network|timed? ?out|certificate|TLS|SSL|alert|aborted|Unexpected token|invalid json|status code (5\d\d|429|403)/i.test(
+    msg
+  );
+}
+
+class RpcTimeoutError extends Error {
+  name = 'RpcTimeoutError';
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const t = new Promise<T>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new RpcTimeoutError(`${label} timed out after ${ms}ms`)),
+      ms
+    );
+  });
+  return Promise.race([p, t]).finally(() => clearTimeout(timer));
 }
 
 /** How long to poll for a submitted transaction before giving up. */
@@ -43,18 +107,122 @@ export function scEnum(value: unknown): string {
 }
 
 export class StellarClient {
-  private server: rpc.Server;
+  private endpoints: RpcEndpoint[];
   private networkPassphrase: string;
+  private rpcTimeoutMs: number;
 
   constructor(config: StellarClientConfig) {
-    this.server = new rpc.Server(config.rpcUrl);
+    const urls = [config.rpcUrl, ...(config.fallbackRpcUrls ?? [])].filter(
+      (u, i, arr) => u && arr.indexOf(u) === i
+    );
+    this.endpoints = urls.map((url) => ({
+      url,
+      host: StellarClient.hostOf(url),
+      server: new rpc.Server(url),
+    }));
     this.networkPassphrase = config.networkPassphrase;
+    this.rpcTimeoutMs = config.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
+  }
+
+  /** Host only — provider URLs can carry the API key in the path. */
+  static hostOf(url: string): string {
+    try {
+      return new URL(url).host;
+    } catch {
+      return 'configured';
+    }
+  }
+
+  /** Endpoints in try-order: healthy ones first (primary leads), then
+   *  those inside their failover cooldown as a last resort. */
+  private orderedEndpoints(): RpcEndpoint[] {
+    const now = Date.now();
+    const up = this.endpoints.filter((e) => (endpointDownUntil.get(e.url) ?? 0) <= now);
+    const down = this.endpoints.filter((e) => (endpointDownUntil.get(e.url) ?? 0) > now);
+    return [...up, ...down];
+  }
+
+  /**
+   * Run one RPC call with timeout + failover. Transport failures mark
+   * the endpoint down for RPC_FAILOVER_COOLDOWN_MS and move on to the
+   * next; deterministic errors propagate from the first endpoint that
+   * answered. Both October-2026 outages (provider endpoint deleted, then
+   * TLS rejected) would have failed over here instead of returning
+   * "no liquidity" for every pair.
+   */
+  private async rpc<T>(label: string, fn: (s: rpc.Server) => Promise<T>): Promise<T> {
+    let lastErr: unknown = new Error(`${label}: no RPC endpoints configured`);
+    for (const ep of this.orderedEndpoints()) {
+      try {
+        const out = await withTimeout(
+          fn(ep.server),
+          this.rpcTimeoutMs,
+          `${label} @ ${ep.host}`
+        );
+        if (endpointDownUntil.has(ep.url)) {
+          endpointDownUntil.delete(ep.url);
+          console.warn(`RPC endpoint recovered: ${ep.host}`);
+        }
+        return out;
+      } catch (err) {
+        if (!isTransportError(err)) throw err;
+        lastErr = err;
+        endpointDownUntil.set(ep.url, Date.now() + RPC_FAILOVER_COOLDOWN_MS);
+        console.warn(
+          `RPC ${label} failed at ${ep.host} (${(err as Error)?.message ?? err}) — failing over`
+        );
+      }
+    }
+    throw lastErr;
   }
 
   /** Latest ledger sequence — needed to compute expiry / timer offsets. */
   async getLatestLedger(): Promise<number> {
-    const response = await this.server.getLatestLedger();
+    const response = await this.rpc('getLatestLedger', (s) => s.getLatestLedger());
     return response.sequence;
+  }
+
+  /**
+   * Health probe: hits the PRIMARY endpoint directly (bypassing the
+   * cooldown so recovery shows promptly) with a short timeout, and
+   * reports which endpoint live traffic would currently use.
+   */
+  async rpcStatus(): Promise<{
+    primary: string;
+    primaryOk: boolean;
+    latencyMs: number | null;
+    ledger: number | null;
+    error?: string;
+    active: string;
+    fallbacks: string[];
+  }> {
+    const primary = this.endpoints[0];
+    const started = Date.now();
+    let primaryOk = false;
+    let ledger: number | null = null;
+    let error: string | undefined;
+    try {
+      const r = await withTimeout(
+        primary.server.getLatestLedger(),
+        RPC_PROBE_TIMEOUT_MS,
+        'probe'
+      );
+      ledger = r.sequence;
+      primaryOk = true;
+      endpointDownUntil.delete(primary.url);
+    } catch (err) {
+      error = String((err as Error)?.message ?? err).slice(0, 200);
+      endpointDownUntil.set(primary.url, Date.now() + RPC_FAILOVER_COOLDOWN_MS);
+    }
+    return {
+      primary: primary.host,
+      primaryOk,
+      latencyMs: primaryOk ? Date.now() - started : null,
+      ledger,
+      ...(error ? { error } : {}),
+      active: this.orderedEndpoints()[0].host,
+      fallbacks: this.endpoints.slice(1).map((e) => e.host),
+    };
   }
 
   /**
@@ -80,7 +248,7 @@ export class StellarClient {
         .setTimeout(30)
         .build();
 
-      const simResult = await this.server.simulateTransaction(tx);
+      const simResult = await this.rpc('simulateTransaction', (s) => s.simulateTransaction(tx));
 
       if (rpc.Api.isSimulationSuccess(simResult)) {
         return simResult.result?.retval ?? null;
@@ -165,7 +333,7 @@ export class StellarClient {
       let soroban = '200';
       let classic = '10000';
       try {
-        const stats = await this.server.getFeeStats();
+        const stats = await this.rpc('getFeeStats', (s) => s.getFeeStats());
         const bid = (p90: string | undefined, floor: number, cap: number) =>
           Math.min(cap, Math.max(floor, Number(p90 ?? 0) * 2)).toString();
         soroban = bid(stats.sorobanInclusionFee?.p90, 200, 10_000_000);
@@ -191,7 +359,7 @@ export class StellarClient {
     const contract = new Contract(contractId);
     const operation = contract.call(method, ...args);
 
-    const account = await this.server.getAccount(sourceAddress);
+    const account = await this.rpc('getAccount', (s) => s.getAccount(sourceAddress));
     const tx = new TransactionBuilder(account, {
       fee: await this.inclusionFee('soroban'),
       networkPassphrase: this.networkPassphrase,
@@ -200,7 +368,7 @@ export class StellarClient {
       .setTimeout(300)
       .build();
 
-    const simResult = await this.server.simulateTransaction(tx);
+    const simResult = await this.rpc('simulateTransaction', (s) => s.simulateTransaction(tx));
 
     if (!rpc.Api.isSimulationSuccess(simResult)) {
       const detail =
@@ -231,7 +399,7 @@ export class StellarClient {
      *  destination must hold a trustline for destAsset. */
     partnerPayment?: { destination: string; amount: string };
   }): Promise<string> {
-    const account = await this.server.getAccount(opts.sourceAddress);
+    const account = await this.rpc('getAccount', (s) => s.getAccount(opts.sourceAddress));
     const builder = new TransactionBuilder(account, {
       fee: await this.inclusionFee('classic'),
       networkPassphrase: this.networkPassphrase,
@@ -267,7 +435,7 @@ export class StellarClient {
     sourceAddress: string;
     asset: InstanceType<typeof Asset>;
   }): Promise<string> {
-    const account = await this.server.getAccount(opts.sourceAddress);
+    const account = await this.rpc('getAccount', (s) => s.getAccount(opts.sourceAddress));
     return new TransactionBuilder(account, {
       fee: await this.inclusionFee('classic'),
       networkPassphrase: this.networkPassphrase,
@@ -305,7 +473,7 @@ export class StellarClient {
    */
   async submitTransaction(signedXdr: string): Promise<rpc.Api.GetTransactionResponse> {
     const tx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
-    const response = await this.server.sendTransaction(tx);
+    const response = await this.rpc('sendTransaction', (s) => s.sendTransaction(tx));
 
     if (response.status === 'ERROR') {
       // Surface the actual result code (txBadSeq, txInsufficientFee,
@@ -327,7 +495,7 @@ export class StellarClient {
     }
 
     for (let attempt = 0; attempt < SUBMIT_POLL_ATTEMPTS; attempt++) {
-      const getResponse = await this.server.getTransaction(response.hash);
+      const getResponse = await this.rpc('getTransaction', (s) => s.getTransaction(response.hash));
       if (getResponse.status === 'FAILED') {
         // Landed on-ledger but failed — callers treat a returned response
         // as success, so this must throw with the op-level reason.

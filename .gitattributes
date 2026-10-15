@@ -1,0 +1,3 @@
+# cargo test regenerates these on every run; CRLF checkouts on Windows
+# otherwise show ~80 whitespace-only "modified" files after each test run.
+contracts/**/test_snapshots/**/*.json text eol=lf

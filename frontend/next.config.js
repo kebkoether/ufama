@@ -9,6 +9,22 @@ const nextConfig = {
   async headers() {
     return [
       {
+        // Baseline hardening for a wallet dapp. frame-ancestors/X-Frame-
+        // Options stop another site from framing ufama and overlaying
+        // its own UI on the swap button (clickjacking). A script-src CSP
+        // is deliberately NOT set: wallet extensions and the wallets-kit
+        // modal inject scripts/styles at runtime, and a wrong allowlist
+        // would break connect on the live site — add it with testing.
+        source: '/(.*)',
+        headers: [
+          { key: 'X-Frame-Options', value: 'DENY' },
+          { key: 'Content-Security-Policy', value: "frame-ancestors 'none'" },
+          { key: 'X-Content-Type-Options', value: 'nosniff' },
+          { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
+          { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=(), payment=()' },
+        ],
+      },
+      {
         // SEP-1 requires the stellar.toml to be readable cross-origin so
         // wallets and ecosystem scanners (Freighter/Blockaid, stellar.expert)
         // can fetch it from any context.
