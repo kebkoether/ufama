@@ -377,7 +377,7 @@ export class StellarClient {
     }
 
     const preparedTx = rpc.assembleTransaction(tx, simResult);
-    return preparedTx.build().toXDR();
+    return preparedTx.build().toXdr();
   }
 
   /**
@@ -423,7 +423,7 @@ export class StellarClient {
       );
     }
     const tx = builder.setTimeout(300).build();
-    return tx.toXDR();
+    return tx.toXdr();
   }
 
   /**
@@ -443,7 +443,7 @@ export class StellarClient {
       .addOperation(Operation.changeTrust({ asset: opts.asset }))
       .setTimeout(300)
       .build()
-      .toXDR();
+      .toXdr();
   }
 
   /**
@@ -462,9 +462,9 @@ export class StellarClient {
       method,
       args
     );
-    const tx = TransactionBuilder.fromXDR(unsignedXdr, this.networkPassphrase);
+    const tx = TransactionBuilder.fromXdr(unsignedXdr, this.networkPassphrase);
     tx.sign(signer);
-    return this.submitTransaction(tx.toXDR());
+    return this.submitTransaction(tx.toXdr());
   }
 
   /**
@@ -472,7 +472,7 @@ export class StellarClient {
    * timeout — a hung RPC must not hang the request handler forever.
    */
   async submitTransaction(signedXdr: string): Promise<rpc.Api.GetTransactionResponse> {
-    const tx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
+    const tx = TransactionBuilder.fromXdr(signedXdr, this.networkPassphrase);
     const response = await this.rpc('sendTransaction', (s) => s.sendTransaction(tx));
 
     if (response.status === 'ERROR') {
@@ -480,7 +480,7 @@ export class StellarClient {
       // txTooLate...) — the raw response dump only helps in logs.
       let code = 'unknown';
       try {
-        code = response.errorResult?.result().switch().name ?? 'unknown';
+        code = response.errorResult?.result.type ?? 'unknown';
       } catch {
         /* keep 'unknown' */
       }
@@ -501,7 +501,7 @@ export class StellarClient {
         // as success, so this must throw with the op-level reason.
         let code = 'unknown';
         try {
-          code = getResponse.resultXdr.result().switch().name;
+          code = getResponse.resultXdr.result.type;
         } catch {
           /* keep 'unknown' */
         }
