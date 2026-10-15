@@ -533,7 +533,7 @@ async function buildClassicSwap(
   } else {
     params.set('source_asset_type', sendAsset.getCode().length <= 4 ? 'credit_alphanum4' : 'credit_alphanum12');
     params.set('source_asset_code', sendAsset.getCode());
-    params.set('source_asset_issuer', sendAsset.getIssuer());
+    params.set('source_asset_issuer', sendAsset.getIssuer() ?? '');
   }
   const res = await fetch(`${config.horizonUrl}/paths/strict-send?${params}`);
   if (!res.ok) throw new Error(`Horizon path lookup failed: ${res.status}`);
@@ -1923,7 +1923,7 @@ const RELAY_MAX_OPS = 10;
 async function assertRelayable(signedXdr: string): Promise<void> {
   let tx;
   try {
-    tx = TransactionBuilder.fromXDR(signedXdr, config.networkPassphrase);
+    tx = TransactionBuilder.fromXdr(signedXdr, config.networkPassphrase);
   } catch {
     throw new BadRequest('xdr is not a valid transaction envelope for this network');
   }
@@ -1949,13 +1949,13 @@ async function assertRelayable(signedXdr: string): Promise<void> {
     }
     switch (op.type) {
       case 'invokeHostFunction': {
+        // SDK 17 XDR unions: `.type` is the variant name, arms are
+        // properties (was `.switch().name` / `.invokeContract()`).
         const fn = (op as any).func;
-        if (fn?.switch?.().name !== 'hostFunctionTypeInvokeContract') {
+        if (fn?.type !== 'hostFunctionTypeInvokeContract') {
           throw new BadRequest('only contract invocations are relayed');
         }
-        const target = Address.fromScAddress(
-          fn.invokeContract().contractAddress()
-        ).toString();
+        const target = Address.fromScAddress(fn.invokeContract.contractAddress).toString();
         if (!allowedContracts.has(target)) {
           throw new BadRequest('transaction invokes a contract outside the ufama set');
         }
@@ -1992,9 +1992,9 @@ app.post('/api/swap/submit', async (req, res) => {
     const result = await stellar.submitTransaction(signedXdr);
     // Hash lets the UI link the settled tx on an explorer. Computed from
     // the envelope so it works regardless of SDK response shape.
-    const hash = TransactionBuilder.fromXDR(signedXdr, config.networkPassphrase)
-      .hash()
-      .toString('hex');
+    const hash = Buffer.from(
+      TransactionBuilder.fromXdr(signedXdr, config.networkPassphrase).hash()
+    ).toString('hex');
     res.json({ status: result.status, hash, result });
   } catch (error) {
     // Submission failures carry user-actionable reasons (bad sequence,
