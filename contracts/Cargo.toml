@@ -8,6 +8,7 @@ members = [
     "adapters/aqua",
     "adapters/sushiswap",
     "adapters/curve",
+    "rfq",
     "integration-tests",
 ]
 

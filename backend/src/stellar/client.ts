@@ -9,6 +9,7 @@
 
 import {
   Contract,
+  Transaction,
   TransactionBuilder,
   Keypair,
   Account,
@@ -354,10 +355,61 @@ export class StellarClient {
     sourceAddress: string,
     contractId: string,
     method: string,
-    args: xdr.ScVal[]
+    args: xdr.ScVal[],
+    opts: {
+      /**
+       * Pre-collected authorization entries (e.g. an RFQ maker's signed
+       * entry plus the source account's own). When present the
+       * simulation runs in ENFORCE mode — signatures, nonces and
+       * expirations are verified by the host — and assembly keeps these
+       * entries instead of the simulation's recorded ones.
+       */
+      auth?: xdr.SorobanAuthorizationEntry[];
+    } = {}
   ): Promise<string> {
-    const contract = new Contract(contractId);
-    const operation = contract.call(method, ...args);
+    const { tx, simResult } = await this.simulateInvocation(
+      sourceAddress,
+      contractId,
+      method,
+      args,
+      opts
+    );
+    const preparedTx = rpc.assembleTransaction(tx, simResult);
+    return preparedTx.build().toXdr();
+  }
+
+  /**
+   * Recording-mode simulation from a REAL source account: returns the
+   * authorization entries the host says the invocation needs (the
+   * source account's own entry plus one unsigned address entry per
+   * other party). The RFQ flow hands a maker their entry to sign.
+   */
+  async simulateAuthEntries(
+    sourceAddress: string,
+    contractId: string,
+    method: string,
+    args: xdr.ScVal[]
+  ): Promise<xdr.SorobanAuthorizationEntry[]> {
+    const { simResult } = await this.simulateInvocation(sourceAddress, contractId, method, args);
+    return simResult.result?.auth ?? [];
+  }
+
+  private async simulateInvocation(
+    sourceAddress: string,
+    contractId: string,
+    method: string,
+    args: xdr.ScVal[],
+    opts: { auth?: xdr.SorobanAuthorizationEntry[] } = {}
+  ): Promise<{ tx: Transaction; simResult: rpc.Api.SimulateTransactionSuccessResponse }> {
+    const withAuth = Boolean(opts.auth && opts.auth.length > 0);
+    const operation = withAuth
+      ? Operation.invokeContractFunction({
+          contract: contractId,
+          function: method,
+          args,
+          auth: opts.auth,
+        })
+      : new Contract(contractId).call(method, ...args);
 
     const account = await this.rpc('getAccount', (s) => s.getAccount(sourceAddress));
     const tx = new TransactionBuilder(account, {
@@ -368,16 +420,22 @@ export class StellarClient {
       .setTimeout(300)
       .build();
 
-    const simResult = await this.rpc('simulateTransaction', (s) => s.simulateTransaction(tx));
+    // useUpgradedAuth=false: ask for LEGACY address credentials. The SDK
+    // defaults to CAP-71 V2 credentials, which older wallets and CLIs
+    // cannot decode — a taker's wallet would refuse to sign the RFQ tx.
+    // Ufama's own auth is all source-account, so nothing else changes.
+    const simResult = await this.rpc('simulateTransaction', (s) =>
+      withAuth
+        ? s.simulateTransaction(tx, undefined, 'enforce', false)
+        : s.simulateTransaction(tx, undefined, undefined, false)
+    );
 
     if (!rpc.Api.isSimulationSuccess(simResult)) {
       const detail =
         'error' in simResult ? ` — ${JSON.stringify(simResult.error)}` : '';
       throw new Error(`Transaction simulation failed${detail}`);
     }
-
-    const preparedTx = rpc.assembleTransaction(tx, simResult);
-    return preparedTx.build().toXdr();
+    return { tx, simResult };
   }
 
   /**

@@ -76,12 +76,42 @@ mis-ordered), plus one adapter v1 with the allowance-based flow.
 | Router | `CDHWQFVZ7CIUZQL334ZQW2IEINCM3H66SZD77WO2IQ2NBUTKO2UF35LR` |
 | TwapBook | `CCL6X6X5YWCHVFFDLX63TCIV4R2GTEHEZPEHG4TJLVIOP52DXJ7YQHMH` |
 | Aqua adapter | `CBJTYQG3V2VC2KSMNT4KRXRULU6FSGWXX2AT453QZBGI2AFHKZREIBUH` |
+| RfqSettle (2026-10-16) | `CB4TBZBK6SLTVBAOV3IRI6DLH27P23WT3C5J7UXDW3FJ7BIX5WVVZ43W` |
+
+RFQ end-to-end verified on testnet 2026-10-16: maker bot (testnet
+`maker` identity) quoted a 100 USDC → USDT0 request in 2s, taker signed
+with the CLI, `settle_quote` landed (tx `bfdd63ef…26aa`): taker −100 USDC
+/ +99.95 USDT0, FeeVault +0.005 USDC, `is_used` true, replay refused.
+Negative paths exercised live: NAV-band breach, tampered signature,
+unfunded maker, unregistered key, closed request. The testnet SwapBook
+carries a pushed 1:1 USDC/USDT0 oracle price (deployer is oracle admin)
+so the on-chain NAV band path runs there.
 
 Curve (StableSwap-NG) is NOT registered on testnet by design. Its
 testnet factory `CANV76QKMKSQ26WZMLGVBGML5BCXKKZN2D2Q7HWFLKAEYZ6WWOJ6MHDS`
 and 3-pool `CB6PW7DRUI5GO652L7CRUOOPAZ4IBMWKQ7RCM7SGWFFF5YQKV6PIXFXN` were
 used once (2026-10-15) to verify the adapter's ABI assumptions and the
 quote path; the venue was then removed from the testnet Router.
+
+## RFQ settlement — mainnet rollout
+
+Not yet deployed on mainnet. Three steps, no change to any live contract:
+
+| Step | Command / action | What it does |
+|---|---|---|
+| 1 | `bash scripts/rfq.sh deploy` | Builds `contracts/rfq`, deploys it wired to the live FeeVault and SwapBook v1.2 (NAV source), prints `RFQ_CONTRACT_ID`. Admin = mainnet-deployer (rotate with `transfer_admin`/`accept_admin` like the others). |
+| 2 | Railway: `RFQ_CONTRACT_ID=…`, `RFQ_MAKER_KEYS="SDF Liquidity:<key>,…"` then Deploy | Enables the RFQ tab (the frontend needs nothing); registers who may post quotes. The key label is the badge takers see. |
+| 3 | Run a maker: `UFAMA_API_URL=… RFQ_MAKER_KEY=… RFQ_MAKER_SECRET=… NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015" npm run maker` (backend dir) | Reference bot: quotes every request at NAV − `RFQ_SPREAD_BPS` (default 5) within `RFQ_MAX_NOTIONAL`, signs locally, posts. Run one per SDF liquidity wallet; pairs can be allowlisted with `RFQ_PAIRS=USDC>USTRY,…`. |
+
+Issuer onboarding (Etherfuse etc.): give them a maker key; they run the
+same flow with their own key and quote their asset at NAV + 0. The
+contract settles atomically — no escrow, no custody by Ufama. If they
+cannot sign Soroban auth entries, their API stays an off-chain reference
+only.
+
+NAV band on mainnet: pairs priced through SwapBook SEP-40 feeds (RedStone
+for the RWA roster) get `maxNavDevBps` 50 by default; pairs without a
+feed quote with band 0 and show "no NAV ref" on the card.
 
 ## Curve mainnet launch (pre-armed)
 

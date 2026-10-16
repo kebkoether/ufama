@@ -30,55 +30,74 @@ const REFLECTOR_ALIASES: Record<string, string> = {
   USDT0: 'USDT', // bridged Tether — USDT is its fair-value feed
 };
 
+/** A USD reading with its provenance — the RFQ screen shows NAV age. */
+export interface UsdQuote {
+  price: number;
+  source: 'redstone' | 'reflector';
+  /** Feed timestamp, seconds since epoch (ms feeds normalized). */
+  timestamp: number;
+}
+
 export class FairValueService {
-  private cache = new Map<string, { price: number | null; at: number }>();
+  private cache = new Map<string, { quote: UsdQuote | null; at: number }>();
 
   constructor(private stellar: StellarClient) {}
 
   /** USD price for a token, or null if no oracle covers it. */
   async priceUsd(sac: string, symbol: string): Promise<number | null> {
+    return (await this.quoteUsd(sac, symbol))?.price ?? null;
+  }
+
+  /** USD price with source + feed timestamp, or null if uncovered. */
+  async quoteUsd(sac: string, symbol: string): Promise<UsdQuote | null> {
     const hit = this.cache.get(sac);
-    if (hit && Date.now() - hit.at < TTL_MS) return hit.price;
+    if (hit && Date.now() - hit.at < TTL_MS) return hit.quote;
 
     // RedStone first (address-keyed — no symbol ambiguity)
-    let price = await this.lastprice(
+    let quote = await this.lastprice(
       REDSTONE_ADAPTER,
       xdr.ScVal.scvVec([
         xdr.ScVal.scvSymbol('Stellar'),
         new Address(sac).toScVal(),
       ]),
-      REDSTONE_DECIMALS
+      REDSTONE_DECIMALS,
+      'redstone'
     );
-    if (price === null && symbol) {
+    if (quote === null && symbol) {
       const alias = REFLECTOR_ALIASES[symbol] ?? symbol;
-      price = await this.lastprice(
+      quote = await this.lastprice(
         REFLECTOR_EXTERNAL,
         xdr.ScVal.scvVec([
           xdr.ScVal.scvSymbol('Other'),
           xdr.ScVal.scvSymbol(alias),
         ]),
-        REFLECTOR_DECIMALS
+        REFLECTOR_DECIMALS,
+        'reflector'
       );
     }
-    this.cache.set(sac, { price, at: Date.now() });
-    return price;
+    this.cache.set(sac, { quote, at: Date.now() });
+    return quote;
   }
 
   /** SEP-40 lastprice via read-only simulation; null on any failure. */
   private async lastprice(
     oracle: string,
     asset: xdr.ScVal,
-    decimals: number
-  ): Promise<number | null> {
+    decimals: number,
+    source: UsdQuote['source']
+  ): Promise<UsdQuote | null> {
     try {
-      const res = await this.stellar.simulateAndParse<{ price: bigint }>(
+      const res = await this.stellar.simulateAndParse<{ price: bigint; timestamp?: bigint }>(
         oracle,
         'lastprice',
         [asset]
       );
       if (!res || res.price === undefined) return null;
       const price = Number(res.price) / 10 ** decimals;
-      return price > 0 ? price : null;
+      if (!(price > 0)) return null;
+      let ts = Number(res.timestamp ?? 0);
+      if (ts > 100_000_000_000) ts = Math.floor(ts / 1000); // ms feeds
+      return { price, source, timestamp: ts };
     } catch {
       return null;
     }

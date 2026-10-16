@@ -6,6 +6,8 @@ import { toBaseUnits, fromBaseUnits, formatUnits } from '@/lib/units';
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 import { useWallet } from '@/context/WalletContext';
 import OrderBook from './OrderBook';
+import RfqPanel from './RfqPanel';
+import { useRfq } from '@/lib/rfq';
 import { getQuote as fetchQuote, buildPeerSwap, getOraclePrice } from '@/lib/api';
 
 // ─── Token Data ─────────────────────────────────────────
@@ -572,6 +574,9 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
   const [loading, setLoading] = useState(false);
   const [quote, setQuote] = useState<any>(null);
   const [p2pPlan, setP2pPlan] = useState<any>(null);
+  // RFQ state machine (request → firm quotes → atomic settlement)
+  const rfq = useRfq();
+  const { start: rfqStart, accept: rfqAccept, reset: rfqReset } = rfq;
   const [priceMode, setPriceMode] = useState<'fixed' | 'market'>('fixed');
   const [maxSlippageBps, setMaxSlippageBps] = useState(50); // 0.50% default
   const [autoRouteMinutes, setAutoRouteMinutes] = useState(0); // 0 = no timer
@@ -898,31 +903,67 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     setTokenOut(prev);
     setQuote(null);
     setP2pPlan(null);
-  }, [tokenIn, tokenOut]);
+    rfqReset();
+  }, [tokenIn, tokenOut, rfqReset]);
 
-  const handleP2pCheck = useCallback(async () => {
-    if (!amountIn || parseFloat(amountIn) <= 0) return;
-    setLoading(true);
+  // ─── RFQ: request firm quotes, settle atomically ──────
+  const handleRfqStart = useCallback(async () => {
+    if (!walletAddress || !amountIn || parseFloat(amountIn) <= 0) return;
     try {
-      const baseAmount = toBaseUnits(amountIn, decimalsOf(tokenIn));
-      const data = await buildPeerSwap({
-        sourceAddress: walletAddress || 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
-        // SAC addresses — discovered tokens aren't symbol-resolvable
+      const r = await rfqStart({
+        taker: walletAddress,
         tokenIn: tokenParam(tokenIn),
         tokenOut: tokenParam(tokenOut),
-        amountIn: baseAmount,
-        minAmountOut: priceMode === 'market' ? '0' : baseAmount,
-        priceMode: priceMode === 'market' ? 1 : 0,
-        maxSlippageBps: priceMode === 'market' ? maxSlippageBps : undefined,
-        autoRouteMinutes: autoRouteMinutes > 0 ? autoRouteMinutes : undefined,
+        amountIn: toBaseUnits(amountIn, decimalsOf(tokenIn)),
+        ttlSec: 20,
       });
-      setP2pPlan(data.plan);
-    } catch (error) {
-      console.error('P2P match check error:', error);
-    } finally {
-      setLoading(false);
+      // A pair with an on-chain NAV feed defaults the fallback standing
+      // order to oracle-pegged pricing so it never goes stale.
+      setPriceMode(r.reference.oracleOnChain ? 'market' : 'fixed');
+      setP2pPlan(null);
+    } catch {
+      /* surfaced through rfq.error */
     }
-  }, [amountIn, tokenIn, tokenOut, walletAddress, priceMode, maxSlippageBps, autoRouteMinutes, tokenParam]);
+  }, [walletAddress, amountIn, tokenIn, tokenOut, tokenParam, decimalsOf, rfqStart]);
+
+  const handleRfqAccept = useCallback(async (quoteId: string) => {
+    if (!walletAddress) return;
+    setSubmitting(true);
+    try {
+      setTxStatus({
+        phase: 'confirming',
+        title: 'Settling your quote on-chain…',
+        detail: 'Sign in your wallet. Both legs move in one transaction, or nothing moves.',
+      });
+      const { hash, quote } = await rfqAccept(quoteId, signTransaction);
+      const vs = quote.vsNavBps;
+      const navText =
+        vs === null
+          ? ''
+          : Math.abs(vs) < 0.05
+          ? ' at NAV'
+          : vs > 0
+          ? ` at NAV −${vs.toFixed(1)} bps`
+          : ` at NAV +${(-vs).toFixed(1)} bps`;
+      setTxStatus({
+        phase: 'success',
+        title: `Filled${navText}: ${formatUnits(quote.amountOut, decimalsOf(tokenOut))} ${tokenOut} from ${quote.makerLabel}`,
+        detail: 'Settled atomically — no escrow, 0.5 bps protocol fee.',
+        hash,
+      });
+      setAmountIn('');
+      fetchBalances();
+    } catch (error: any) {
+      console.error('RFQ settle error:', error);
+      setTxStatus({
+        phase: 'error',
+        title: 'Quote did not settle',
+        detail: error?.message || 'Unknown error',
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  }, [walletAddress, rfqAccept, signTransaction, decimalsOf, tokenOut, fetchBalances]);
 
   // Place a TWAP order: build → sign (escrows total) → submit
   const handleTwapSubmit = useCallback(async () => {
@@ -970,7 +1011,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
 
   // Submit the P2P order (sign + send the transaction)
   const handleP2pSubmit = useCallback(async () => {
-    if (!walletAddress || !p2pPlan) return;
+    if (!walletAddress) return;
     setSubmitting(true);
     try {
       const baseAmount = toBaseUnits(amountIn, decimalsOf(tokenIn));
@@ -1161,7 +1202,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
       <div style={{ display: 'flex', borderBottom: '1px solid #1a1f2e' }}>
         {([
           { key: 'instant' as const, label: 'Instant Swap', desc: 'Fills now via DEXs · venue fees only' },
-          { key: 'p2p' as const, label: 'P2P Match', desc: 'Wait for a peer · 0.5 bps only' },
+          { key: 'p2p' as const, label: 'RFQ', desc: 'Firm quotes at NAV · 0.5 bps' },
           { key: 'twap' as const, label: 'TWAP', desc: 'Spread over time · keeper-run' },
         ]).map((tab) => (
           <button
@@ -1170,15 +1211,9 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
               setMode(tab.key);
               setQuote(null);
               setP2pPlan(null);
-              if (tab.key === 'p2p') {
-                // Coerce selections into the (server-configured) P2P corridor
-                const nextIn = p2pAllowed.includes(tokenIn) ? tokenIn : p2pAllowed[0];
-                const fallbackOut = p2pAllowed.find((s) => s !== nextIn) ?? p2pAllowed[0];
-                const nextOut =
-                  p2pAllowed.includes(tokenOut) && tokenOut !== nextIn ? tokenOut : fallbackOut;
-                setTokenIn(nextIn);
-                setTokenOut(nextOut);
-              }
+              rfqReset();
+              // RFQ takes any pair (makers decide what they quote); only the
+              // standing-order fallback is gated by the server corridor.
               if (tab.key === 'twap' && twapTokens.length >= 2) {
                 // Coerce into TWAP-eligible tokens (registered venue pools)
                 const eligible = (s: string) => twapTokens.some((t) => t.symbol === s);
@@ -1218,10 +1253,10 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           sublabel={balanceLabel(tokenIn)}
           onSublabelClick={balances[tokenIn] !== undefined ? fillMaxBalance : undefined}
           value={amountIn}
-          onChange={(v) => { setAmountIn(v); setP2pPlan(null); }}
+          onChange={(v) => { setAmountIn(v); setP2pPlan(null); rfqReset(); }}
           token={tokenIn}
-          tokens={mode === 'p2p' ? p2pTokens : mode === 'twap' ? twapTokens : allTokens}
-          onTokenSelect={(s) => { setTokenIn(s); if (s === tokenOut) setTokenOut(tokenIn); setQuote(null); setP2pPlan(null); }}
+          tokens={mode === 'twap' ? twapTokens : allTokens}
+          onTokenSelect={(s) => { setTokenIn(s); if (s === tokenOut) setTokenOut(tokenIn); setQuote(null); setP2pPlan(null); rfqReset(); }}
           excludeToken={tokenOut}
           accent="#ef4444"
         />
@@ -1253,7 +1288,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
 
         {/* Buying */}
         <InputPanel
-          label={mode === 'instant' ? 'Buying' : 'Buying (estimated)'}
+          label={mode === 'instant' ? 'Buying' : mode === 'p2p' && rfq.quotes.length > 0 ? 'Buying (best firm quote)' : 'Buying (estimated)'}
           sublabel={loading ? 'Fetching...' : balanceLabel(tokenOut)}
           value={
             (mode === 'instant' || mode === 'twap') && !quote && loading
@@ -1261,15 +1296,17 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
               : (mode === 'instant' || mode === 'twap') && quote
               ? `${mode === 'twap' ? '~' : ''}${formatOutput(quote.netAmountOut)}`
               : mode === 'p2p' && amountIn && parseFloat(amountIn) > 0
-              ? p2pPlan
-                ? formatOutput(p2pPlan.summary?.instantFillAmount || '0')
+              ? rfq.quotes.length > 0
+                ? formatOutput(rfq.quotes[0].amountOut)
+                : rfq.request?.reference.navAmountOut
+                ? `~${formatOutput(rfq.request.reference.navAmountOut)}`
                 : `~${parseFloat(amountIn).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
               : ''
           }
           readOnly
           token={tokenOut}
-          tokens={mode === 'p2p' ? p2pTokens : mode === 'twap' ? twapTokens : allTokens}
-          onTokenSelect={(s) => { setTokenOut(s); if (s === tokenIn) setTokenIn(tokenOut); setQuote(null); setP2pPlan(null); }}
+          tokens={mode === 'twap' ? twapTokens : allTokens}
+          onTokenSelect={(s) => { setTokenOut(s); if (s === tokenIn) setTokenIn(tokenOut); setQuote(null); setP2pPlan(null); rfqReset(); }}
           excludeToken={tokenIn}
           accent="#22c55e"
         />
@@ -1451,6 +1488,32 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         {/* P2P Options: Price Mode + Timer */}
         {mode === 'p2p' && (
           <div style={{ marginTop: '14px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {/* RFQ: reference strip, live quote cards, fallbacks */}
+            <RfqPanel
+              request={rfq.request}
+              phase={rfq.phase}
+              error={rfq.error}
+              secondsLeft={rfq.secondsLeft}
+              quotes={rfq.quotes}
+              now={rfq.now}
+              tokenIn={tokenIn}
+              tokenOut={tokenOut}
+              decimalsIn={decimalsOf(tokenIn)}
+              decimalsOut={decimalsOf(tokenOut)}
+              busy={submitting}
+              standingAllowed={p2pLive(tokenIn) && p2pLive(tokenOut)}
+              onAcceptQuote={handleRfqAccept}
+              onAcceptBook={handleP2pSubmit}
+              onUseAmm={() => { rfqReset(); setMode('instant'); }}
+              onPostStanding={handleP2pSubmit}
+              onCancel={rfq.cancel}
+            />
+
+            {p2pLive(tokenIn) && p2pLive(tokenOut) && (
+              <div style={{ fontSize: '12px', fontWeight: 700, color: '#8a8f9c', textTransform: 'uppercase', letterSpacing: '0.8px', marginTop: '6px' }}>
+                Standing order · if no quote fills
+              </div>
+            )}
             {/* Resting orders for this pair */}
             {p2pLive(tokenIn) && p2pLive(tokenOut) && (
               <OrderBook
@@ -1464,6 +1527,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
             )}
 
             {/* Price Mode Toggle */}
+            {p2pLive(tokenIn) && p2pLive(tokenOut) && (
             <div
               style={{
                 background: '#161b26',
@@ -1539,7 +1603,10 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
               )}
             </div>
 
+            )}
+
             {/* Auto-Route Timer */}
+            {p2pLive(tokenIn) && p2pLive(tokenOut) && (
             <div
               style={{
                 background: '#161b26',
@@ -1587,73 +1654,6 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
                 </div>
               )}
             </div>
-          </div>
-        )}
-
-        {/* P2P Match info */}
-        {mode === 'p2p' && amountIn && parseFloat(amountIn) > 0 && (
-          <div
-            style={{
-              marginTop: '12px',
-              background: 'rgba(99, 102, 241, 0.06)',
-              border: '1px solid rgba(99, 102, 241, 0.15)',
-              borderRadius: '12px',
-              padding: '12px 14px',
-              fontSize: '13px',
-              color: '#8a8f9c',
-              lineHeight: '1.5',
-            }}
-          >
-            <div style={{ fontWeight: 600, color: '#6366f1', marginBottom: '4px', fontSize: '12px' }}>
-              P2P MATCH
-            </div>
-
-            {p2pPlan ? (
-              // Show auto-match results
-              <div>
-                {p2pPlan.fills && p2pPlan.fills.length > 0 ? (
-                  <>
-                    <div style={{ color: '#22c55e', fontWeight: 600, marginBottom: '4px' }}>
-                      {p2pPlan.fills.length} matching order{p2pPlan.fills.length > 1 ? 's' : ''} found
-                    </div>
-                    <div style={{ marginBottom: '6px' }}>
-                      <strong style={{ color: '#e1e4ea' }}>
-                        {formatUnits(p2pPlan.summary.instantFillAmount, decimalsOf(tokenOut))} {tokenOut}
-                      </strong>{' '}
-                      fills instantly at <strong style={{ color: '#22c55e' }}>0.5 bps</strong>.
-                    </div>
-                    {p2pPlan.remainder && (
-                      <div style={{ fontSize: '12px', color: '#eab308' }}>
-                        Remaining{' '}
-                        <strong>{formatUnits(p2pPlan.remainder.amountIn, decimalsOf(tokenIn))} {tokenIn}</strong>{' '}
-                        will be escrowed on-chain waiting for a future match.
-                      </div>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    <div>
-                      No matching orders right now. Your{' '}
-                      <strong style={{ color: '#e1e4ea' }}>{parseFloat(amountIn).toLocaleString()} {tokenIn}</strong>{' '}
-                      will be escrowed on-chain and wait for a counterparty to match at{' '}
-                      <strong style={{ color: '#22c55e' }}>0.5 bps</strong>.
-                    </div>
-                    <div style={{ marginTop: '6px', fontSize: '12px', color: '#565b68' }}>
-                      *Could take minutes to days depending on demand. Cancel anytime to reclaim tokens.
-                    </div>
-                  </>
-                )}
-              </div>
-            ) : (
-              // Default info before checking
-              <div>
-                We&apos;ll check for matching orders first. Any matches fill instantly at{' '}
-                <strong style={{ color: '#22c55e' }}>0.5 bps</strong>. Remainder is escrowed
-                on-chain and waits for a future match. You can cancel anytime.
-                <div style={{ marginTop: '6px', fontSize: '12px', color: '#565b68' }}>
-                  *Cheapest option, but the wait could be minutes to days depending on demand.
-                </div>
-              </div>
             )}
           </div>
         )}
@@ -1795,8 +1795,12 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         {/* Action button */}
         {(() => {
           const hasAmount = amountIn && parseFloat(amountIn) > 0;
-          const p2pPairReady =
-            mode !== 'p2p' || (p2pLive(tokenIn) && p2pLive(tokenOut));
+          const p2pPairReady = p2pLive(tokenIn) && p2pLive(tokenOut);
+          const rfqWaiting =
+            mode === 'p2p' &&
+            (rfq.phase === 'requesting' ||
+              rfq.phase === 'accepting' ||
+              (rfq.phase === 'open' && rfq.secondsLeft > 0 && rfq.quotes.length === 0));
           // Missing trustline preempts every mode: the wallet can't
           // receive tokenOut until it's added, so the button becomes the
           // add-trustline action (clickable even while a quote loads).
@@ -1806,7 +1810,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           const impactBlocked = mode === 'instant' && Boolean(quote?.priceImpactBlocked);
           const disabled = trustlineGate
             ? false
-            : !hasAmount || loading || submitting || addingTrustline || !p2pPairReady || impactBlocked;
+            : !hasAmount || loading || submitting || addingTrustline || impactBlocked || rfqWaiting;
 
           // Determine button action and label
           let onClick: (() => void) | undefined;
@@ -1824,7 +1828,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           } else if (submitting) {
             label = 'Signing transaction...';
           } else if (loading) {
-            label = mode === 'p2p' ? 'Checking for matches...' : 'Finding best route...';
+            label = 'Finding best route...';
           } else if (mode === 'twap') {
             if (!hasAmount) {
               label = 'Enter an amount';
@@ -1846,24 +1850,30 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
               label = 'Fetching quote...';
             }
           } else if (mode === 'p2p') {
-            if (!p2pPairReady) {
-              label = `${tokenIn === 'USDT0' || tokenOut === 'USDT0' ? 'USDT0' : 'Pair'} not live yet — P2P opens at launch`;
-            } else if (!hasAmount) {
+            const best = rfq.quotes[0];
+            if (!hasAmount) {
               label = 'Enter an amount';
-            } else if (!p2pPlan) {
-              onClick = handleP2pCheck;
-              label = 'Find P2P Matches';
-            } else {
-              // Plan loaded — button submits the order
-              onClick = handleP2pSubmit;
+            } else if (rfq.phase === 'requesting') {
+              label = 'Opening request…';
+            } else if (rfq.phase === 'accepting') {
+              label = 'Settling…';
+            } else if ((rfq.phase === 'open' || rfq.phase === 'closed') && best) {
+              onClick = () => handleRfqAccept(best.id);
               showGreen = true;
-              if (p2pPlan.fills?.length > 0) {
-                label = p2pPlan.remainder
-                  ? `Fill ${p2pPlan.fills.length} match${p2pPlan.fills.length > 1 ? 'es' : ''} + escrow remainder`
-                  : `Fill ${p2pPlan.fills.length} match${p2pPlan.fills.length > 1 ? 'es' : ''} now`;
+              label = `Accept best quote · ${formatOutput(best.amountOut)} ${tokenOut} from ${best.makerLabel}`;
+            } else if (rfq.phase === 'open' && rfq.secondsLeft > 0) {
+              label = `Collecting firm quotes… ${rfq.secondsLeft}s`;
+            } else if (rfq.phase === 'open' || rfq.phase === 'closed') {
+              if (p2pPairReady) {
+                onClick = handleP2pSubmit;
+                label = `Post standing order${priceMode === 'market' ? ' at NAV' : ''} · escrow ${parseFloat(amountIn).toLocaleString()} ${tokenIn}`;
               } else {
-                label = `Place Order · escrow ${parseFloat(amountIn).toLocaleString()} ${tokenIn}`;
+                onClick = handleRfqStart;
+                label = 'No quotes yet — request again';
               }
+            } else {
+              onClick = handleRfqStart;
+              label = `Request firm quotes for ${parseFloat(amountIn).toLocaleString()} ${tokenIn}`;
             }
           }
 

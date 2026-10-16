@@ -10,10 +10,14 @@ Swap protocol on Stellar (Soroban), three execution styles in one UI:
   when blending the SDEX book with AMMs beats any single route by more
   than the fee-aware gate, it automatically returns a two-transaction
   split plan (each leg min-out protected). Protocol fee: 0.5 bps.
-- **P2P match** — sit a limit order on the on-chain SwapBook and match
-  peer-to-peer at 0.5 bps, with an optional auto-route timer: if nobody
-  fills you in N minutes, a permissionless keeper routes the escrow
-  through the DEXes, your price floor enforced on-chain.
+- **RFQ** — request firm quotes; registered makers (liquidity desks,
+  issuers quoting their own RWAs at NAV) answer in seconds by pre-signing
+  one Soroban authorization entry each. Accept one and both legs settle
+  in a single transaction — no escrow, the contract can enforce a NAV
+  band on-chain, 0.5 bps. Standing orders remain the fallback: sit a
+  limit or oracle-pegged order on the SwapBook at 0.5 bps, with an
+  optional auto-route timer (a permissionless keeper routes the escrow
+  through the DEXes, your price floor enforced on-chain).
 - **TWAP** — escrow a total and a schedule; a permissionless keeper
   executes slices with contract-enforced pace, price, and cadence.
   Fee: 10 bps, admin-settable but hard-capped on-chain at 10 bps.
@@ -135,7 +139,8 @@ Deploy to testnet: `./scripts/deploy-testnet.sh`.
 
 | Venue | ID | Quotes | On-chain execution |
 |---|---|---|---|
-| SwapBook (P2P) | 0 | `quote_fill` (taker-direction) | fill/partial_fill via peer-swap flow |
+| SwapBook (standing orders) | 0 | `quote_fill` (taker-direction) | fill/partial_fill via peer-swap flow |
+| RfqSettle (firm quotes) | — | maker quotes via `/api/rfq` | `settle_quote` with the maker's pre-signed auth entry |
 | Aqua | 1 | Aqua REST + pool `estimate_swap` | ✅ `swap_chained` via adapter (mainnet-verified) |
 | SushiSwap V3 | 2 | pool `slot0` spot | ✅ direct `pool.swap` via adapter (mainnet-verified) |
 | Stellar DEX | 3 | Horizon path-finding (includes classic AMMs) | classic `path_payment` — standalone tx or blend leg, never a Router segment |
