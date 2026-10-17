@@ -11,6 +11,7 @@
 | Aqua adapter v1.2 (venue 1) | `CBYQV73IOS3KFIXZV6TC3LC7CPQQGTFQG2UEJ5EF5LFBMVBF7XRSUJCE` |
 | Sushi adapter v1.2 (venue 2) | `CAWVG65APH5K56AS7FWXKKDLSJQUO5WIGCVFUFFFRA2JOJ35OYERLCVR` |
 | Curve adapter (venue 4, UNARMED) | `CCTMKF4PIHIW6UKF3ETVNLE4Z3ZSGLI4HMDWVWCXKSHJHVZEILKGMG7O` |
+| RfqSettle (2026-10-17) | `CBFNGCV7IIZC2E2LUQFLBJU2E4UKG4AINSDWWOU5S64OFKHXTOB74DNB` |
 
 Admin/deployer: `GB3BIN23PHTOPHTEGTC4VCY2HVSY6HDYG3C6QXQQ3TCEJR74K6DWGMQT`.
 Router v1.2 `CBSF6G7HXYWHXQDGZROJU4MLONCTNZXF7U3LNURUYMWR5B75TZJGAUJW` is
@@ -118,11 +119,17 @@ quote path; the venue was then removed from the testnet Router.
 
 ## RFQ settlement — mainnet rollout
 
-Not yet deployed on mainnet. Three steps, no change to any live contract:
+RfqSettle deployed 2026-10-17: `CBFNGCV7IIZC2E2LUQFLBJU2E4UKG4AINSDWWOU5S64OFKHXTOB74DNB`
+(admin mainnet-deployer, fee_vault CBNI2QR4…HPXP, swap_book CB2KKROC…AEBN,
+fee 5/100k). Code rent for the 11 KB wasm was ~16.6 XLM. Step 1 below is
+done; steps 2–3 remain. On-chain NAV (`fair_value`) answers today for
+USDC→deJTRSY and USDC→USDY (SwapBook SEP-40 feeds); USDC→USTRY has no
+feed registered on the SwapBook yet, so USTRY quotes run with band 0
+until `set_sep40_feed` adds its RedStone feed.
 
 | Step | Command / action | What it does |
 |---|---|---|
-| 1 | `bash scripts/rfq.sh deploy` | Builds `contracts/rfq`, deploys it wired to the live FeeVault and SwapBook v1.2 (NAV source), prints `RFQ_CONTRACT_ID`. Admin = mainnet-deployer (rotate with `transfer_admin`/`accept_admin` like the others). |
+| 1 ✅ | `bash scripts/rfq.sh deploy` | Builds `contracts/rfq`, deploys it wired to the live FeeVault and SwapBook v1.2 (NAV source), prints `RFQ_CONTRACT_ID`. Admin = mainnet-deployer (rotate with `transfer_admin`/`accept_admin` like the others). |
 | 2 | Railway: `RFQ_CONTRACT_ID=…`, `RFQ_MAKER_KEYS="SDF Liquidity:<key>,…"` then Deploy | Enables the RFQ tab (the frontend needs nothing); registers who may post quotes. The key label is the badge takers see. |
 | 3 | Run a maker: `UFAMA_API_URL=… RFQ_MAKER_KEY=… RFQ_MAKER_SECRET=… NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015" npm run maker` (backend dir) | Reference bot: quotes every request at NAV − `RFQ_SPREAD_BPS` (default 5) within `RFQ_MAX_NOTIONAL`, signs locally, posts. Run one per SDF liquidity wallet; pairs can be allowlisted with `RFQ_PAIRS=USDC>USTRY,…`. |
 
