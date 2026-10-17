@@ -44,11 +44,15 @@ flowchart LR
         K[TWAP keeper + timer sweep]
         OP[Oracle pusher]
     end
+    subgraph Makers["RFQ makers (own keys)"]
+        MB[Maker bot / issuer desk]
+    end
     subgraph Soroban["Stellar / Soroban (on-chain)"]
         SB[SwapBook]
         R[Router]
         TB[TwapBook]
         FV[FeeVault]
+        RQ[RfqSettle]
         AA[Aqua adapter]
         SA[Sushi adapter]
         CA[Curve adapter]
@@ -62,6 +66,9 @@ flowchart LR
 
     W -- signs txs --> Soroban
     FE -- quotes / build --> BE
+    MB -- signed quote auth entries --> BE
+    RQ -- get_oracle_price --> SB
+    RQ -- 0.5 bps --> FV
     W --- FE
     BE -- Horizon path-finding --> DEX
     K -- execute_slice / route_expired_order --> TB & R
@@ -189,6 +196,35 @@ the token balances themselves (no shadow accounting to drift or strand
 fees). `withdraw(token, to, amount)` and `set_admin` are admin-only;
 `get_balance` / `get_admin` are public reads.
 
+### RfqSettle — firm quotes, atomic delivery-versus-payment
+
+`contracts/rfq`. A maker's quote IS a pre-signed Soroban authorization
+entry for one exact `settle_quote(quote)` invocation (taker, pair,
+amounts, expiry ledger, nonce, NAV band). The taker's transaction carries
+that entry plus their own source-account auth; both `require_auth`
+calls pass or the transaction fails, so the two token transfers are
+atomic and the contract never holds funds — no escrow.
+
+- **Replay**: the host consumes the maker entry's nonce natively; the
+  contract additionally records `Used(maker, nonce)` in temporary
+  storage until `expiry_ledger` (covers maker-as-source settlements and
+  gives `is_used` a definitive answer). Expiry is capped at ~7 days.
+- **NAV band**: with `max_nav_dev_bps > 0` the contract reads the pair's
+  price through the SwapBook's `get_oracle_price` (the same SEP-40 feeds
+  that price oracle-pegged standing orders) and refuses to settle more
+  than the band away from fair value in EITHER direction — protects the
+  taker from a wide quote and the maker from a fat-fingered one. Fails
+  closed when the feed is missing or stale. `check_quote` / `fair_value`
+  expose the same math as views so the backend can label every quote
+  "NAV ± bps" from the number the chain will enforce.
+- **Fee**: 0.5 bps of the taker's payment leg to the FeeVault, ceil,
+  admin-settable, hard-capped at the compiled rate.
+- **Who can quote**: anyone with a funded wallet. The backend gates
+  submission by registered maker API key (the key's label is the trust
+  badge takers see) and verifies every quote against the live host in
+  enforce mode before showing it. Issuers can quote their own assets at
+  NAV directly, no escrow and no custody by Ufama.
+
 ### Venue adapters
 
 Both adapters implement the same interface the Router/TwapBook dispatch to
@@ -241,6 +277,8 @@ funds at rest.
 | Keeper | None — permissionless | Trigger TWAP slices, timer routes, expiries | Move funds anywhere but to the maker; violate pace/price/cadence |
 | Maker | `require_auth` | Place, cancel own orders | Cancel others' orders |
 | Taker | `require_auth` | Fill at or above the order's price terms | Underpay (ceiling math), fill expired orders |
+| RFQ maker | Pre-signed address-credential auth entry (nonce + signature expiry enforced by the host) | Deliver exactly the quoted amount to the quoted taker, once, before expiry | Be settled for a different taker/pair/amount, be replayed, be settled outside the quote's NAV band |
+| RFQ taker | Source-account auth on `settle_quote` | Accept one live quote; pay exactly `amount_in` | Settle a quote the maker did not sign for them |
 
 ## Backend (Railway)
 
@@ -282,6 +320,7 @@ balance changes.
 | SwapBook fills | 0.5 bps, ceil, min 1 stroop | Compile-time constant | FeeVault |
 | Router routes (incl. timer routes) | 0.5 bps on total output, ceil | Compile-time constant | FeeVault |
 | TWAP slices | 10 bps default, admin-settable 0–10 bps, ceil | `set_fee`, hard cap compiled | FeeVault |
+| RFQ settlements | 0.5 bps of the taker's payment, ceil, admin-settable, hard-capped | `set_fee` on RfqSettle | FeeVault |
 | Integrator partner fee | per-key `feeBps` | Backend, classic legs only | Partner address |
 
 ## Deployment & operations

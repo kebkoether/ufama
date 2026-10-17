@@ -31,8 +31,8 @@ export default function Home() {
         <p style={{ fontSize: '14px', color: '#8a8f9c', lineHeight: '1.6' }}>
           <strong style={{ color: '#e1e4ea' }}>Instant Swap</strong> routes through the
           best DEX price.{' '}
-          <strong style={{ color: '#e1e4ea' }}>P2P Match</strong> finds you a peer at just{' '}
-          <span style={{ color: '#6366f1', fontWeight: 600 }}>0.5 bps</span>.
+          <strong style={{ color: '#e1e4ea' }}>RFQ</strong> gets you firm quotes at NAV, settled
+          atomically for <span style={{ color: '#6366f1', fontWeight: 600 }}>0.5 bps</span>.
         </p>
       </div>
 
@@ -78,9 +78,9 @@ export default function Home() {
             },
             {
               num: '2',
-              title: 'P2P Match',
-              desc: 'Wait & save. We check for matching peers first — any matches fill instantly. The rest is escrowed on-chain until a counterparty appears. Cancel anytime.',
-              fee: '0.5 bps only · could take minutes to days',
+              title: 'RFQ',
+              desc: 'Ask for firm quotes. Makers answer in seconds with prices pinned to NAV — RWAs delivered at net asset value. Accept one and both legs settle in a single transaction, no escrow. Nobody answers? Post a standing order at NAV.',
+              fee: '0.5 bps only · firm quotes in seconds',
               feeColor: '#22c55e',
             },
           ].map((step) => (

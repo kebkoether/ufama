@@ -27,6 +27,8 @@ import { TimerSweepService } from './services/timer-sweep.js';
 import { assertNotBlocked, isBlocked, BlockedAddressError } from './services/screening.js';
 import { Sep1Verifier } from './services/sep1-verify.js';
 import { FairValueService } from './services/fair-value.js';
+import { RfqStore } from './rfq/store.js';
+import { RfqService, RfqError } from './rfq/service.js';
 import { TokenDiscoveryService } from './services/token-discovery.js';
 import { TwapKeeperService } from './services/twap-keeper.js';
 import { sweepCurveFactory } from './services/curve-discovery.js';
@@ -85,6 +87,8 @@ const config = {
   curveAdapterContractId: process.env.CURVE_ADAPTER_CONTRACT_ID ?? '',
   curveFactoryContractId: process.env.CURVE_FACTORY_CONTRACT_ID ?? '',
   twapBookContractId: process.env.TWAP_BOOK_CONTRACT_ID ?? '',
+  /** RFQ settlement contract (firm quotes, atomic DvP). Empty = RFQ off. */
+  rfqContractId: process.env.RFQ_CONTRACT_ID ?? '',
   horizonUrl: process.env.HORIZON_URL ?? 'https://horizon-testnet.stellar.org',
   /**
    * v1.1 SwapBook features (match_and_place, excluded counterparties).
@@ -291,6 +295,7 @@ console.log(`  Aqua:     ${config.aquaAdapterContractId || '(not set)'}`);
 console.log(`  Sushi:    ${config.sushiAdapterContractId || '(not set)'}`);
 console.log(`  Curve:    ${config.curveAdapterContractId || '(not set)'}`);
 console.log(`  Curve factory: ${config.curveFactoryContractId || '(not set)'}`);
+console.log(`  RFQ:      ${config.rfqContractId || '(not set — RFQ disabled)'}`);
 console.log('');
 
 const stellar = new StellarClient({
@@ -358,6 +363,58 @@ let pathfinder: Pathfinder;
 
 // Oracle fair-value reads (RedStone + Reflector) for quote honesty
 const fairValue = new FairValueService(stellar);
+
+// ─── RFQ: firm quotes settled atomically (no escrow) ────
+//
+// Makers are registered by API key (RFQ_MAKER_KEYS="label:key,…"); the
+// label is the trust badge the taker sees. Keys only gate who may POST
+// quotes — every quote is still verified against the host before it is
+// shown. Taker endpoints are public (the taker signs their own tx).
+const RFQ_MAKER_KEYS = new Map<string, string>(); // api key -> maker label
+for (const pair of (process.env.RFQ_MAKER_KEYS ?? '').split(',')) {
+  const idx = pair.indexOf(':');
+  if (idx <= 0) continue;
+  const name = pair.slice(0, idx).trim();
+  const key = pair.slice(idx + 1).trim();
+  if (name && key.length >= 16) RFQ_MAKER_KEYS.set(key, name);
+}
+const rfqStore = new RfqStore();
+rfqStore.start();
+const rfq = new RfqService({
+  stellar,
+  rfqContractId: config.rfqContractId,
+  store: rfqStore,
+  fairValue,
+  tokenMeta: (sac) => ({ symbol: symbolForSac(sac), decimals: decimalsForSac(sac) }),
+  // The SwapBook answers get_oracle_price only when both tokens have a
+  // registered SEP-40 feed (or a pushed price) — that is exactly the
+  // condition for an on-chain NAV band / an oracle-pegged standing order.
+  oracleOnChain: async (a, b) =>
+    (await stellar.simulateAndParse<unknown>(config.swapbookContractId, 'get_oracle_price', [
+      StellarClient.toAddress(a),
+      StellarClient.toAddress(b),
+    ])) !== null,
+  ammQuote: async (a, b, amt) => {
+    const best = await computeBestExecution(a, b, amt, 50);
+    if (best.singleKind === 'classic' && best.sdexOut > 0n) {
+      return { amountOut: best.sdexOut, venues: ['Stellar DEX'] };
+    }
+    if (best.route && best.route.netAmountOut > 0n) {
+      return {
+        amountOut: best.route.netAmountOut,
+        venues: [...new Set(best.route.segments.map((seg) => seg.venueName))],
+      };
+    }
+    return null;
+  },
+  bookPlan: async (taker, a, b, amt) => {
+    const plan = await planBookFills(taker, a, b, amt);
+    return { fills: plan.fills.length, amountOut: plan.totalBought, amountInUsed: plan.totalPaid };
+  },
+});
+if (config.rfqContractId) {
+  console.log(`RFQ enabled — ${RFQ_MAKER_KEYS.size} registered maker key(s)`);
+}
 
 // ─── Background Services ───────────────────────────────
 
@@ -515,6 +572,75 @@ function decimalsForSac(sac: string): number {
 }
 
 /** ceil(a * b / d) for bigints — mirrors the contract's rounding. */
+/**
+ * Plan fills against resting SwapBook orders for a taker paying
+ * `amountIn` of tokenIn. Reverse-side fixed-price orders are the
+ * matches; the taker's own orders and orders excluding the taker are
+ * skipped. Organic makers first, protocol-operated (SDF) wallets last so
+ * growing organic volume displaces them. Greedy, ceiling payments —
+ * mirrors the contract's rounding exactly.
+ */
+async function planBookFills(
+  sourceAddress: string,
+  tokenIn: string,
+  tokenOut: string,
+  amountIn: bigint
+): Promise<{
+  fills: Array<{
+    orderId: number;
+    fillAmountIn: bigint; // how much of the reverse order's token we take
+    paymentOut: bigint; // how much of our tokenIn we pay
+    full: boolean;
+  }>;
+  amountToSit: bigint;
+  totalBought: bigint;
+  totalPaid: bigint;
+}> {
+  const candidates = (await fetchOrdersForPair(tokenOut, tokenIn)).filter(
+    (o) =>
+      isOpen(o) &&
+      o.priceMode === 'Fixed' &&
+      o.amountIn > 0n &&
+      o.maker !== sourceAddress &&
+      !o.excluded.includes(sourceAddress)
+  );
+  const reverseOrders = [
+    ...candidates.filter((o) => !SDF_LIQUIDITY_WALLETS.includes(o.maker)),
+    ...candidates.filter((o) => SDF_LIQUIDITY_WALLETS.includes(o.maker)),
+  ];
+
+  let budget = amountIn;
+  const fills: Array<{ orderId: number; fillAmountIn: bigint; paymentOut: bigint; full: boolean }> = [];
+  for (const order of reverseOrders) {
+    if (budget <= 0n) break;
+    const remaining = order.amountInRemaining;
+    if (remaining <= 0n) continue;
+    const fullCost = muldivCeil(order.minAmountOut, remaining, order.amountIn);
+    if (budget >= fullCost) {
+      fills.push({ orderId: order.id, fillAmountIn: remaining, paymentOut: fullCost, full: true });
+      budget -= fullCost;
+    } else {
+      let fillable = (budget * order.amountIn) / order.minAmountOut;
+      if (fillable > remaining) fillable = remaining;
+      while (fillable > 0n) {
+        const cost = muldivCeil(order.minAmountOut, fillable, order.amountIn);
+        if (cost <= budget) {
+          fills.push({ orderId: order.id, fillAmountIn: fillable, paymentOut: cost, full: false });
+          budget -= cost;
+          break;
+        }
+        fillable -= 1n;
+      }
+    }
+  }
+  return {
+    fills,
+    amountToSit: budget,
+    totalBought: fills.reduce((acc, f) => acc + f.fillAmountIn, 0n),
+    totalPaid: fills.reduce((acc, f) => acc + f.paymentOut, 0n),
+  };
+}
+
 function muldivCeil(a: bigint, b: bigint, d: bigint): bigint {
   return (a * b + d - 1n) / d;
 }
@@ -1362,62 +1488,13 @@ app.post('/api/peer-swap/build', async (req, res) => {
       throw new BadRequest('autoRouteMinutes must be a non-negative number');
     }
 
-    // 1. Reverse-side sitting orders are our matches. Skip the taker's
-    //    own orders and any order that excludes this taker (v1.1).
-    const candidates = (await fetchOrdersForPair(tokenOut, tokenIn)).filter(
-      (o) =>
-        isOpen(o) &&
-        o.priceMode === 'Fixed' &&
-        o.amountIn > 0n &&
-        o.maker !== sourceAddress &&
-        !o.excluded.includes(sourceAddress)
+    // 1–2. Match against the standing book (shared with the RFQ reference)
+    const { fills, amountToSit, totalBought, totalPaid } = await planBookFills(
+      sourceAddress,
+      tokenIn,
+      tokenOut,
+      amountInBig
     );
-    // Organic liquidity first; protocol-operated (SDF) wallets are the
-    // fallback — so growing organic volume naturally displaces them.
-    const reverseOrders = [
-      ...candidates.filter((o) => !SDF_LIQUIDITY_WALLETS.includes(o.maker)),
-      ...candidates.filter((o) => SDF_LIQUIDITY_WALLETS.includes(o.maker)),
-    ];
-
-    // 2. Greedy fill planning (ceiling payments — mirrors contract rounding)
-    let budget = amountInBig;
-    const fills: Array<{
-      orderId: number;
-      fillAmountIn: bigint; // how much of the reverse order's token we take
-      paymentOut: bigint;   // how much of our tokenIn we pay
-      full: boolean;
-    }> = [];
-
-    for (const order of reverseOrders) {
-      if (budget <= 0n) break;
-      const remaining = order.amountInRemaining;
-      if (remaining <= 0n) continue;
-
-      // Full-fill cost for the remaining amount (ceil pro-rata)
-      const fullCost = muldivCeil(order.minAmountOut, remaining, order.amountIn);
-
-      if (budget >= fullCost) {
-        fills.push({ orderId: order.id, fillAmountIn: remaining, paymentOut: fullCost, full: true });
-        budget -= fullCost;
-      } else {
-        // Partial: how much can our budget buy at this order's rate?
-        let fillable = (budget * order.amountIn) / order.minAmountOut;
-        if (fillable > remaining) fillable = remaining;
-        while (fillable > 0n) {
-          const cost = muldivCeil(order.minAmountOut, fillable, order.amountIn);
-          if (cost <= budget) {
-            fills.push({ orderId: order.id, fillAmountIn: fillable, paymentOut: cost, full: false });
-            budget -= cost;
-            break;
-          }
-          fillable -= 1n;
-        }
-      }
-    }
-
-    const amountToSit = budget;
-    const totalBought = fills.reduce((s, f) => s + f.fillAmountIn, 0n);
-    const totalPaid = fills.reduce((s, f) => s + f.paymentOut, 0n);
 
     // 3. Shared placement parameters for any escrowed remainder
     const currentLedger = await stellar.getLatestLedger();
@@ -1564,6 +1641,149 @@ app.post('/api/peer-swap/build', async (req, res) => {
     });
   } catch (error) {
     handleError(res, error, 'Failed to build peer swap');
+  }
+});
+
+// ─── RFQ endpoints ──────────────────────────────────────
+//
+// Taker:  POST /api/rfq/request → poll GET /api/rfq/:id → POST /api/rfq/:id/accept
+//         (sign the returned XDR, submit via /api/swap/submit) → POST /api/rfq/:id/settled
+// Maker:  GET /api/rfq/stream (SSE) or GET /api/rfq/open → POST /api/rfq/:id/prepare
+//         → sign the auth entry locally → POST /api/rfq/:id/quote
+
+function rfqMakerAuth(req: any, res: any, next: any): void {
+  const header = req.headers['x-api-key'] ?? req.headers.authorization ?? '';
+  const key = String(header).replace(/^Bearer\s+/i, '').trim();
+  const label = RFQ_MAKER_KEYS.get(key);
+  if (!label) {
+    res.status(401).json({ error: 'invalid or missing maker API key' });
+    return;
+  }
+  req.makerLabel = label;
+  next();
+}
+
+function handleRfqError(res: express.Response, error: unknown, label: string): void {
+  if (error instanceof RfqError) {
+    res.status(error.status).json({ error: error.message });
+    return;
+  }
+  handleError(res, error, label);
+}
+
+/** POST /api/rfq/request — open a request for quotes. */
+app.post('/api/rfq/request', async (req, res) => {
+  try {
+    const taker = parseStellarAccount(req.body.taker, 'taker');
+    await assertNotBlocked(taker);
+    const tokenIn = resolveTokenParam(req.body.tokenIn, 'tokenIn');
+    const tokenOut = resolveTokenParam(req.body.tokenOut, 'tokenOut');
+    const amountIn = parseAmount(req.body.amountIn, 'amountIn');
+    const ttlSec = req.body.ttlSec === undefined ? undefined : Number(req.body.ttlSec);
+    if (ttlSec !== undefined && !Number.isFinite(ttlSec)) {
+      throw new BadRequest('ttlSec must be a number');
+    }
+    res.json({ request: await rfq.createRequest({ taker, tokenIn, tokenOut, amountIn, ttlSec }) });
+  } catch (error) {
+    handleRfqError(res, error, 'Failed to create RFQ');
+  }
+});
+
+/** GET /api/rfq/open — open requests (makers polling instead of SSE). */
+app.get('/api/rfq/open', rfqMakerAuth, (_req, res) => {
+  res.json({ requests: rfq.listOpen() });
+});
+
+/** GET /api/rfq/stream — SSE feed of request.created / request.closed. */
+app.get('/api/rfq/stream', rfqMakerAuth, (req: any, res) => {
+  if (!rfq.enabled) {
+    res.status(503).json({ error: 'RFQ is not enabled on this server' });
+    return;
+  }
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.write(`event: hello\ndata: ${JSON.stringify({ maker: req.makerLabel, open: rfq.listOpen() })}\n\n`);
+  const unsubscribe = rfq.subscribe((ev) => {
+    res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
+  });
+  const heartbeat = setInterval(() => res.write(': hb\n\n'), 15_000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  });
+});
+
+/** GET /api/rfq/:id — request + live quotes (no signed XDR exposed). */
+app.get('/api/rfq/:id', (req, res) => {
+  try {
+    res.json({ request: rfq.get(String(req.params.id)) });
+  } catch (error) {
+    handleRfqError(res, error, 'Failed to read RFQ');
+  }
+});
+
+/** POST /api/rfq/:id/prepare — maker: build the auth entry to sign. */
+app.post('/api/rfq/:id/prepare', rfqMakerAuth, async (req, res) => {
+  try {
+    const maker = parseStellarAccount(req.body.maker, 'maker');
+    await assertNotBlocked(maker);
+    const amountOut = parseAmount(req.body.amountOut, 'amountOut');
+    const ttlLedgers = req.body.ttlLedgers === undefined ? undefined : Number(req.body.ttlLedgers);
+    const maxNavDevBps = req.body.maxNavDevBps === undefined ? undefined : Number(req.body.maxNavDevBps);
+    res.json(await rfq.prepareQuote(String(req.params.id), { maker, amountOut, ttlLedgers, maxNavDevBps }));
+  } catch (error) {
+    handleRfqError(res, error, 'Failed to prepare RFQ quote');
+  }
+});
+
+/** POST /api/rfq/:id/quote — maker: submit the SIGNED auth entry. */
+app.post('/api/rfq/:id/quote', rfqMakerAuth, async (req: any, res) => {
+  try {
+    const signedAuthXdr = req.body.signedAuthXdr;
+    if (typeof signedAuthXdr !== 'string') throw new BadRequest('signedAuthXdr is required');
+    const quote = await rfq.submitQuote(String(req.params.id), {
+      signedAuthXdr,
+      makerLabel: String(req.makerLabel),
+    });
+    res.json({ quote });
+  } catch (error) {
+    handleRfqError(res, error, 'Failed to submit RFQ quote');
+  }
+});
+
+/** POST /api/rfq/:id/accept — taker: get the settlement tx to sign. */
+app.post('/api/rfq/:id/accept', async (req, res) => {
+  try {
+    const quoteId = req.body.quoteId;
+    if (typeof quoteId !== 'string' || !quoteId) throw new BadRequest('quoteId is required');
+    const out = await rfq.accept(String(req.params.id), quoteId);
+    res.json(out);
+  } catch (error) {
+    handleRfqError(res, error, 'Failed to accept RFQ quote');
+  }
+});
+
+/** POST /api/rfq/:id/cancel */
+app.post('/api/rfq/:id/cancel', (req, res) => {
+  try {
+    res.json({ request: rfq.cancel(String(req.params.id)) });
+  } catch (error) {
+    handleRfqError(res, error, 'Failed to cancel RFQ');
+  }
+});
+
+/** POST /api/rfq/:id/settled — taker reports the landed tx hash. */
+app.post('/api/rfq/:id/settled', (req, res) => {
+  try {
+    const hash = String(req.body.hash ?? '');
+    if (!/^[0-9a-f]{64}$/i.test(hash)) throw new BadRequest('hash must be a 64-hex transaction hash');
+    res.json({ request: rfq.markSettled(String(req.params.id), hash.toLowerCase()) });
+  } catch (error) {
+    handleRfqError(res, error, 'Failed to record RFQ settlement');
   }
 });
 
@@ -1981,6 +2201,7 @@ async function assertRelayable(signedXdr: string): Promise<void> {
       config.aquaAdapterContractId,
       config.sushiAdapterContractId,
       config.curveAdapterContractId,
+      config.rfqContractId,
     ].filter(Boolean)
   );
   for (const op of tx.operations) {
@@ -2186,6 +2407,14 @@ app.get('/api/health', async (_req, res) => {
           factory: curveFactoryInUse,
           armed: curveFactoryInUse !== null,
           pools: disc.curvePools,
+        }
+      : null,
+    rfq: config.rfqContractId
+      ? {
+          contract: config.rfqContractId,
+          openRequests: rfq.openCount(),
+          makersConnected: rfq.listenerCount(),
+          makerKeys: RFQ_MAKER_KEYS.size,
         }
       : null,
     // Host only — QuickNode-style RPC URLs carry the API key in the path,

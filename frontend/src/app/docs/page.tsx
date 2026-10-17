@@ -100,6 +100,73 @@ export default function DocsPage() {
         </p>
       </div>
 
+      <h1 style={{ fontSize: '26px', fontWeight: 700, color: '#e1e4ea', margin: '36px 0 6px' }}>
+        RFQ Maker API
+      </h1>
+      <p style={{ ...p, marginBottom: '24px' }}>
+        Quote takers directly with firm prices and settle atomically on-chain. You sign one
+        Soroban authorization entry per quote with <b style={{ color: '#e1e4ea' }}>your own key</b>;
+        Ufama never holds it and never holds funds — there is no escrow. If the taker accepts, their
+        transaction carries your signed entry and both legs settle together or not at all. The
+        protocol fee (0.5 bps) comes out of the taker&apos;s payment leg. Issuers can quote their own
+        assets at NAV; the contract can enforce a NAV band on-chain for pairs with an oracle feed.
+      </p>
+
+      <div style={section}>
+        <div style={h2}>Flow</div>
+        <span style={code}>{`GET  /api/rfq/stream            SSE: request.created / request.closed   (x-api-key)
+GET  /api/rfq/open              same, for pollers                       (x-api-key)
+POST /api/rfq/:id/prepare       -> unsigned auth entry for your quote   (x-api-key)
+     sign it locally: authorizeEntry(entry, keypair, expiryLedger, passphrase)
+POST /api/rfq/:id/quote         { signedAuthXdr }                       (x-api-key)`}</span>
+        <p style={p}>
+          Maker keys are issued manually (same contact as below); the key&apos;s label is the trust
+          badge takers see on your quote card. A reference bot that does all of this is in the repo:{' '}
+          <b>backend/src/rfq/maker-bot.ts</b> (<b>npm run maker</b>).
+        </p>
+      </div>
+
+      <div style={section}>
+        <div style={h2}>POST /api/rfq/:id/prepare</div>
+        <span style={code}>{`{
+  "maker":        "G...",          // the wallet that will sign and deliver
+  "amountOut":    "999500000",     // base units of tokenOut you deliver for request.amountIn
+  "maxNavDevBps": 50,              // optional; 0 = no on-chain NAV check (default 50 when a feed exists)
+  "ttlLedgers":   120              // optional; default = request window + ~1 min grace
+}
+→ {
+  "quote":        { maker, taker, tokenIn, tokenOut, amountIn, amountOut, expiryLedger, nonce, maxNavDevBps },
+  "authEntryXdr": "<SorobanAuthorizationEntry, unsigned>",
+  "check":        { fee, makerReceives, fairOut, vsNavBps }   // what the contract will enforce
+}`}</span>
+        <p style={p}>
+          The server simulates the full settlement with your balances before answering, so a quote
+          you cannot fund, or one outside its NAV band, is refused here with the contract&apos;s own
+          reason. Sign <b>authEntryXdr</b> with <b>validUntilLedgerSeq = quote.expiryLedger</b>.
+        </p>
+      </div>
+
+      <div style={section}>
+        <div style={h2}>POST /api/rfq/:id/quote</div>
+        <span style={code}>{`{ "signedAuthXdr": "<SorobanAuthorizationEntry, signed>" }
+→ { "quote": { id, makerLabel, amountOut, expiryLedger, vsNavBps, status: "live" } }`}</span>
+        <p style={p}>
+          Every submission is verified against the live host in enforce mode (signature, nonce,
+          expiry, balances, NAV band) before the taker sees it. One live quote per maker per
+          request — a re-quote supersedes. Requests carry a <b>reference</b> (NAV from
+          RedStone/Reflector or the on-chain feed, the best DEX route, standing-book fills) so you
+          can price off the same anchor the taker compares against.
+        </p>
+      </div>
+
+      <div style={section}>
+        <div style={h2}>Taker side (public)</div>
+        <span style={code}>{`POST /api/rfq/request          { taker, tokenIn, tokenOut, amountIn, ttlSec? }
+GET  /api/rfq/:id              request + live quotes (no signed XDR exposed)
+POST /api/rfq/:id/accept       { quoteId } → { xdr }   sign with the taker wallet, submit via /api/swap/submit
+POST /api/rfq/:id/settled      { hash }`}</span>
+      </div>
+
       <div style={section}>
         <div style={h2}>Contact</div>
         <p style={{ ...p, marginBottom: 0 }}>
