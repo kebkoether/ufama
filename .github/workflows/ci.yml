@@ -58,6 +58,7 @@ jobs:
           cache-dependency-path: backend/package-lock.json
       - run: npm ci
       - run: npx tsc --noEmit
+      - run: npx vitest run
 
   frontend:
     name: Frontend (typecheck)
