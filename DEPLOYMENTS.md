@@ -130,6 +130,32 @@ builds), the adapter needs a rebuild + redeploy before arming — the
 unarmed venue keeps doing nothing in the meantime. Admin pins
 (`set_pool`) remain available to force a specific pool.
 
+**Curve v1.0.0 review (2026-10-23, private repo `curvefi/stableswap-rs`,
+branch `release/v1.0.0`).** The release matches the adapter exactly:
+`exchange(caller, i, j, dx, min_dy, receiver: MuxedAddress) -> i128` with
+`caller.require_auth()`; the input is pulled by a nested
+`token.transfer(caller -> pool)` (`execute.rs` → `move_coin`), the
+mechanism the adapter pre-authorizes; payouts go to `receiver` (a
+contract address needs no trustline); `get_dy(i,j,dx)`, `get_balances()`,
+`coin_decimals()`, `coins(i)` and the SEP-41 `name` are all present;
+factory `pool_count()` and `pool_registration(i) -> Option<PoolRegistration
+{ pool, coins, coin_decimals, … }>` match discovery and the adapter's
+field-tolerant decoder. No code change needed. Launch facts from their
+`deploy.sh`: one Factory (non-upgradeable, admin = their deploy key),
+one 3-coin implementation, ONE pool at launch, implementation closed
+afterwards. The factory address is deterministic —
+`bash scripts/curve.sh derive <ADMIN>` — so it can be known before
+pool_count > 0. Their SHA256SUMS (CI `wasm` job of the release tag) can be
+pinned into preflight via `EXPECTED_POOL_WASM_SHA256` /
+`EXPECTED_FACTORY_WASM_SHA256`.
+Release/v1.0.0 CI wasm job (run 39804728438, commit 4294412…, 2026-10-22)
+built: factory.wasm 0738851daec0513310d9714f0d2757002f2a1102c22f3b23e9cf340bd1170834;
+pool builds (build order 2-coin then 3-coin per build_release.sh)
+a14b7606884d4a493145600c1538052ef7fbd3ab509302c0be54dbeb06c96984 and
+4cbbec8e3604da9fb1115949ca737f5c26641a9b580974bd37c0980e7192b631. Confirm
+which is pool-coins-3 against their published SHA256SUMS before pinning;
+the launch pool is 3-coin.
+
 Test assets USDC / USDT0 issued by the testnet deployer
 `GBSFQ5KPAH76PGXVG2WIJFOAEYZNUIZDYVWACGLK7JXTBVKDA4H6MGDY`.
 Note: Stellar testnet resets quarterly — these expire with it.
