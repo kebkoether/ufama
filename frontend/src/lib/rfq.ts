@@ -21,6 +21,10 @@ export interface RfqReference {
   navSource: string | null;
   navAgeSec: number | null;
   oracleOnChain: boolean;
+  issuerNavAmountOut: string | null;
+  issuerNavSource: string | null;
+  issuerNavAgeSec: number | null;
+  issuerVsOracleBps: number | null;
   ammAmountOut: string | null;
   ammVsNavBps: number | null;
   ammVenues: string[];

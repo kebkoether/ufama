@@ -141,6 +141,21 @@ export default function RfqPanel(p: Props) {
         {ref.oracleOnChain && (
           <Chip text="NAV band enforced on-chain" color="#6366f1" />
         )}
+        {ref.issuerNavAmountOut && (
+          <div style={{ fontSize: '12px', color: '#8a8f9c', flexBasis: '100%' }}>
+            <span style={{ color: '#565b68' }}>Issuer NAV </span>
+            <strong style={{ color: '#e1e4ea' }}>
+              {fmtOut(ref.issuerNavAmountOut)} {p.tokenOut}
+            </strong>
+            <span style={{ color: '#565b68' }}>
+              {' '}· {ref.issuerNavSource}
+              {ref.issuerNavAgeSec !== null ? ` · ${ageLabel(ref.issuerNavAgeSec)}` : ''}
+              {ref.issuerVsOracleBps !== null
+                ? ` · oracle ${Math.abs(ref.issuerVsOracleBps) < 0.05 ? 'matches' : ref.issuerVsOracleBps > 0 ? `−${ref.issuerVsOracleBps.toFixed(1)} bps vs issuer` : `+${(-ref.issuerVsOracleBps).toFixed(1)} bps vs issuer`}`
+                : ''}
+            </span>
+          </div>
+        )}
         <div style={{ marginLeft: 'auto', fontSize: '12px', color: collecting ? '#6366f1' : '#565b68', fontWeight: 600 }}>
           {collecting
             ? `Collecting quotes · ${p.secondsLeft}s`

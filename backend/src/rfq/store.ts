@@ -21,6 +21,14 @@ export interface RfqReference {
   /** Whether the SwapBook has an on-chain feed for this pair (so a quote
    *  can carry a NAV band and a standing order can be oracle-pegged). */
   oracleOnChain: boolean;
+  /** Issuer-direct NAV (e.g. Etherfuse's mint/redeem price) for the
+   *  same amount, when either side is an issuer-priced RWA; informational
+   *  beside the oracle NAV the contract enforces. */
+  issuerNavAmountOut: string | null;
+  issuerNavSource: string | null;
+  issuerNavAgeSec: number | null;
+  /** Oracle NAV vs issuer NAV, bps (positive = oracle pays less). */
+  issuerVsOracleBps: number | null;
   /** Best AMM/DEX route net output, or null when no route exists. */
   ammAmountOut: string | null;
   ammVsNavBps: number | null;

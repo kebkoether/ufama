@@ -29,6 +29,9 @@ const TTL_MS = 120_000;
 const REFLECTOR_ALIASES: Record<string, string> = {
   USDT0: 'USDT', // bridged Tether — USDT is its fair-value feed
 };
+/** Majors Reflector refreshes every ~5 min — ask it first; RedStone's
+ *  deviation-push feeds for these can sit hours old between heartbeats. */
+const REFLECTOR_FIRST = new Set(['XLM', 'USDC', 'EURC', 'USDT0', 'USDT', 'BTC', 'ETH']);
 
 /** A USD reading with its provenance — the RFQ screen shows NAV age. */
 export interface UsdQuote {
@@ -53,28 +56,28 @@ export class FairValueService {
     const hit = this.cache.get(sac);
     if (hit && Date.now() - hit.at < TTL_MS) return hit.quote;
 
-    // RedStone first (address-keyed — no symbol ambiguity)
-    let quote = await this.lastprice(
-      REDSTONE_ADAPTER,
-      xdr.ScVal.scvVec([
-        xdr.ScVal.scvSymbol('Stellar'),
-        new Address(sac).toScVal(),
-      ]),
-      REDSTONE_DECIMALS,
-      'redstone'
-    );
-    if (quote === null && symbol) {
+    const redstone = () =>
+      this.lastprice(
+        REDSTONE_ADAPTER,
+        xdr.ScVal.scvVec([xdr.ScVal.scvSymbol('Stellar'), new Address(sac).toScVal()]),
+        REDSTONE_DECIMALS,
+        'redstone'
+      );
+    const reflector = () => {
+      if (!symbol) return Promise.resolve(null);
       const alias = REFLECTOR_ALIASES[symbol] ?? symbol;
-      quote = await this.lastprice(
+      return this.lastprice(
         REFLECTOR_EXTERNAL,
-        xdr.ScVal.scvVec([
-          xdr.ScVal.scvSymbol('Other'),
-          xdr.ScVal.scvSymbol(alias),
-        ]),
+        xdr.ScVal.scvVec([xdr.ScVal.scvSymbol('Other'), xdr.ScVal.scvSymbol(alias)]),
         REFLECTOR_DECIMALS,
         'reflector'
       );
-    }
+    };
+    // RedStone is address-keyed (no symbol ambiguity) and covers the RWA
+    // roster, so it leads — except for the majors Reflector keeps fresh.
+    const order = REFLECTOR_FIRST.has((symbol ?? '').toUpperCase()) ? [reflector, redstone] : [redstone, reflector];
+    let quote = await order[0]();
+    if (quote === null) quote = await order[1]();
     this.cache.set(sac, { quote, at: Date.now() });
     return quote;
   }
