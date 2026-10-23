@@ -77,6 +77,10 @@ const MAX_QUOTE_TTL_LEDGERS = 720; // ~1h
 /** Default on-chain NAV band for quotes on pairs with a feed (bps). */
 const DEFAULT_NAV_BAND_BPS = 50;
 const MAX_NAV_BAND_BPS = 1_000;
+/** A request costs a route search + book sweep + oracle reads; one
+ *  taker may hold this many open at once and must space them out. */
+const MAX_OPEN_PER_TAKER = 3;
+const MIN_REQUEST_SPACING_MS = 2_000;
 
 export class RfqService {
   private ledgerSeconds: number;
@@ -123,6 +127,15 @@ export class RfqService {
     );
     const metaIn = this.deps.tokenMeta(input.tokenIn);
     const metaOut = this.deps.tokenMeta(input.tokenOut);
+
+    const mine = this.deps.store.open().filter((r) => r.taker === input.taker);
+    if (mine.length >= MAX_OPEN_PER_TAKER) {
+      throw new RfqError('too many open requests for this taker — accept or cancel one first', 429);
+    }
+    const last = Math.max(0, ...mine.map((r) => r.createdAt));
+    if (Date.now() - last < MIN_REQUEST_SPACING_MS) {
+      throw new RfqError('requests are limited to one every 2 seconds per taker', 429);
+    }
 
     const [ledger, reference] = await Promise.all([
       this.deps.stellar.getLatestLedger(),
@@ -308,7 +321,8 @@ export class RfqService {
     try {
       decoded = decodeQuoteEntry(input.signedAuthXdr, this.deps.rfqContractId);
     } catch (err) {
-      throw new RfqError(explain(err));
+      // Decoder messages are already precise; explain() is for host errors.
+      throw new RfqError(err instanceof Error ? err.message : String(err));
     }
     const f = decoded.quote;
     if (!decoded.signed) throw new RfqError('auth entry is not signed');

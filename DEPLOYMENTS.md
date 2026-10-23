@@ -122,7 +122,27 @@ quote path; the venue was then removed from the testnet Router.
 RfqSettle deployed 2026-10-17: `CBFNGCV7IIZC2E2LUQFLBJU2E4UKG4AINSDWWOU5S64OFKHXTOB74DNB`
 (admin mainnet-deployer, fee_vault CBNI2QR4…HPXP, swap_book CB2KKROC…AEBN,
 fee 5/100k). Code rent for the 11 KB wasm was ~16.6 XLM. Step 1 below is
-done; steps 2–3 remain. On-chain NAV (`fair_value`) answers today for
+done. Steps 2–3 done 2026-10-23: Railway carries RFQ_CONTRACT_ID +
+RFQ_MAKER_KEYS ("SDF Liquidity"); a maker runs from Klint's laptop with
+the dedicated CLI identity `sdf-maker` (GDDSD2TN…6WYS, 50 USDC +
+6 XLM inventory). **First mainnet RFQ settlement 2026-10-23**: taker
+mainnet-tester sold 0.5 XLM for 0.872912 USDC at NAV −5 bps with the
+50 bps on-chain band active (XLM/USDC Reflector feeds), tx
+`d31b07a2…fb0a`. Repeatable: `scripts/rfq-smoke.sh`.
+
+Always-on maker (instead of the laptop): in Railway, add a second
+service from this repo — root directory `backend`, config-as-code
+path `backend/railway.maker.json` (start command runs the bot, no
+healthcheck), variables UFAMA_API_URL (the backend's public URL),
+RFQ_MAKER_KEY (one of RFQ_MAKER_KEYS), RFQ_MAKER_SECRET (the maker
+wallet's S… key — Railway's secret store, nowhere else),
+NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015",
+RFQ_SPREAD_BPS=5, RFQ_MAX_NOTIONAL=50000. One service per maker wallet.
+
+TODO (admin tx, run by Klint): `bash scripts/register-rwa-feeds.sh`
+registers RedStone feeds for USTRY/CETES/TESOURO on the SwapBook so
+those pairs get the NAV band (RedStone publishes all three). Until then
+they quote with band 0. On-chain NAV (`fair_value`) answers today for
 USDC→deJTRSY and USDC→USDY (SwapBook SEP-40 feeds); USDC→USTRY has no
 feed registered on the SwapBook yet, so USTRY quotes run with band 0
 until `set_sep40_feed` adds its RedStone feed.
