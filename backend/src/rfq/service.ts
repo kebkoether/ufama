@@ -63,6 +63,8 @@ export interface RfqServiceDeps {
     tokenOut: string,
     amountIn: bigint
   ) => Promise<{ fills: number; amountOut: bigint; amountInUsed: bigint }>;
+  /** Issuer-direct USD price for a token (symbol + classic issuer), or null. */
+  issuerUsd?: (symbol: string, sac: string) => Promise<{ usd: number; source: string; timestamp: number } | null>;
   /** Ledger close time estimate (seconds). */
   ledgerSeconds?: number;
 }
@@ -494,7 +496,8 @@ export class RfqService {
     metaIn: { symbol: string; decimals: number },
     metaOut: { symbol: string; decimals: number }
   ): Promise<RfqReference> {
-    const [usdIn, usdOut, oracleOnChain, amm, book] = await Promise.all([
+    const issuer = this.deps.issuerUsd ?? (async () => null);
+    const [usdIn, usdOut, oracleOnChain, amm, book, issIn, issOut] = await Promise.all([
       this.deps.fairValue.quoteUsd(tokenIn, metaIn.symbol),
       this.deps.fairValue.quoteUsd(tokenOut, metaOut.symbol),
       this.deps.oracleOnChain(tokenIn, tokenOut).catch(() => false),
@@ -502,6 +505,8 @@ export class RfqService {
       this.deps
         .bookPlan(taker, tokenIn, tokenOut, amountIn)
         .catch(() => ({ fills: 0, amountOut: 0n, amountInUsed: 0n })),
+      issuer(metaIn.symbol, tokenIn).catch(() => null),
+      issuer(metaOut.symbol, tokenOut).catch(() => null),
     ]);
 
     let navAmountOut: bigint | null = null;
@@ -540,6 +545,28 @@ export class RfqService {
       }
     }
 
+    // Issuer NAV: the issuer's own price for whichever side it prices,
+    // the oracle's USD for the other side. Only when at least one side
+    // is issuer-priced; both sides from the issuer when both are.
+    let issuerNavAmountOut: bigint | null = null;
+    let issuerNavSource: string | null = null;
+    let issuerNavAgeSec: number | null = null;
+    if (issIn || issOut) {
+      const pIn = issIn?.usd ?? usdIn?.price ?? null;
+      const pOut = issOut?.usd ?? usdOut?.price ?? null;
+      if (pIn && pOut) {
+        const sIn = BigInt(Math.round(pIn * 1e12));
+        const sOut = BigInt(Math.round(pOut * 1e12));
+        if (sIn > 0n && sOut > 0n) {
+          issuerNavAmountOut =
+            (amountIn * sIn * 10n ** BigInt(metaOut.decimals)) / (sOut * 10n ** BigInt(metaIn.decimals));
+          issuerNavSource = issIn && issOut ? issIn.source : (issIn ?? issOut)!.source;
+          const nowSec = Math.floor(Date.now() / 1000);
+          issuerNavAgeSec = Math.max(...[issIn, issOut].filter(Boolean).map((u) => nowSec - u!.timestamp));
+        }
+      }
+    }
+
     // A fill that uses only part of the budget is compared pro-rata.
     let bookVsNavBps: number | null = null;
     if (navAmountOut && book.amountInUsed > 0n && book.amountOut > 0n) {
@@ -553,6 +580,11 @@ export class RfqService {
       navSource,
       navAgeSec,
       oracleOnChain,
+      issuerNavAmountOut: issuerNavAmountOut?.toString() ?? null,
+      issuerNavSource,
+      issuerNavAgeSec,
+      issuerVsOracleBps:
+        navAmountOut && issuerNavAmountOut ? vsFairBps(issuerNavAmountOut, navAmountOut) : null,
       ammAmountOut: amm?.amountOut ? amm.amountOut.toString() : null,
       ammVsNavBps: navAmountOut && amm?.amountOut ? vsFairBps(navAmountOut, amm.amountOut) : null,
       ammVenues: amm?.venues ?? [],

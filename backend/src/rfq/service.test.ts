@@ -68,6 +68,25 @@ describe('RfqService.createRequest', () => {
     expect(r.decimalsOut).toBe(18);
   });
 
+  it('adds an issuer-direct NAV beside the oracle NAV when the issuer prices a side', async () => {
+    const t = deps({
+      // Issuer says the bond is $10.52 (oracle says $10.50): 1,050 USDC -> 99.8098… bonds
+      issuerUsd: async (symbol: string) =>
+        symbol === 'BOND' ? { usd: 10.52, source: 'etherfuse', timestamp: Math.floor(Date.now() / 1000) - 30 } : null,
+    });
+    const r = await t.service.createRequest({ taker: TAKER, tokenIn: USDC, tokenOut: BOND, amountIn: 1_050_0000000n });
+    expect(r.reference.navAmountOut).toBe((100n * 10n ** 18n).toString());
+    expect(r.reference.issuerNavSource).toBe('etherfuse');
+    expect(BigInt(r.reference.issuerNavAmountOut!)).toBe((1_050n * 10n ** 18n * 10n ** 12n) / 10_520_000_000_000n);
+    // Oracle pays 100 bonds, issuer 99.81: the oracle is ~19 bps generous vs the issuer
+    expect(r.reference.issuerVsOracleBps).toBe(-19);
+    expect(r.reference.issuerNavAgeSec).toBeGreaterThanOrEqual(30);
+    // No issuer coverage -> fields stay null
+    const plain = await s.service.createRequest({ taker: TAKER, tokenIn: USDC, tokenOut: BOND, amountIn: 1_0000000n });
+    expect(plain.reference.issuerNavAmountOut).toBeNull();
+    expect(plain.reference.issuerVsOracleBps).toBeNull();
+  });
+
   it('clamps ttl and refuses degenerate input', async () => {
     const r = await s.service.createRequest({ taker: TAKER, tokenIn: USDC, tokenOut: BOND, amountIn: 1n, ttlSec: 9_999 });
     expect(r.expiresAt - r.createdAt).toBe(120_000);

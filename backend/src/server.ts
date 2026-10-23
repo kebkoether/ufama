@@ -28,6 +28,7 @@ import { assertNotBlocked, isBlocked, BlockedAddressError } from './services/scr
 import { Sep1Verifier } from './services/sep1-verify.js';
 import { FairValueService } from './services/fair-value.js';
 import { RfqStore } from './rfq/store.js';
+import { EtherfuseNavService } from './services/etherfuse-nav.js';
 import { RfqService, RfqError } from './rfq/service.js';
 import { TokenDiscoveryService } from './services/token-discovery.js';
 import { TwapKeeperService } from './services/twap-keeper.js';
@@ -233,6 +234,12 @@ function resolveTokenParam(value: unknown, field: string): string {
   try {
     return resolveSacAddress(value);
   } catch (err) {
+    // Venue-discovered tokens (USTRY, deJTRSY, …) have no curated entry;
+    // accept their symbol too so scripts and partners need not look up
+    // the SAC first. Resolved at request time, after discovery has run.
+    const upper = value.toUpperCase();
+    const hit = tokenDiscovery.getTokens().find((t) => t.symbol.toUpperCase() === upper && t.sacAddress);
+    if (hit) return hit.sacAddress;
     throw new BadRequest((err as Error).message);
   }
 }
@@ -380,6 +387,11 @@ for (const pair of (process.env.RFQ_MAKER_KEYS ?? '').split(',')) {
 }
 const rfqStore = new RfqStore();
 rfqStore.start();
+// Issuer-direct NAV for the Etherfuse stablebonds — shown beside the
+// oracle NAV on every RFQ for those pairs (the issuer's mint/redeem price
+// is the "NAV" a taker ultimately cares about; the oracle is what the
+// contract enforces).
+const etherfuseNav = new EtherfuseNavService();
 const rfq = new RfqService({
   stellar,
   rfqContractId: config.rfqContractId,
@@ -410,6 +422,12 @@ const rfq = new RfqService({
   bookPlan: async (taker, a, b, amt) => {
     const plan = await planBookFills(taker, a, b, amt);
     return { fills: plan.fills.length, amountOut: plan.totalBought, amountInUsed: plan.totalPaid };
+  },
+  issuerUsd: async (symbol, sac) => {
+    if (!symbol) return null;
+    const issuer = tokenDiscovery.getTokens().find((t) => t.sacAddress === sac)?.issuer ?? null;
+    const nav = await etherfuseNav.lookup(symbol, issuer);
+    return nav ? { usd: nav.usd, source: 'etherfuse', timestamp: nav.timestamp } : null;
   },
 });
 if (config.rfqContractId) {
