@@ -11,6 +11,15 @@
 #   bash scripts/curve.sh preflight <FACTORY>    # launch day: verify Curve's mainnet ABI matches
 #   bash scripts/curve.sh arm <FACTORY>          # launch day: set_factory (after preflight passes)
 #   bash scripts/curve.sh status                 # any time: adapter/factory/venue readout
+#   bash scripts/curve.sh derive <ADMIN_G...>    # pre-launch: the factory address Curve's deploy.sh
+#                                                #   will produce for that admin (deterministic salt)
+#
+# Reviewed against curvefi/stableswap-rs release/v1.0.0 (2026-10-23): the
+# ABI this adapter targets is exactly what that release ships — see the
+# "Curve v1.0.0 review" note in DEPLOYMENTS.md. Optional pins for
+# preflight: EXPECTED_POOL_WASM_SHA256 / EXPECTED_FACTORY_WASM_SHA256
+# (from the release's SHA256SUMS) make preflight refuse a pool or factory
+# that is not running the audited release build.
 #
 # Env: NET (mainnet), SRC (mainnet-deployer), ROUTER (mainnet Router),
 #      ADAPTER (for preflight/arm/status; defaults to CURVE_ADAPTER env).
@@ -73,6 +82,18 @@ case "$cmd" in
       echo " pool[0] = $POOL"
       echo "$REG" | grep -q '"coins"' && echo " ✓ registration carries coins[]" || { echo " ✗ registration has no coins[]"; ok=0; }
       PI="$(stellar contract info interface --id "$POOL" --network "$NET" 2>/dev/null)"
+      # Provenance: the pool must name THIS factory (release/v1.0.0 `factory()`).
+      PF="$(view "$POOL" factory | tr -d '"')"
+      [ "$PF" = "$FACTORY" ] && echo " ✓ pool.factory() == $FACTORY" || { echo " ✗ pool.factory() = $PF (expected $FACTORY)"; ok=0; }
+      # Optional: pin the on-chain wasm to the release build's SHA256SUMS.
+      if [ -n "${EXPECTED_POOL_WASM_SHA256:-}" ]; then
+        PH="$(stellar contract fetch --id "$POOL" --network "$NET" 2>/dev/null | sha256sum | cut -d' ' -f1)"
+        [ "$PH" = "$EXPECTED_POOL_WASM_SHA256" ] && echo " ✓ pool wasm sha256 matches release" || { echo " ✗ pool wasm sha256 $PH != expected"; ok=0; }
+      fi
+      if [ -n "${EXPECTED_FACTORY_WASM_SHA256:-}" ]; then
+        FH="$(stellar contract fetch --id "$FACTORY" --network "$NET" 2>/dev/null | sha256sum | cut -d' ' -f1)"
+        [ "$FH" = "$EXPECTED_FACTORY_WASM_SHA256" ] && echo " ✓ factory wasm sha256 matches release" || { echo " ✗ factory wasm sha256 $FH != expected"; ok=0; }
+      fi
       echo "$PI" | grep -q "fn get_dy" && echo " ✓ pool: get_dy" || { echo " ✗ pool: get_dy MISSING"; ok=0; }
       echo "$PI" | grep -q "fn get_balances" && echo " ✓ pool: get_balances" || { echo " ✗ pool: get_balances MISSING"; ok=0; }
       # exchange(caller, i, j, dx, min_dy, receiver) — argument ORDER matters
@@ -114,6 +135,16 @@ case "$cmd" in
     fi
     echo "Backend picks the factory up on its next discovery refresh (≤10 min);"
     echo "watch /api/health → curve.armed:true, curve.pools > 0."
+    ;;
+
+  derive)
+    ADMIN="${2:?usage: curve.sh derive <ADMIN_G...>}"
+    # Curve's scripts/deploy/lib.sh: FACTORY_SALT = sha256("curve-stableswap-factory"),
+    # factory id = deployer(ADMIN).with_salt(SALT). Same admin -> same address, any network.
+    SALT=a0ace7105fb5b2a533369442bb55c1a32e564a072515a950888111c853238254
+    echo "Curve factory for admin $ADMIN on $NET:"
+    echo "  $(stellar contract id wasm --network "$NET" --salt "$SALT" --source-account "$ADMIN" 2>/dev/null)"
+    echo "Once Curve announces the admin key, this is the FACTORY to preflight/arm the moment pool_count > 0."
     ;;
 
   status)
