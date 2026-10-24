@@ -888,6 +888,23 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     [onRouteComputed, tokenParam]
   );
 
+  // RFQ tab: price the pair against NAV as the taker types (no request
+  // opened yet). Cleared when the amount is empty.
+  useEffect(() => {
+    if (mode !== 'p2p') return;
+    if (!amountIn || parseFloat(amountIn) <= 0) {
+      rfq.previewFor(null);
+      return;
+    }
+    rfq.previewFor({
+      tokenIn: tokenParam(tokenIn),
+      tokenOut: tokenParam(tokenOut),
+      amountIn: toBaseUnits(amountIn, decimalsOf(tokenIn)),
+      taker: walletAddress || undefined,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, amountIn, tokenIn, tokenOut, walletAddress]);
+
   // Trigger auto-quote when amount/tokens change in instant mode
   useEffect(() => {
     if (mode === 'instant' || mode === 'twap') {
@@ -1288,7 +1305,17 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
 
         {/* Buying */}
         <InputPanel
-          label={mode === 'instant' ? 'Buying' : mode === 'p2p' && rfq.quotes.length > 0 ? 'Buying (best firm quote)' : 'Buying (estimated)'}
+          label={
+            mode === 'instant'
+              ? 'Buying'
+              : mode === 'p2p' && rfq.quotes.length > 0
+              ? 'Buying (best firm quote)'
+              : mode === 'p2p' && (rfq.request?.reference.navAmountOut || rfq.preview?.navAmountOut)
+              ? 'Buying (at NAV, estimated)'
+              : mode === 'p2p' && rfq.preview?.ammAmountOut
+              ? 'Buying (DEX estimate)'
+              : 'Buying (estimated)'
+          }
           sublabel={loading ? 'Fetching...' : balanceLabel(tokenOut)}
           value={
             (mode === 'instant' || mode === 'twap') && !quote && loading
@@ -1300,7 +1327,11 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
                 ? formatOutput(rfq.quotes[0].amountOut)
                 : rfq.request?.reference.navAmountOut
                 ? `~${formatOutput(rfq.request.reference.navAmountOut)}`
-                : `~${parseFloat(amountIn).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                : rfq.preview?.navAmountOut
+                ? `~${formatOutput(rfq.preview.navAmountOut)}`
+                : rfq.preview?.ammAmountOut
+                ? `~${formatOutput(rfq.preview.ammAmountOut)}`
+                : '…'
               : ''
           }
           readOnly
@@ -1491,6 +1522,8 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
             {/* RFQ: reference strip, live quote cards, fallbacks */}
             <RfqPanel
               request={rfq.request}
+              preview={rfq.preview}
+              previewLoading={rfq.previewLoading}
               phase={rfq.phase}
               error={rfq.error}
               secondsLeft={rfq.secondsLeft}

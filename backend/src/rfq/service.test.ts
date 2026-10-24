@@ -131,6 +131,30 @@ describe('RfqService.createRequest', () => {
   });
 });
 
+describe('RfqService.preview', () => {
+  it('returns the reference without opening a request, and caches it briefly', async () => {
+    let calls = 0;
+    const t = deps({
+      ammQuote: async () => {
+        calls++;
+        return { amountOut: 99_500_000_000_000_000_000n, venues: ['Aqua'] };
+      },
+    });
+    const a = await t.service.preview({ tokenIn: USDC, tokenOut: BOND, amountIn: 1_050_0000000n });
+    expect(a.navAmountOut).toBe((100n * 10n ** 18n).toString());
+    expect(a.symbolOut).toBe('BOND');
+    expect(a.decimalsOut).toBe(18);
+    expect(t.store.openCount()).toBe(0);
+    const b = await t.service.preview({ tokenIn: USDC, tokenOut: BOND, amountIn: 1_050_0000000n });
+    expect(b).toBe(a);
+    expect(calls).toBe(1);
+    // a different amount is a different preview
+    await t.service.preview({ tokenIn: USDC, tokenOut: BOND, amountIn: 2_000_0000000n });
+    expect(calls).toBe(2);
+    await expect(t.service.preview({ tokenIn: USDC, tokenOut: USDC, amountIn: 1n })).rejects.toThrow(/must differ/);
+  });
+});
+
 describe('RfqService quote intake', () => {
   it('rejects malformed and mismatched signed entries before touching the network', async () => {
     const s = deps();

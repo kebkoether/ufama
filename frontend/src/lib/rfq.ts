@@ -82,6 +82,28 @@ export async function createRfq(body: {
   return (await post<{ request: RfqRequest }>('/api/rfq/request', body)).request;
 }
 
+export type RfqPreview = RfqReference & {
+  symbolIn: string;
+  symbolOut: string;
+  decimalsIn: number;
+  decimalsOut: number;
+};
+
+/** Reference for a pair/amount without opening a request. */
+export async function getRfqReference(params: {
+  tokenIn: string;
+  tokenOut: string;
+  amountIn: string;
+  taker?: string;
+}): Promise<RfqPreview> {
+  const q = new URLSearchParams({ tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn });
+  if (params.taker) q.set('taker', params.taker);
+  const res = await fetch(`${API_BASE}/api/rfq/reference?${q}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `RFQ reference failed: ${res.statusText}`);
+  return data.reference as RfqPreview;
+}
+
 export async function getRfq(id: string): Promise<RfqRequest> {
   const res = await fetch(`${API_BASE}/api/rfq/${id}`);
   const data = await res.json().catch(() => ({}));
@@ -113,6 +135,10 @@ export function acceptableQuotes(r: RfqRequest | null, now = Date.now()): RfqQuo
 
 export function useRfq() {
   const [request, setRequest] = useState<RfqRequest | null>(null);
+  const [preview, setPreview] = useState<RfqPreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const previewSeq = useRef(0);
+  const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [phase, setPhase] = useState<RfqPhase>('idle');
   const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -141,6 +167,34 @@ export function useRfq() {
     setPhase('idle');
     setError(null);
   }, [stopPolling]);
+
+  /**
+   * Debounced reference preview for the pair/amount being typed. Pass
+   * null to clear (empty amount). Stale responses are dropped.
+   */
+  const previewFor = useCallback(
+    (params: { tokenIn: string; tokenOut: string; amountIn: string; taker?: string } | null) => {
+      if (previewTimer.current) clearTimeout(previewTimer.current);
+      const seq = ++previewSeq.current;
+      if (!params) {
+        setPreview(null);
+        setPreviewLoading(false);
+        return;
+      }
+      setPreviewLoading(true);
+      previewTimer.current = setTimeout(async () => {
+        try {
+          const ref = await getRfqReference(params);
+          if (seq === previewSeq.current) setPreview(ref);
+        } catch {
+          if (seq === previewSeq.current) setPreview(null);
+        } finally {
+          if (seq === previewSeq.current) setPreviewLoading(false);
+        }
+      }, 450);
+    },
+    []
+  );
 
   const start = useCallback(
     async (params: { taker: string; tokenIn: string; tokenOut: string; amountIn: string; ttlSec?: number }) => {
@@ -218,5 +272,5 @@ export function useRfq() {
   const secondsLeft = request ? Math.max(0, Math.ceil((request.expiresAt - now) / 1000)) : 0;
   const quotes = acceptableQuotes(request, now);
 
-  return { request, phase, error, secondsLeft, quotes, now, start, cancel, accept, reset };
+  return { request, preview, previewLoading, previewFor, phase, error, secondsLeft, quotes, now, start, cancel, accept, reset };
 }
