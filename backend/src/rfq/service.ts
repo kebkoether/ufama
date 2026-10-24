@@ -83,6 +83,11 @@ const MAX_NAV_BAND_BPS = 1_000;
  *  taker may hold this many open at once and must space them out. */
 const MAX_OPEN_PER_TAKER = 3;
 const MIN_REQUEST_SPACING_MS = 2_000;
+/** Previews are cheap to repeat but cost a route search; cache briefly. */
+const PREVIEW_TTL_MS = 8_000;
+/** Book sweeps skip the taker's own orders; previews without a wallet
+ *  use a placeholder that owns none. */
+const PREVIEW_TAKER = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 
 export class RfqService {
   private ledgerSeconds: number;
@@ -167,6 +172,47 @@ export class RfqService {
     this.deps.store.insert(req);
     return toPublic(req);
   }
+
+  /**
+   * The reference a request WOULD carry, without opening one — what the
+   * tab shows while the taker is still typing (NAV, issuer NAV, DEX
+   * route, standing-book fills). Cached briefly per (pair, amount, taker).
+   */
+  async preview(input: {
+    taker?: string;
+    tokenIn: string;
+    tokenOut: string;
+    amountIn: bigint;
+  }): Promise<RfqReference & { symbolIn: string; symbolOut: string; decimalsIn: number; decimalsOut: number }> {
+    this.assertEnabled();
+    if (input.tokenIn === input.tokenOut) throw new RfqError('tokenIn and tokenOut must differ');
+    if (input.amountIn <= 0n) throw new RfqError('amountIn must be positive');
+    const key = `${input.taker ?? ''}|${input.tokenIn}|${input.tokenOut}|${input.amountIn}`;
+    const hit = this.previewCache.get(key);
+    if (hit && Date.now() - hit.at < PREVIEW_TTL_MS) return hit.value;
+    const metaIn = this.deps.tokenMeta(input.tokenIn);
+    const metaOut = this.deps.tokenMeta(input.tokenOut);
+    const reference = await this.buildReference(
+      input.taker ?? PREVIEW_TAKER,
+      input.tokenIn,
+      input.tokenOut,
+      input.amountIn,
+      metaIn,
+      metaOut
+    );
+    const value = {
+      ...reference,
+      symbolIn: metaIn.symbol,
+      symbolOut: metaOut.symbol,
+      decimalsIn: metaIn.decimals,
+      decimalsOut: metaOut.decimals,
+    };
+    if (this.previewCache.size > 500) this.previewCache.clear();
+    this.previewCache.set(key, { at: Date.now(), value });
+    return value;
+  }
+
+  private previewCache = new Map<string, { at: number; value: any }>();
 
   get(id: string): PublicRequest {
     const r = this.require(id);

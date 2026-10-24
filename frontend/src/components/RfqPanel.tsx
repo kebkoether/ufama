@@ -15,10 +15,13 @@
  */
 
 import { formatUnits } from '@/lib/units';
-import type { RfqRequest, RfqQuote, RfqPhase } from '@/lib/rfq';
+import type { RfqRequest, RfqQuote, RfqPhase, RfqReference } from '@/lib/rfq';
 
 interface Props {
   request: RfqRequest | null;
+  /** Reference for the pair/amount being typed, before any request. */
+  preview: RfqReference | null;
+  previewLoading: boolean;
   phase: RfqPhase;
   error: string | null;
   secondsLeft: number;
@@ -92,17 +95,71 @@ export default function RfqPanel(p: Props) {
   const fmtIn = (raw: string) => formatUnits(raw, p.decimalsIn);
 
   if (phase === 'idle' || !r) {
+    const pre = p.preview;
     return (
-      <div style={{ ...card, background: 'rgba(99, 102, 241, 0.06)', border: '1px solid rgba(99, 102, 241, 0.15)' }}>
-        <div style={{ fontSize: '12px', fontWeight: 700, color: '#6366f1', marginBottom: '4px' }}>REQUEST FOR QUOTE</div>
-        <div style={{ fontSize: '13px', color: '#8a8f9c', lineHeight: 1.5 }}>
-          Makers answer within seconds with firm prices pinned to NAV. Accept one and both legs
-          settle in a single transaction — <strong style={{ color: '#e1e4ea' }}>no escrow</strong>,{' '}
-          <strong style={{ color: '#22c55e' }}>0.5 bps</strong> fee. Nobody answers? Post a
-          standing order at NAV or take the DEX route.
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+        <div style={{ ...card, background: 'rgba(99, 102, 241, 0.06)', border: '1px solid rgba(99, 102, 241, 0.15)' }}>
+          <div style={{ fontSize: '12px', fontWeight: 700, color: '#6366f1', marginBottom: '4px' }}>REQUEST FOR QUOTE</div>
+          <div style={{ fontSize: '13px', color: '#8a8f9c', lineHeight: 1.5 }}>
+            Makers answer within seconds with firm prices pinned to NAV. Accept one and both legs
+            settle in a single transaction — <strong style={{ color: '#e1e4ea' }}>no escrow</strong>,{' '}
+            <strong style={{ color: '#22c55e' }}>0.5 bps</strong> fee. Nobody answers? Post a
+            standing order at NAV or take the DEX route.
+          </div>
+          {phase === 'idle' && p.error && (
+            <div style={{ marginTop: '8px', fontSize: '12px', color: '#ef4444' }}>{p.error}</div>
+          )}
         </div>
-        {phase === 'idle' && p.error && (
-          <div style={{ marginTop: '8px', fontSize: '12px', color: '#ef4444' }}>{p.error}</div>
+        {/* Reference for what's being typed — the same anchor the quotes will be judged against */}
+        {(pre || p.previewLoading) && (
+          <div style={{ ...card, display: 'flex', flexWrap: 'wrap', gap: '8px 16px', alignItems: 'center' }}>
+            {p.previewLoading && !pre ? (
+              <span style={{ fontSize: '12px', color: '#8a8f9c' }}>Pricing against NAV…</span>
+            ) : pre ? (
+              <>
+                <div style={{ fontSize: '12px', color: '#8a8f9c' }}>
+                  <span style={{ color: '#565b68' }}>NAV </span>
+                  {pre.navPrice !== null && pre.navAmountOut ? (
+                    <>
+                      <strong style={{ color: '#e1e4ea' }}>
+                        {fmtOut(pre.navAmountOut)} {p.tokenOut}
+                      </strong>
+                      <span style={{ color: '#565b68' }}>
+                        {' '}· 1 {p.tokenIn} = {pre.navPrice.toLocaleString('en-US', { maximumSignificantDigits: 6 })} {p.tokenOut}
+                        {' '}· {pre.navSource === 'swapbook' ? 'on-chain feed' : pre.navSource}
+                        {pre.navAgeSec !== null ? ` · ${ageLabel(pre.navAgeSec)}` : ''}
+                      </span>
+                    </>
+                  ) : (
+                    <span style={{ color: '#eab308' }}>no oracle feed for this pair — quotes will show raw output only</span>
+                  )}
+                </div>
+                {pre.issuerNavAmountOut && (
+                  <div style={{ fontSize: '12px', color: '#8a8f9c', flexBasis: '100%' }}>
+                    <span style={{ color: '#565b68' }}>Issuer NAV </span>
+                    <strong style={{ color: '#e1e4ea' }}>{fmtOut(pre.issuerNavAmountOut)} {p.tokenOut}</strong>
+                    <span style={{ color: '#565b68' }}> · {pre.issuerNavSource}</span>
+                  </div>
+                )}
+                {pre.ammAmountOut && (
+                  <div style={{ fontSize: '12px', color: '#8a8f9c', flexBasis: '100%' }}>
+                    <span style={{ color: '#565b68' }}>DEX route </span>
+                    <strong style={{ color: '#e1e4ea' }}>{fmtOut(pre.ammAmountOut)} {p.tokenOut}</strong>
+                    <span style={{ color: navColor(pre.ammVsNavBps), fontWeight: 600 }}> {navLabel(pre.ammVsNavBps)}</span>
+                    <span style={{ color: '#565b68' }}> · {pre.ammVenues.join(' + ')}</span>
+                  </div>
+                )}
+                {pre.bookFills > 0 && pre.bookAmountOut && (
+                  <div style={{ fontSize: '12px', color: '#8a8f9c', flexBasis: '100%' }}>
+                    <span style={{ color: '#565b68' }}>Standing orders </span>
+                    <strong style={{ color: '#e1e4ea' }}>{fmtOut(pre.bookAmountOut)} {p.tokenOut}</strong>
+                    <span style={{ color: navColor(pre.bookVsNavBps), fontWeight: 600 }}> {navLabel(pre.bookVsNavBps)}</span>
+                  </div>
+                )}
+                {pre.oracleOnChain && <Chip text="NAV band enforced on-chain" color="#6366f1" />}
+              </>
+            ) : null}
+          </div>
         )}
       </div>
     );

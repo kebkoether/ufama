@@ -1707,6 +1707,24 @@ app.post('/api/rfq/request', async (req, res) => {
   }
 });
 
+/** GET /api/rfq/reference?tokenIn&tokenOut&amountIn[&taker] — the
+ *  reference (NAV, issuer NAV, DEX route, book fills) without opening a
+ *  request; drives the tab's estimate while the taker types. */
+app.get('/api/rfq/reference', async (req, res) => {
+  try {
+    const tokenIn = resolveTokenParam(req.query.tokenIn, 'tokenIn');
+    const tokenOut = resolveTokenParam(req.query.tokenOut, 'tokenOut');
+    const amountIn = parseAmount(req.query.amountIn, 'amountIn');
+    const taker =
+      typeof req.query.taker === 'string' && req.query.taker
+        ? parseStellarAccount(req.query.taker, 'taker')
+        : undefined;
+    res.json({ reference: await rfq.preview({ taker, tokenIn, tokenOut, amountIn }) });
+  } catch (error) {
+    handleRfqError(res, error, 'Failed to build RFQ reference');
+  }
+});
+
 /** GET /api/rfq/open — open requests (makers polling instead of SSE). */
 app.get('/api/rfq/open', rfqMakerAuth, (_req, res) => {
   res.json({ requests: rfq.listOpen() });
