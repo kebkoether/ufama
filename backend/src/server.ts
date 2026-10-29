@@ -11,6 +11,7 @@
  */
 
 import 'dotenv/config';
+import { readFileSync } from 'node:fs';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -2404,6 +2405,17 @@ app.get('/api/screen/:address', async (req, res) => {
 });
 
 const bootedAt = Date.now();
+/** GET /openapi.yaml — the API contract (also what @ufama/sdk wraps). */
+let openapiCache: string | null = null;
+app.get('/openapi.yaml', (_req, res) => {
+  try {
+    openapiCache ??= readFileSync(new URL('../openapi.yaml', import.meta.url), 'utf8');
+    res.type('application/yaml').send(openapiCache);
+  } catch {
+    res.status(404).json({ error: 'openapi.yaml not bundled with this build' });
+  }
+});
+
 app.get('/api/health', async (_req, res) => {
   const venues = await registry.getAvailable();
   const disc = tokenDiscovery.getStatus();

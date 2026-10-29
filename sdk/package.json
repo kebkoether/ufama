@@ -1,0 +1,35 @@
+{
+  "name": "@ufama/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript client for the ufama API: instant swaps for integrators, and both sides of the RFQ (takers and makers) with local quote signing.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@stellar/stellar-sdk": "^17.2.1"
+  },
+  "devDependencies": {
+    "@stellar/stellar-sdk": "^17.2.1",
+    "typescript": "^5.4.0",
+    "vitest": "^1.2.0"
+  }
+}

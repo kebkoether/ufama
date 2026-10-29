@@ -38,6 +38,15 @@ export default function DocsPage() {
       </p>
 
       <div style={section}>
+        <div style={h2}>SDK &amp; OpenAPI</div>
+        <p style={p}>
+          TypeScript client for every surface on this page (integrator swaps, RFQ taker, RFQ maker with
+          local quote signing): <b>@ufama/sdk</b> in the repo under <b>sdk/</b>. The full contract is
+          served at <b>{API_BASE}/openapi.yaml</b> — generate a client in any language from it.
+        </p>
+      </div>
+
+      <div style={section}>
         <div style={h2}>Base URL &amp; auth</div>
         <span style={code}>{API_BASE}</span>
         <p style={p}>
