@@ -24,7 +24,9 @@
  */
 
 import 'dotenv/config';
-import { Keypair, authorizeEntry, xdr } from '@stellar/stellar-sdk';
+import { Keypair, authorizeEntry, xdr, Horizon, TransactionBuilder } from '@stellar/stellar-sdk';
+import { EtherfuseClient, EtherfuseEnv } from '../services/etherfuse-client.js';
+import { Restocker, RestockTarget } from './restock.js';
 
 const API = (process.env.UFAMA_API_URL ?? 'http://localhost:3001').replace(/\/$/, '');
 const KEY = process.env.RFQ_MAKER_KEY ?? '';
@@ -196,4 +198,77 @@ function logErr(err: unknown): void {
   console.error('[maker] error:', err instanceof Error ? err.message : err);
 }
 
+/**
+ * Optional: keep bond inventory topped up from the issuer's primary
+ * market (Etherfuse v2). Enabled when ETHERFUSE_API_KEY is set.
+ *
+ *   ETHERFUSE_API_KEY=api_prod:…      (or api_sand:… with ETHERFUSE_ENV=sand)
+ *   ETHERFUSE_ENV=prod|sand
+ *   ETHERFUSE_ORG_ID=<uuid>
+ *   ETHERFUSE_PAYMENT_ACCOUNT_ID=<uuid of this wallet on Etherfuse; omitted = register it>
+ *   RESTOCK_SOURCE_ASSET=USDC:GA5ZSEJ…   (what we spend)
+ *   RESTOCK_TARGETS='[{"symbol":"USTRY","asset":"USTRY:GCRYUGD5…","minBalance":50,"spend":"100"}]'
+ *   RESTOCK_INTERVAL_SEC=60
+ */
+async function startRestock(): Promise<void> {
+  const key = process.env.ETHERFUSE_API_KEY ?? '';
+  if (!key) return;
+  const env = (process.env.ETHERFUSE_ENV ?? 'prod') as EtherfuseEnv;
+  const org = process.env.ETHERFUSE_ORG_ID ?? '';
+  const sourceAsset = process.env.RESTOCK_SOURCE_ASSET ?? '';
+  let targets: RestockTarget[] = [];
+  try {
+    targets = JSON.parse(process.env.RESTOCK_TARGETS ?? '[]');
+  } catch {
+    console.error('[restock] RESTOCK_TARGETS is not valid JSON');
+    return;
+  }
+  if (!org || !sourceAsset || targets.length === 0) {
+    console.error('[restock] ETHERFUSE_ORG_ID, RESTOCK_SOURCE_ASSET and RESTOCK_TARGETS are required');
+    return;
+  }
+  const ef = new EtherfuseClient({ apiKey: key, env, organizationId: org });
+  const me = await ef.me().catch((e) => {
+    console.error('[restock] Etherfuse key check failed:', e instanceof Error ? e.message : e);
+    return null;
+  });
+  if (!me) return;
+  let paymentAccountId = process.env.ETHERFUSE_PAYMENT_ACCOUNT_ID ?? '';
+  if (!paymentAccountId) {
+    const pa = await ef.registerStellarWallet(signer.publicKey(), 'ufama maker');
+    paymentAccountId = pa.id;
+    console.log(`[restock] registered maker wallet on Etherfuse as payment account ${pa.id} (${pa.status})`);
+  }
+  const horizonUrl = PASSPHRASE.startsWith('Public') ? 'https://horizon.stellar.org' : 'https://horizon-testnet.stellar.org';
+  const horizon = new Horizon.Server(horizonUrl);
+  const restocker = new Restocker({
+    etherfuse: ef,
+    paymentAccountId,
+    sourceAsset,
+    targets,
+    balances: async () => {
+      const acct = await horizon.loadAccount(signer.publicKey());
+      const out: Record<string, number> = {};
+      for (const b of acct.balances as any[]) {
+        const sym = b.asset_type === 'native' ? 'XLM' : String(b.asset_code ?? '');
+        if (sym) out[sym] = (out[sym] ?? 0) + Number(b.balance);
+      }
+      return out;
+    },
+    signAndSubmit: async (unsignedXdr) => {
+      const tx = TransactionBuilder.fromXdr(unsignedXdr, PASSPHRASE);
+      tx.sign(signer);
+      const res = await horizon.submitTransaction(tx);
+      return res.hash;
+    },
+    log: (m) => console.log(m),
+  });
+  const interval = Number(process.env.RESTOCK_INTERVAL_SEC ?? '60') * 1000;
+  console.log(`[restock] on (${env}, every ${interval / 1000}s): ${targets.map((t) => `${t.symbol}<${t.minBalance}`).join(', ')}`);
+  const run = () => restocker.tick().catch((e) => console.error('[restock] tick failed:', e instanceof Error ? e.message : e));
+  void run();
+  setInterval(run, interval);
+}
+
 stream();
+void startRestock();
