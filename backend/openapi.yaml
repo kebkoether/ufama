@@ -1,0 +1,506 @@
+openapi: 3.1.0
+info:
+  title: ufama API
+  version: 1.0.0
+  description: |
+    Public REST surface of ufama, the cheapest swap on Stellar.
+
+    Three roles:
+    - **Integrators** (`/v1`, API key): quote → build → *your user signs* → send.
+    - **RFQ takers** (public): request firm quotes pinned to NAV, accept one, settle atomically.
+    - **RFQ makers** (maker API key): answer requests with quotes signed by your own key.
+
+    ufama never holds keys or funds. Amounts are strings in the token's base units
+    (7 decimals for classic assets, 18 for deRWA tokens, 8 for SolvBTC — see `/api/assets`).
+    A TypeScript client is published as `@ufama/sdk`.
+  contact:
+    email: hello@ufama.trade
+servers:
+  - url: https://atomicswap-aggregator-production.up.railway.app
+    description: Production (Stellar mainnet)
+security: []
+tags:
+  - name: Public
+  - name: RFQ taker
+  - name: RFQ maker
+  - name: Integrator v1
+
+components:
+  securitySchemes:
+    integratorKey:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: Integrator key (INTEGRATOR_API_KEYS). `Authorization: Bearer <key>` is also accepted.
+    makerKey:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: RFQ maker key (RFQ_MAKER_KEYS). The key's label is the badge takers see.
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+      required: [error]
+    Asset:
+      type: object
+      properties:
+        symbol: { type: string }
+        name: { type: string }
+        sacAddress: { type: string, description: Soroban contract address (SAC for classic assets) }
+        issuer: { type: string, nullable: true, description: Classic issuer G-address, absent for Soroban-native tokens }
+        decimals: { type: integer }
+        status: { type: string, enum: [live, coming_soon] }
+        verified: { type: boolean }
+        venueVolume: { type: number }
+        twapEligible: { type: boolean }
+    Token:
+      type: object
+      properties:
+        symbol: { type: string }
+        name: { type: string }
+        contract: { type: string }
+        issuer: { type: string, nullable: true }
+        decimals: { type: integer }
+        verified: { type: boolean }
+        venueVolume: { type: number }
+    RouteSegment:
+      type: object
+      properties:
+        venue: { type: string }
+        amountIn: { type: string }
+        expectedOut: { type: string }
+    IntegratorQuote:
+      type: object
+      properties:
+        assetIn: { type: string }
+        assetOut: { type: string }
+        amountIn: { type: string }
+        amountOut: { type: string, description: Net of partner fee }
+        partnerFee: { type: string }
+        partnerFeeCollected: { type: boolean }
+        minAmountOut: { type: string }
+        kind: { type: string, enum: [classic, soroban] }
+        priceImpactBps: { type: number }
+        priceImpactWarning: { type: boolean }
+        priceImpactBlocked: { type: boolean }
+        segments:
+          type: array
+          items: { $ref: '#/components/schemas/RouteSegment' }
+    IntegratorBuild:
+      type: object
+      properties:
+        xdr: { type: string, description: Unsigned transaction envelope for the user's wallet to sign }
+        kind: { type: string, enum: [classic, soroban] }
+        partnerFee: { type: string }
+        partnerFeeCollected: { type: boolean }
+        expectedOut: { type: string }
+    SendResult:
+      type: object
+      properties:
+        status: { type: string }
+        hash: { type: string }
+        result: { type: object }
+    RfqReference:
+      type: object
+      description: Pricing anchors for one pair and amount. `vs…Bps` are signed: positive = that source pays LESS than oracle NAV.
+      properties:
+        navAmountOut: { type: string, nullable: true, description: Oracle NAV of amountIn in tokenOut base units }
+        navPrice: { type: number, nullable: true, description: tokenOut per 1 tokenIn }
+        navSource: { type: string, nullable: true, description: redstone | reflector | swapbook | combinations }
+        navAgeSec: { type: integer, nullable: true }
+        oracleOnChain: { type: boolean, description: SwapBook has a feed for this pair → quotes can carry an on-chain NAV band }
+        issuerNavAmountOut: { type: string, nullable: true, description: Issuer-direct NAV (e.g. Etherfuse mint/redeem price) }
+        issuerNavSource: { type: string, nullable: true }
+        issuerNavAgeSec: { type: integer, nullable: true }
+        issuerVsOracleBps: { type: number, nullable: true }
+        ammAmountOut: { type: string, nullable: true, description: Best DEX/AMM route net output }
+        ammVsNavBps: { type: number, nullable: true }
+        ammVenues: { type: array, items: { type: string } }
+        bookAmountOut: { type: string, nullable: true, description: Standing-order fills available now }
+        bookAmountInUsed: { type: string, nullable: true }
+        bookVsNavBps: { type: number, nullable: true }
+        bookFills: { type: integer }
+    RfqPreview:
+      allOf:
+        - $ref: '#/components/schemas/RfqReference'
+        - type: object
+          properties:
+            symbolIn: { type: string }
+            symbolOut: { type: string }
+            decimalsIn: { type: integer }
+            decimalsOut: { type: integer }
+    RfqQuote:
+      type: object
+      properties:
+        id: { type: string }
+        requestId: { type: string }
+        maker: { type: string, description: Maker wallet G-address }
+        makerLabel: { type: string, description: Registered maker label (trust badge) }
+        amountOut: { type: string }
+        expiryLedger: { type: integer, description: Last ledger the quote settles at (also the signature expiry) }
+        expiresAt: { type: integer, description: Wall-clock estimate, ms since epoch }
+        nonce: { type: string }
+        maxNavDevBps: { type: integer, description: On-chain NAV band the contract enforces; 0 = none }
+        vsNavBps: { type: number, nullable: true, description: Positive = taker receives less than oracle NAV }
+        status: { type: string, enum: [live, accepted, superseded, expired, rejected] }
+        receivedAt: { type: integer }
+    RfqRequest:
+      type: object
+      properties:
+        id: { type: string }
+        taker: { type: string }
+        tokenIn: { type: string }
+        tokenOut: { type: string }
+        symbolIn: { type: string }
+        symbolOut: { type: string }
+        decimalsIn: { type: integer }
+        decimalsOut: { type: integer }
+        amountIn: { type: string }
+        createdAt: { type: integer }
+        expiresAt: { type: integer, description: End of the quote-collection window (ms). Live quotes stay acceptable for a grace period after it. }
+        ledgerAtCreate: { type: integer }
+        status: { type: string, enum: [open, accepted, settled, expired, cancelled] }
+        reference: { $ref: '#/components/schemas/RfqReference' }
+        quotes:
+          type: array
+          items: { $ref: '#/components/schemas/RfqQuote' }
+        acceptedQuoteId: { type: string, nullable: true }
+        settledHash: { type: string, nullable: true }
+    RfqQuoteFields:
+      type: object
+      description: The exact struct the maker signs (settle_quote argument).
+      properties:
+        maker: { type: string }
+        taker: { type: string }
+        tokenIn: { type: string }
+        tokenOut: { type: string }
+        amountIn: { type: string }
+        amountOut: { type: string }
+        expiryLedger: { type: integer }
+        nonce: { type: string }
+        maxNavDevBps: { type: integer }
+    RfqPrepareResponse:
+      type: object
+      properties:
+        quote: { $ref: '#/components/schemas/RfqQuoteFields' }
+        authEntryXdr: { type: string, description: Unsigned SorobanAuthorizationEntry (base64). Sign with validUntilLedgerSeq = quote.expiryLedger. }
+        check:
+          type: object
+          description: What the contract will enforce, from an on-chain `check_quote` simulation.
+          properties:
+            fee: { type: string }
+            makerReceives: { type: string }
+            fairOut: { type: string, nullable: true }
+            vsNavBps: { type: number, nullable: true }
+
+paths:
+  /api/health:
+    get:
+      tags: [Public]
+      summary: Service health, venues, contracts, RFQ readout
+      responses:
+        '200': { description: ok or degraded }
+        '503': { description: warming up after deploy }
+  /api/assets:
+    get:
+      tags: [Public]
+      summary: Tradeable universe and the P2P corridor
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assets: { type: array, items: { $ref: '#/components/schemas/Asset' } }
+                  p2pAllowed: { type: array, items: { type: string } }
+  /api/swap/submit:
+    post:
+      tags: [Public]
+      summary: Relay a signed transaction (ufama contract invocations, classic path payments, trustlines only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { signedXdr: { type: string } }
+              required: [signedXdr]
+      responses:
+        '200':
+          description: landed
+          content: { application/json: { schema: { $ref: '#/components/schemas/SendResult' } } }
+        '400': { description: not relayable, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '502': { description: rejected or failed on-ledger (reason in `error`) }
+
+  /api/rfq/reference:
+    get:
+      tags: [RFQ taker]
+      summary: Reference pricing for a pair/amount, without opening a request
+      parameters:
+        - { name: tokenIn, in: query, required: true, schema: { type: string }, description: Symbol or contract address }
+        - { name: tokenOut, in: query, required: true, schema: { type: string } }
+        - { name: amountIn, in: query, required: true, schema: { type: string }, description: Base units of tokenIn }
+        - { name: taker, in: query, required: false, schema: { type: string }, description: G-address; excludes the taker's own standing orders from the book sweep }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { reference: { $ref: '#/components/schemas/RfqPreview' } }
+  /api/rfq/request:
+    post:
+      tags: [RFQ taker]
+      summary: Open a request for firm quotes
+      description: Max 3 open requests per taker, one every 2 s. Makers see it immediately; poll `GET /api/rfq/{id}` for quotes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                taker: { type: string, description: G-address that will sign the settlement }
+                tokenIn: { type: string }
+                tokenOut: { type: string }
+                amountIn: { type: string }
+                ttlSec: { type: integer, default: 20, minimum: 5, maximum: 120 }
+              required: [taker, tokenIn, tokenOut, amountIn]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { request: { $ref: '#/components/schemas/RfqRequest' } }
+        '400': { description: bad input }
+        '403': { description: taker address blocked by screening }
+        '429': { description: too many open requests / too frequent }
+        '503': { description: RFQ not enabled }
+  /api/rfq/{id}:
+    get:
+      tags: [RFQ taker]
+      summary: Request state and live quotes (no signed XDR exposed)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { request: { $ref: '#/components/schemas/RfqRequest' } }
+        '404': { description: unknown request }
+  /api/rfq/{id}/accept:
+    post:
+      tags: [RFQ taker]
+      summary: Accept a quote — returns the settlement transaction for the taker to sign
+      description: |
+        The transaction carries the maker's pre-signed authorization entry. Sign it with the taker
+        wallet and relay via `/api/swap/submit`. Both legs settle in that one transaction or nothing moves.
+        A live quote is acceptable until its own `expiryLedger`, even after the request window closed.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { quoteId: { type: string } }, required: [quoteId] }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  xdr: { type: string }
+                  quote: { $ref: '#/components/schemas/RfqQuote' }
+                  request: { $ref: '#/components/schemas/RfqRequest' }
+        '409': { description: request or quote no longer open }
+        '422': { description: quote can no longer settle (host rejected the pair of auth entries) }
+  /api/rfq/{id}/cancel:
+    post:
+      tags: [RFQ taker]
+      summary: Cancel an open request
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: ok }
+  /api/rfq/{id}/settled:
+    post:
+      tags: [RFQ taker]
+      summary: Report the landed transaction hash
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { hash: { type: string, pattern: '^[0-9a-f]{64}$' } }, required: [hash] }
+      responses:
+        '200': { description: ok }
+
+  /api/rfq/open:
+    get:
+      tags: [RFQ maker]
+      security: [{ makerKey: [] }]
+      summary: Open requests (for makers that poll instead of streaming)
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { requests: { type: array, items: { $ref: '#/components/schemas/RfqRequest' } } }
+  /api/rfq/stream:
+    get:
+      tags: [RFQ maker]
+      security: [{ makerKey: [] }]
+      summary: Server-sent events — `hello` (with open requests), `request.created`, `request.closed`
+      responses:
+        '200':
+          description: text/event-stream; heartbeat comment every 15 s
+          content:
+            text/event-stream:
+              schema: { type: string }
+  /api/rfq/{id}/prepare:
+    post:
+      tags: [RFQ maker]
+      security: [{ makerKey: [] }]
+      summary: Build the exact authorization entry to sign for a quote
+      description: |
+        The server simulates the full settlement with the maker's balances and the contract's
+        NAV band before answering, so a quote that cannot fund or settle is refused here with
+        the contract's own reason. Sign `authEntryXdr` with `validUntilLedgerSeq = quote.expiryLedger`.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                maker: { type: string, description: Wallet that signs and delivers }
+                amountOut: { type: string, description: Base units of tokenOut delivered for request.amountIn }
+                maxNavDevBps: { type: integer, minimum: 0, maximum: 1000, description: On-chain band; 0 = none. Default 50 when the pair has a feed. }
+                ttlLedgers: { type: integer, minimum: 6, maximum: 720, description: Default = request window + ~1 min grace }
+              required: [maker, amountOut]
+      responses:
+        '200':
+          description: ok
+          content: { application/json: { schema: { $ref: '#/components/schemas/RfqPrepareResponse' } } }
+        '409': { description: request not open }
+        '422': { description: quote would not settle (reason in `error`) }
+  /api/rfq/{id}/quote:
+    post:
+      tags: [RFQ maker]
+      security: [{ makerKey: [] }]
+      summary: Submit the signed authorization entry as a live quote
+      description: Shape-checked, then verified by an enforce-mode simulation against the live host (signature, nonce, expiry, balances, NAV band). One live quote per maker per request; a re-quote supersedes.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { signedAuthXdr: { type: string } }, required: [signedAuthXdr] }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { quote: { $ref: '#/components/schemas/RfqQuote' } }
+        '400': { description: malformed or mismatched entry }
+        '422': { description: rejected by the host }
+
+  /v1/health:
+    get:
+      tags: [Integrator v1]
+      security: [{ integratorKey: [] }]
+      summary: Auth check — echoes the partner the key belongs to
+      responses:
+        '200': { description: ok }
+        '401': { description: invalid or missing API key }
+  /v1/tokens:
+    get:
+      tags: [Integrator v1]
+      security: [{ integratorKey: [] }]
+      summary: Tradeable tokens with contract address, decimals and venue volume
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { tokens: { type: array, items: { $ref: '#/components/schemas/Token' } } }
+  /v1/quote:
+    post:
+      tags: [Integrator v1]
+      security: [{ integratorKey: [] }]
+      summary: Indicative quote (EXACT_IN). `/v1/quote/build` re-prices.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                assetIn: { type: string, description: Symbol or contract address }
+                assetOut: { type: string }
+                amount: { type: string, description: Base units of assetIn }
+                slippageBps: { type: integer, default: 50 }
+                feeBps: { type: integer, minimum: 0, maximum: 100, description: Partner fee }
+                referralAddress: { type: string, description: Required when feeBps > 0; must trust assetOut on classic routes }
+              required: [assetIn, assetOut, amount]
+      responses:
+        '200':
+          description: ok
+          content: { application/json: { schema: { $ref: '#/components/schemas/IntegratorQuote' } } }
+        '400': { description: no liquidity / bad input }
+  /v1/quote/build:
+    post:
+      tags: [Integrator v1]
+      security: [{ integratorKey: [] }]
+      summary: Build the unsigned transaction for the user's wallet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                from: { type: string, description: The user's G-address (signs the tx) }
+                assetIn: { type: string }
+                assetOut: { type: string }
+                amount: { type: string }
+                slippageBps: { type: integer }
+                feeBps: { type: integer }
+                referralAddress: { type: string }
+              required: [from, assetIn, assetOut, amount]
+      responses:
+        '200':
+          description: ok
+          content: { application/json: { schema: { $ref: '#/components/schemas/IntegratorBuild' } } }
+        '400': { description: no executable liquidity, price impact above the safety cap, or bad input }
+        '403': { description: address blocked by screening }
+  /v1/send:
+    post:
+      tags: [Integrator v1]
+      security: [{ integratorKey: [] }]
+      summary: Submit a signed transaction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { xdr: { type: string } }, required: [xdr] }
+      responses:
+        '200':
+          description: landed
+          content: { application/json: { schema: { $ref: '#/components/schemas/SendResult' } } }

@@ -8,6 +8,12 @@ your user's wallet.
 
 Base URL: `https://atomicswap-aggregator-production.up.railway.app`
 
+## SDK and OpenAPI
+
+- TypeScript: `sdk/` in this repo (`@ufama/sdk`) wraps everything below plus
+  both sides of the RFQ, including local signing of maker quotes.
+- Any language: the API host serves `GET /openapi.yaml`.
+
 ## Auth
 
 Every `/v1/*` request needs an API key, sent either way:
