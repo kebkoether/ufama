@@ -1,6 +1,8 @@
 'use client';
 
-import { createContext, useContext, useState, useCallback, useEffect, ReactNode } from 'react';
+import { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode } from 'react';
+import TermsGate from '@/components/TermsGate';
+import { hasAcceptedTerms, recordTermsAcceptance } from '@/lib/legal';
 
 /**
  * Wallet context backed by Stellar Wallets Kit v2 — one integration for
@@ -69,6 +71,27 @@ const DISCONNECTED: WalletState = {
 export function WalletProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<WalletState>(DISCONNECTED);
 
+  // First-connect acknowledgment (Terms + Privacy + eligibility). Resolves
+  // true once the current TERMS_VERSION is accepted on this browser; a
+  // declined gate resolves false and the caller backs out quietly.
+  const [gateOpen, setGateOpen] = useState(false);
+  const gateResolver = useRef<((ok: boolean) => void) | null>(null);
+  const ensureTermsAccepted = useCallback((): Promise<boolean> => {
+    if (hasAcceptedTerms()) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      gateResolver.current?.(false);
+      gateResolver.current = resolve;
+      setGateOpen(true);
+    });
+  }, []);
+  const decideGate = useCallback((accepted: boolean) => {
+    setGateOpen(false);
+    if (accepted) recordTermsAcceptance();
+    const r = gateResolver.current;
+    gateResolver.current = null;
+    r?.(accepted);
+  }, []);
+
   const applyConnection = useCallback((address: string, networkPassphrase: string | null) => {
     setState({
       connected: true,
@@ -112,6 +135,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
 
   const connect = useCallback(async () => {
     if (typeof window === 'undefined') return;
+    if (!(await ensureTermsAccepted())) return;
     setState((s) => ({ ...s, loading: true }));
     try {
       const kit = await getKit();
@@ -140,7 +164,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       }
       setState((s) => ({ ...s, loading: false }));
     }
-  }, [applyConnection]);
+  }, [applyConnection, ensureTermsAccepted]);
 
   const disconnect = useCallback(() => {
     try {
@@ -156,6 +180,11 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     async (xdr: string): Promise<string> => {
       if (!state.connected || !state.address) {
         throw new Error('Wallet not connected');
+      }
+      // Sessions restored from before the Terms shipped (or after a Terms
+      // revision) see the acknowledgment before their next signature.
+      if (!(await ensureTermsAccepted())) {
+        throw new Error('You need to accept the Terms of Use before signing');
       }
       const kit = await getKit();
 
@@ -184,7 +213,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       }
       return result.signedTxXdr;
     },
-    [state.connected, state.address]
+    [state.connected, state.address, ensureTermsAccepted]
   );
 
   return (
@@ -198,6 +227,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       }}
     >
       {children}
+      <TermsGate open={gateOpen} onDecide={decideGate} />
     </WalletContext.Provider>
   );
 }

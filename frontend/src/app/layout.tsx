@@ -3,6 +3,7 @@ import './globals.css';
 import Providers from '@/components/Providers';
 import Header from '@/components/Header';
 import BackgroundArt from '@/components/BackgroundArt';
+import Footer from '@/components/Footer';
 
 export const metadata: Metadata = {
   title: 'Ufama — Smart Swap Aggregator on Stellar',
@@ -28,6 +29,7 @@ export default function RootLayout({
         <Providers>
           <Header />
           <main style={{ position: 'relative', zIndex: 1 }}>{children}</main>
+          <Footer />
         </Providers>
       </body>
     </html>
