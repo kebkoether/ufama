@@ -24,6 +24,23 @@ backend reports the venue unavailable until it is armed — see
 `CURVE_ADAPTER_CONTRACT_ID=CCTMKF4PIHIW6UKF3ETVNLE4Z3ZSGLI4HMDWVWCXKSHJHVZEILKGMG7O`
 once the Curve-venue backend is deployed.
 
+## Pending redeploy — pre-audit fixes (repo ahead of mainnet, 2026-11-02)
+
+`main` carries the fixes from the internal adversarial review
+([audit/PRE-AUDIT.md](./audit/PRE-AUDIT.md)); the live set above does NOT
+have them yet. Contracts are not upgradeable, so each ships as a new
+deployment:
+
+| Contract | Change | Redeploy |
+|---|---|---|
+| RfqSettle | stale-price refusal (`OracleStale`), durable replay record, `cancel_nonce`, views return errors instead of trapping, `transfer_admin` event | **Yes, cheap** (`bash scripts/rfq.sh deploy`, ~17 XLM rent; then set `RFQ_CONTRACT_ID` on Railway and in the frontend) |
+| SwapBook | per-maker-per-pair cap, TTLs cover order expiry + `bump_ttl`, maker floor net of fee, `get_oracle_price` freshness, events, validation | Yes — batch with the post-audit redeploy unless the audit is far off; needs feed re-registration (`scripts/register-rwa-feeds.sh`), oracle admin, router wiring, and the backend already sends gross payments so it works against both versions |
+| FeeVault | two-step admin (`set_admin` removed), instance TTL bumps | Yes, with SwapBook (the vault address is wired into every contract) |
+
+The backend on `main` is compatible with both the live and the fixed
+contracts (fill payments are computed gross of the fee; the new RFQ error
+code is decoded).
+
 ## Mainnet v1.1 — SUPERSEDED by v1.2 (deployed 2026-08-22)
 
 | Contract | Address |

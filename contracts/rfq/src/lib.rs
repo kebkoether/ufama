@@ -10,23 +10,27 @@
 //!
 //! Replay safety comes from two layers: the host consumes the maker's
 //! auth-entry nonce natively, and the contract records (maker, nonce) in
-//! temporary storage until the quote's expiry so a maker-initiated
+//! temporary storage for the maximum quote lifetime so a maker-initiated
 //! settlement (where the maker is the transaction source and has no
-//! host nonce) cannot be replayed either.
+//! host nonce) cannot be replayed either, and `is_used` stays a durable
+//! answer for as long as any quote with that nonce could still be live.
+//! A maker can retire a signed-but-unsettled quote early with
+//! `cancel_nonce`, which writes the same record.
 //!
 //! "At NAV" is enforced on-chain, not just displayed: when the quote
 //! carries `max_nav_dev_bps > 0` the contract reads the pair's oracle
 //! price from the SwapBook (same SEP-40 feeds that price oracle-pegged
-//! standing orders) and refuses to settle outside the band, in either
-//! direction — protecting the taker from a wide quote and the maker from
-//! a fat-fingered one.
+//! standing orders), refuses a price older than `ORACLE_STALE_LEDGERS`
+//! even if the SwapBook would still return it, and refuses to settle
+//! outside the band in either direction — protecting the taker from a
+//! wide quote and the maker from a fat-fingered one.
 //!
 //! Fee: the same 0.5 bps the SwapBook charges, taken from the taker's
 //! payment leg and sent to the FeeVault. Admin-settable, hard-capped.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    vec, Address, Env, IntoVal, Symbol, I256,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
+    IntoVal, Symbol, I256,
 };
 
 /// Protocol fee per 100,000 of the taker's payment (0.5 bps), capped.
@@ -38,6 +42,17 @@ const BPS_DENOMINATOR: i128 = 10_000;
 /// A quote may not be valid for longer than this (~7 days at 5s/ledger).
 /// Bounds the lifetime of the replay record.
 const MAX_QUOTE_TTL_LEDGERS: u32 = 120_960;
+
+/// Replay records live this long (ledgers) regardless of the quote's own
+/// expiry, so `(maker, nonce)` cannot settle twice within the window in
+/// which any quote carrying that nonce could still be valid.
+const USED_TTL_LEDGERS: u32 = MAX_QUOTE_TTL_LEDGERS + 1;
+
+/// An oracle price older than this many ledgers (~83 min) is refused,
+/// mirroring the SwapBook's own staleness rule. The SwapBook enforces
+/// freshness on SEP-40 feeds itself; this guards the admin-pushed price
+/// path, where `get_oracle_price` returns whatever was last written.
+const ORACLE_STALE_LEDGERS: u32 = 1_000;
 
 /// Widest NAV band a quote may request (10%). Beyond that the band is
 /// meaningless; quotes that want no band pass 0.
@@ -55,8 +70,8 @@ pub enum DataKey {
     /// SwapBook contract whose `get_oracle_price` supplies NAV.
     SwapBook,
     FeePer100k,
-    /// Replay record for a settled (maker, nonce). Temporary storage,
-    /// lives until the quote's expiry ledger.
+    /// Replay record for a settled or cancelled (maker, nonce). Temporary
+    /// storage, lives `USED_TTL_LEDGERS` from the write.
     Used(Address, u64),
 }
 
@@ -74,7 +89,8 @@ pub struct Quote {
     pub amount_out: i128,
     /// Last ledger (inclusive) at which this quote may settle.
     pub expiry_ledger: u32,
-    /// Maker-chosen unique id; (maker, nonce) settles at most once.
+    /// Maker-chosen unique id; (maker, nonce) settles at most once
+    /// within `USED_TTL_LEDGERS` of first use. Makers use random u64s.
     pub nonce: u64,
     /// Max deviation from the oracle (NAV) price, in bps, either
     /// direction. 0 = no oracle check (pairs without a feed).
@@ -112,6 +128,7 @@ pub enum RfqError {
     FeeAboveCap = 12,
     Overflow = 13,
     NoPendingAdmin = 14,
+    OracleStale = 15,
 }
 
 #[contract]
@@ -145,17 +162,11 @@ impl RfqSettle {
         // Replay record — the host already consumes the maker's auth
         // nonce; this covers maker-as-source settlements too and gives
         // `is_used` a definitive answer either way.
-        let used_key = DataKey::Used(q.maker.clone(), q.nonce);
-        if env.storage().temporary().has(&used_key) {
-            return Err(RfqError::AlreadyUsed);
-        }
-        let ttl = q.expiry_ledger - env.ledger().sequence() + 1;
-        env.storage().temporary().set(&used_key, &true);
-        env.storage().temporary().extend_ttl(&used_key, ttl, ttl);
+        Self::mark_used(&env, &q.maker, q.nonce)?;
 
         let (fair_out, _) = Self::nav_check(&env, &q)?;
 
-        let fee = Self::calculate_fee(&env, q.amount_in);
+        let fee = Self::calculate_fee(&env, q.amount_in)?;
         let maker_receives = q.amount_in - fee;
         if maker_receives <= 0 {
             return Err(RfqError::InvalidAmount);
@@ -194,6 +205,21 @@ impl RfqSettle {
         Ok(fee)
     }
 
+    /// Retire a signed-but-unsettled quote: writes the replay record for
+    /// `(maker, nonce)` so no quote carrying that nonce can settle for
+    /// `USED_TTL_LEDGERS`. Only the maker can call it. Without this a
+    /// signed quote is a free option for the taker until it expires.
+    pub fn cancel_nonce(env: Env, maker: Address, nonce: u64) -> Result<(), RfqError> {
+        maker.require_auth();
+        Self::mark_used(&env, &maker, nonce)?;
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.events()
+            .publish((symbol_short!("rfq"), symbol_short!("cancel"), maker), nonce);
+        Ok(())
+    }
+
     // ─── Views ──────────────────────────────────────────
 
     /// Everything `settle_quote` would compute, without auth or
@@ -208,7 +234,7 @@ impl RfqSettle {
             return Err(RfqError::AlreadyUsed);
         }
         let (fair_out, deviation_bps) = Self::nav_check(&env, &q)?;
-        let fee = Self::calculate_fee(&env, q.amount_in);
+        let fee = Self::calculate_fee(&env, q.amount_in)?;
         let maker_receives = q.amount_in - fee;
         if maker_receives <= 0 {
             return Err(RfqError::InvalidAmount);
@@ -233,7 +259,7 @@ impl RfqSettle {
             return Err(RfqError::InvalidAmount);
         }
         let (num, den) = Self::read_oracle(&env, &token_in, &token_out)?;
-        let fair = Self::muldiv_floor(&env, amount_in, num, den);
+        let fair = Self::muldiv_floor(&env, amount_in, num, den)?;
         if fair <= 0 {
             return Err(RfqError::OracleUnavailable);
         }
@@ -293,11 +319,15 @@ impl RfqSettle {
         Ok(())
     }
 
+    /// Two-step admin rotation; the pending address must `accept_admin`.
+    /// Calling again overwrites (and so cancels) a previous pending.
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), RfqError> {
         Self::require_admin(&env)?;
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
+        env.events()
+            .publish((symbol_short!("admin"), symbol_short!("pending")), new_admin);
         Ok(())
     }
 
@@ -316,6 +346,19 @@ impl RfqSettle {
     }
 
     // ─── Internal ───────────────────────────────────────
+
+    /// Write the replay record, refusing if one already exists.
+    fn mark_used(env: &Env, maker: &Address, nonce: u64) -> Result<(), RfqError> {
+        let used_key = DataKey::Used(maker.clone(), nonce);
+        if env.storage().temporary().has(&used_key) {
+            return Err(RfqError::AlreadyUsed);
+        }
+        env.storage().temporary().set(&used_key, &true);
+        env.storage()
+            .temporary()
+            .extend_ttl(&used_key, USED_TTL_LEDGERS, USED_TTL_LEDGERS);
+        Ok(())
+    }
 
     fn require_admin(env: &Env) -> Result<(), RfqError> {
         let admin: Address = env
@@ -357,7 +400,7 @@ impl RfqSettle {
             return Ok((0, 0));
         }
         let (num, den) = Self::read_oracle(env, &q.token_in, &q.token_out)?;
-        let fair = Self::muldiv_floor(env, q.amount_in, num, den);
+        let fair = Self::muldiv_floor(env, q.amount_in, num, den)?;
         if fair <= 0 {
             return Err(RfqError::OracleUnavailable);
         }
@@ -365,7 +408,7 @@ impl RfqSettle {
         // absolute value against the band. Ceil so a hair over fails.
         let shortfall = fair - q.amount_out;
         let abs = if shortfall < 0 { -shortfall } else { shortfall };
-        let dev_abs = Self::muldiv_ceil(env, abs, BPS_DENOMINATOR, fair);
+        let dev_abs = Self::muldiv_ceil(env, abs, BPS_DENOMINATOR, fair)?;
         if dev_abs > q.max_nav_dev_bps as i128 {
             return Err(RfqError::NavBandExceeded);
         }
@@ -374,8 +417,11 @@ impl RfqSettle {
     }
 
     /// (num, den): token_out base units per token_in base unit, from the
-    /// SwapBook's `get_oracle_price` (SEP-40 feeds, decimals normalized,
-    /// freshness enforced there). Any failure → OracleUnavailable.
+    /// SwapBook's `get_oracle_price` (SEP-40 feeds, decimals normalized).
+    /// Any failure → OracleUnavailable; a price whose `updated_at` ledger
+    /// is older than `ORACLE_STALE_LEDGERS` → OracleStale (the SwapBook
+    /// returns the last admin-pushed price for feed-less pairs without
+    /// checking its age; we do).
     fn read_oracle(env: &Env, token_in: &Address, token_out: &Address) -> Result<(i128, i128), RfqError> {
         let swap_book: Address = env
             .storage()
@@ -388,7 +434,12 @@ impl RfqSettle {
             vec![env, token_in.into_val(env), token_out.into_val(env)],
         );
         match res {
-            Ok(Ok((num, den, _))) if num > 0 && den > 0 => Ok((num, den)),
+            Ok(Ok((num, den, updated_at))) if num > 0 && den > 0 => {
+                if env.ledger().sequence().saturating_sub(updated_at) > ORACLE_STALE_LEDGERS {
+                    return Err(RfqError::OracleStale);
+                }
+                Ok((num, den))
+            }
             _ => Err(RfqError::OracleUnavailable),
         }
     }
@@ -401,39 +452,37 @@ impl RfqSettle {
     }
 
     /// Fee rounds up — never zero for a nonzero amount unless the rate is 0.
-    fn calculate_fee(env: &Env, amount: i128) -> i128 {
+    fn calculate_fee(env: &Env, amount: i128) -> Result<i128, RfqError> {
         let rate = Self::fee_per_100k(env);
         if rate == 0 {
-            return 0;
+            return Ok(0);
         }
         Self::muldiv_ceil(env, amount, rate, FEE_DENOMINATOR)
     }
 
-    fn muldiv_floor(env: &Env, a: i128, b: i128, d: i128) -> i128 {
+    // The muldivs return errors rather than trapping so the views
+    // (`check_quote`, `fair_value`) report Overflow / OracleUnavailable
+    // exactly the way settlement does.
+
+    fn muldiv_floor(env: &Env, a: i128, b: i128, d: i128) -> Result<i128, RfqError> {
         if d == 0 {
-            panic_with_error!(env, RfqError::OracleUnavailable);
+            return Err(RfqError::OracleUnavailable);
         }
         let r = I256::from_i128(env, a)
             .mul(&I256::from_i128(env, b))
             .div(&I256::from_i128(env, d));
-        match r.to_i128() {
-            Some(v) => v,
-            None => panic_with_error!(env, RfqError::Overflow),
-        }
+        r.to_i128().ok_or(RfqError::Overflow)
     }
 
-    fn muldiv_ceil(env: &Env, a: i128, b: i128, d: i128) -> i128 {
+    fn muldiv_ceil(env: &Env, a: i128, b: i128, d: i128) -> Result<i128, RfqError> {
         if d == 0 {
-            panic_with_error!(env, RfqError::OracleUnavailable);
+            return Err(RfqError::OracleUnavailable);
         }
         let num = I256::from_i128(env, a).mul(&I256::from_i128(env, b));
         let r = num
             .add(&I256::from_i128(env, d - 1))
             .div(&I256::from_i128(env, d));
-        match r.to_i128() {
-            Some(v) => v,
-            None => panic_with_error!(env, RfqError::Overflow),
-        }
+        r.to_i128().ok_or(RfqError::Overflow)
     }
 }
 

@@ -3,8 +3,9 @@
 use super::*;
 use soroban_sdk::{
     contract as sdk_contract, contracterror as sdk_contracterror,
-    contractimpl as sdk_contractimpl, testutils::Address as _, testutils::Ledger as _,
-    token::StellarAssetClient, token::TokenClient, Address, Env,
+    contractimpl as sdk_contractimpl,
+    testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke},
+    token::StellarAssetClient, token::TokenClient, Address, Env, IntoVal,
 };
 
 // ─── Mock SwapBook: get_oracle_price(token_in, token_out) ───────────────
@@ -21,19 +22,36 @@ pub struct MockBook;
 
 #[sdk_contractimpl]
 impl MockBook {
+    /// Price reported as fresh (updated_at = current ledger), like a
+    /// SEP-40 read.
     pub fn set_price(env: Env, token_in: Address, token_out: Address, num: i128, den: i128) {
         env.storage()
             .instance()
-            .set(&(token_in, token_out), &(num, den));
+            .set(&(token_in, token_out), &(num, den, 0u32));
+    }
+    /// Price with an explicit updated_at ledger, like the SwapBook's
+    /// admin-pushed path (which returns the stored age unchecked).
+    pub fn set_price_at(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+        num: i128,
+        den: i128,
+        updated_at: u32,
+    ) {
+        env.storage()
+            .instance()
+            .set(&(token_in, token_out), &(num, den, updated_at));
     }
     pub fn get_oracle_price(
         env: Env,
         token_in: Address,
         token_out: Address,
     ) -> Result<(i128, i128, u32), MockBookError> {
-        let p: Option<(i128, i128)> = env.storage().instance().get(&(token_in, token_out));
+        let p: Option<(i128, i128, u32)> = env.storage().instance().get(&(token_in, token_out));
         match p {
-            Some((num, den)) => Ok((num, den, env.ledger().sequence())),
+            Some((num, den, 0)) => Ok((num, den, env.ledger().sequence())),
+            Some((num, den, at)) => Ok((num, den, at)),
             None => Err(MockBookError::OraclePriceNotSet),
         }
     }
@@ -278,4 +296,153 @@ fn admin_rotation_is_two_step_and_book_can_be_repointed() {
     c.client.set_swap_book(&other);
     assert_eq!(c.client.fair_value(&c.usdc, &c.bond, &(1_000 * ONE)), 100 * ONE);
     let _ = &c.book;
+}
+
+#[test]
+fn stale_pushed_price_is_refused_even_if_the_book_returns_it() {
+    let c = setup();
+    c.env.ledger().with_mut(|li| li.sequence_number = 10_000);
+    let seq = c.env.ledger().sequence();
+    let den = 105 * ONE / 10;
+    // One ledger past the staleness window → refused everywhere
+    c.book
+        .set_price_at(&c.usdc, &c.bond, &ONE, &den, &(seq - ORACLE_STALE_LEDGERS - 1));
+    let q = quote(&c, 1_050 * ONE, 100 * ONE, 25);
+    assert_eq!(c.client.try_settle_quote(&q), Err(Ok(RfqError::OracleStale)));
+    assert_eq!(c.client.try_check_quote(&q), Err(Ok(RfqError::OracleStale)));
+    assert_eq!(
+        c.client.try_fair_value(&c.usdc, &c.bond, &ONE),
+        Err(Ok(RfqError::OracleStale))
+    );
+    // A quote without a band never reads the oracle
+    let mut unbanded = q.clone();
+    unbanded.max_nav_dev_bps = 0;
+    c.client.settle_quote(&unbanded);
+    // Exactly at the window → still accepted
+    c.book
+        .set_price_at(&c.usdc, &c.bond, &ONE, &den, &(seq - ORACLE_STALE_LEDGERS));
+    let mut fresh_enough = q.clone();
+    fresh_enough.nonce = 2;
+    c.client.settle_quote(&fresh_enough);
+}
+
+#[test]
+fn maker_can_cancel_a_nonce_before_it_settles() {
+    let c = setup();
+    assert!(!c.client.is_used(&c.maker, &7));
+    c.client.cancel_nonce(&c.maker, &7);
+    assert!(c.client.is_used(&c.maker, &7));
+    let mut q = quote(&c, 1_050 * ONE, 100 * ONE, 0);
+    q.nonce = 7;
+    assert_eq!(c.client.try_settle_quote(&q), Err(Ok(RfqError::AlreadyUsed)));
+    assert_eq!(c.client.try_check_quote(&q), Err(Ok(RfqError::AlreadyUsed)));
+    assert_eq!(
+        c.client.try_cancel_nonce(&c.maker, &7),
+        Err(Ok(RfqError::AlreadyUsed))
+    );
+    // Other nonces and other makers are unaffected
+    q.nonce = 8;
+    c.client.settle_quote(&q);
+    assert!(!c.client.is_used(&c.taker, &7));
+}
+
+#[test]
+fn used_record_outlives_the_quote_it_settled() {
+    let c = setup();
+    let q = quote(&c, 1_050 * ONE, 100 * ONE, 0); // expires in 60 ledgers
+    c.client.settle_quote(&q);
+    // Well past the quote's own expiry, still inside USED_TTL_LEDGERS
+    c.env.ledger().with_mut(|li| li.sequence_number += 5_000);
+    assert!(c.client.is_used(&c.maker, &1));
+    let mut again = quote(&c, 1_050 * ONE, 100 * ONE, 0); // fresh expiry, same nonce
+    again.nonce = 1;
+    assert_eq!(
+        c.client.try_settle_quote(&again),
+        Err(Ok(RfqError::AlreadyUsed))
+    );
+}
+
+#[test]
+fn overflow_is_reported_as_an_error_not_a_trap() {
+    let c = setup();
+    c.book.set_price(&c.usdc, &c.bond, &i128::MAX, &1);
+    let q = quote(&c, i128::MAX / 2, 100 * ONE, 25);
+    assert_eq!(
+        c.client.try_fair_value(&c.usdc, &c.bond, &(i128::MAX / 2)),
+        Err(Ok(RfqError::Overflow))
+    );
+    assert_eq!(c.client.try_check_quote(&q), Err(Ok(RfqError::Overflow)));
+    assert_eq!(c.client.try_settle_quote(&q), Err(Ok(RfqError::Overflow)));
+}
+
+/// The maker's pre-signed entry authorizes exactly one tree:
+/// settle_quote(q) → token_out.transfer(maker, taker, amount_out).
+/// A different quote (here: more bonds for the same payment) must not
+/// be satisfiable by that entry, and neither party's entry covers the
+/// other's leg.
+#[test]
+fn maker_auth_entry_is_bound_to_the_exact_quote() {
+    let c = setup();
+    let q = quote(&c, 1_050 * ONE, 100 * ONE, 0);
+    let fee: i128 = 525_000;
+    let contract = c.client.address.clone();
+
+    // Tampered quote: taker asks for 1 more bond than the maker signed.
+    let mut tampered = q.clone();
+    tampered.amount_out = 101 * ONE;
+
+    // Maker signed over `q`...
+    let maker_sub = [MockAuthInvoke {
+        contract: &c.bond,
+        fn_name: "transfer",
+        args: (c.maker.clone(), c.taker.clone(), q.amount_out).into_val(&c.env),
+        sub_invokes: &[],
+    }];
+    let maker_root = MockAuthInvoke {
+        contract: &contract,
+        fn_name: "settle_quote",
+        args: (q.clone(),).into_val(&c.env),
+        sub_invokes: &maker_sub,
+    };
+    // ...while the taker authorizes the tampered invocation.
+    let taker_sub = [
+        MockAuthInvoke {
+            contract: &c.usdc,
+            fn_name: "transfer",
+            args: (c.taker.clone(), c.maker.clone(), tampered.amount_in - fee).into_val(&c.env),
+            sub_invokes: &[],
+        },
+        MockAuthInvoke {
+            contract: &c.usdc,
+            fn_name: "transfer",
+            args: (c.taker.clone(), c.fee_vault.clone(), fee).into_val(&c.env),
+            sub_invokes: &[],
+        },
+    ];
+    let taker_root_tampered = MockAuthInvoke {
+        contract: &contract,
+        fn_name: "settle_quote",
+        args: (tampered.clone(),).into_val(&c.env),
+        sub_invokes: &taker_sub,
+    };
+    c.env.mock_auths(&[
+        MockAuth { address: &c.maker, invoke: &maker_root },
+        MockAuth { address: &c.taker, invoke: &taker_root_tampered },
+    ]);
+    assert!(c.client.try_settle_quote(&tampered).is_err());
+    assert_eq!(bal(&c, &c.bond, &c.taker), 0);
+
+    // The genuine pair of entries settles.
+    let taker_root = MockAuthInvoke {
+        contract: &contract,
+        fn_name: "settle_quote",
+        args: (q.clone(),).into_val(&c.env),
+        sub_invokes: &taker_sub,
+    };
+    c.env.mock_auths(&[
+        MockAuth { address: &c.maker, invoke: &maker_root },
+        MockAuth { address: &c.taker, invoke: &taker_root },
+    ]);
+    assert_eq!(c.client.settle_quote(&q), fee);
+    assert_eq!(bal(&c, &c.bond, &c.taker), 100 * ONE);
 }

@@ -634,15 +634,20 @@ async function planBookFills(
     if (budget <= 0n) break;
     const remaining = order.amountInRemaining;
     if (remaining <= 0n) continue;
-    const fullCost = muldivCeil(order.minAmountOut, remaining, order.amountIn);
+    // The maker's floor is NET of the protocol fee (SwapBook v1.3+), so
+    // the taker sends the gross amount: net + fee. Against the earlier
+    // gross-floor contract this overpays the maker by the fee, which is
+    // still a valid fill.
+    const fullCost = grossForNet(muldivCeil(order.minAmountOut, remaining, order.amountIn));
     if (budget >= fullCost) {
       fills.push({ orderId: order.id, fillAmountIn: remaining, paymentOut: fullCost, full: true });
       budget -= fullCost;
     } else {
-      let fillable = (budget * order.amountIn) / order.minAmountOut;
+      const netBudget = (budget * (FEE_DENOMINATOR - SWAPBOOK_FEE_PER_100K)) / FEE_DENOMINATOR;
+      let fillable = (netBudget * order.amountIn) / order.minAmountOut;
       if (fillable > remaining) fillable = remaining;
       while (fillable > 0n) {
-        const cost = muldivCeil(order.minAmountOut, fillable, order.amountIn);
+        const cost = grossForNet(muldivCeil(order.minAmountOut, fillable, order.amountIn));
         if (cost <= budget) {
           fills.push({ orderId: order.id, fillAmountIn: fillable, paymentOut: cost, full: false });
           budget -= cost;
@@ -662,6 +667,21 @@ async function planBookFills(
 
 function muldivCeil(a: bigint, b: bigint, d: bigint): bigint {
   return (a * b + d - 1n) / d;
+}
+
+/** SwapBook protocol fee, per 100k of the taker's payment (0.5 bps, the compile-time cap). */
+const SWAPBOOK_FEE_PER_100K = 5n;
+const FEE_DENOMINATOR = 100_000n;
+
+/**
+ * Smallest gross payment g such that g - ceil(g * fee / D) >= net, i.e.
+ * what a taker must send so the maker nets its floor after the fee.
+ */
+function grossForNet(net: bigint): bigint {
+  if (net <= 0n) return 0n;
+  let g = muldivCeil(net, FEE_DENOMINATOR, FEE_DENOMINATOR - SWAPBOOK_FEE_PER_100K);
+  while (g - muldivCeil(g, SWAPBOOK_FEE_PER_100K, FEE_DENOMINATOR) < net) g += 1n;
+  return g;
 }
 
 // ─── Classic SDEX swap building ─────────────────────────

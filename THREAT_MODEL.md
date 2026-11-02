@@ -102,6 +102,10 @@ admin invocations (F9), API keys (F6).
    quality/liveness. Contracts enforce all price floors independently.
 5. The **keeper is NOT trusted at all** — its entry points are
    permissionless by design and constrained on-chain.
+6. **RFQ makers are NOT trusted.** A maker is bound only by the Soroban
+   auth entry it signs over the full `Quote`; the taker is protected by
+   its own signature, the on-chain NAV band and the fee cap, never by the
+   maker's honesty or the backend's.
 
 ## STRIDE analysis
 
@@ -117,12 +121,13 @@ enforcing code.
 | T-CH-3 | Tampering | Keeper drains a TWAP with rapid/oversized/underpriced slices | Pace (pro-rata + bounded tolerance), price floor (limit or fresh oracle − slippage, checked on **net** proceeds), cadence gap, per-slice cap — all in `TwapBook::execute_slice` | Low — keeper can only slow execution |
 | T-CH-4 | Spoofing | Attacker calls `claim_expired_timer` directly to grab escrow | `require_auth` on the stored Router address; the Router is a contract, so only its own code path (which settles the maker) can satisfy invoker auth | Low |
 | T-CH-5 | Tampering | Attacker calls an adapter's `swap` directly to sweep residual adapter balances | Adapters hold no funds at rest (full balance-delta pushed out each swap); an unfunded call has nothing to move and the venue pull fails | Low |
-| T-CH-6 | DoS | Grief the book with thousands of dust orders (storage bloat, unbounded index scans) | `MAX_ORDERS_PER_PAIR = 200`, `MAX_ACTIVE_ORDERS = 500` (`BookFull`); placing costs escrow + fees | Medium — a motivated griefer can fill a pair's index with 200 real orders; takers/quotes skip them, but placement is blocked for others until they expire. Accepted for current scale |
-| T-CH-7 | DoS | Storage entries expire (TTL) and strand orders | TTL extended to ~30 days on every write (`TTL_EXTEND_TO`); any fill/cancel/expiry re-extends | Low — a fully idle order past 30 days needs restoration before acting; funds are never lost, restoration is permissionless |
+| T-CH-6 | DoS | Grief the book with dust orders (storage bloat, bounded index scans) | `MAX_ORDERS_PER_PAIR = 200` and `MAX_OPEN_PER_MAKER_PAIR = 10` (`BookFull` / `MakerPairLimit`); placing locks escrow (no placement fee); per-token `MinOrder` floors set at deploy | Low–Medium — locking a pair now needs 20 distinct funded makers; `quote_fill` still iterates up to 200 orders. Accepted for current scale |
+| T-CH-7 | DoS | Storage entries expire (TTL) and strand orders or feeds | Order entries extended to cover their own expiry; pair indexes, feed configs, min-order floors and pushed prices re-extended on every touch; permissionless `bump_ttl`; instance TTL bumped by admin calls too | Low — an archived entry fails closed and is restorable by anyone; funds are never lost |
 | T-CH-8 | Info disclosure | Order flow is public (front-running/MEV) | Inherent to on-chain books. Fills are price-bounded by maker terms; TWAP slices are size/pace-capped, limiting sandwich value; Stellar has no public mempool auctions | Medium — accepted, monitor |
 | T-CH-9 | Repudiation | Disputes over what happened | Every state change publishes a typed event (`order placed/filled/claimed`, `twap slice/...`, `fees withdraw`, `oracle update`) | Low |
 | T-CH-10 | Elevation | Re-initialization / init front-running | No `initialize` functions — all state set in `__constructor`, atomic with deploy | None |
 | T-CH-11 | Tampering | Overflow/precision abuse with extreme amounts | `I256` intermediates with explicit `Overflow` errors; `overflow-checks = true` in release profile | Low |
+| T-CH-12 | Tampering (third party) | Issuer of a clawback-enabled or auth-revocable asset (USDT0; typical RWA tokens) claws back or freezes the SwapBook's pooled escrow in that token; the shortfall lands on the last makers to cancel/expire/fill | Not fixable in-contract for SACs. RfqSettle holds no escrow and is unaffected. Follow-ups: issuer-flag badge and allowlist in the UI; monitor `sum(open remaining) <= balance(SwapBook, T)` per token | **Medium — accepted and disclosed** (Terms §4, §7) |
 
 ### Oracle (boundary: Railway → SwapBook)
 
@@ -130,6 +135,29 @@ enforcing code.
 |---|---|---|---|---|
 | T-ORC-1 | Spoofing/Tampering | Oracle key stolen (Railway breach): push a fake price, then fill victims' oracle-pegged orders at the fake price | Key is a **dedicated** oracle admin (not the contract admin). Per-update jump capped at 20% (`MAX_ORACLE_JUMP_BPS`); prices must be positive; reads stale after ~83 min; user slippage ≤ 10%. Worst-case single-step distortion ≈ 20% + slippage on oracle-mode orders only; fixed-price orders unaffected | **Medium — the top residual risk.** Sustained key control allows 20% steps every update. Mitigation shipped in v1.1 (in repo): SEP-40 oracle precedence with fail-closed staleness — pairs with full feed coverage stop trusting the pushed key entirely. Residual closes when v1.1 deploys with Reflector feeds configured |
 | T-ORC-2 | DoS | Oracle stops updating | Reads fail closed (`OraclePriceStale`) — oracle-mode fills and oracle-bound TWAP slices halt; funds remain cancellable/refundable | Low — availability only |
+
+### RFQ settlement (boundary: maker + taker + backend → RfqSettle)
+
+Flow: taker posts a request to the backend; makers stream it, price it
+off-chain, and sign a Soroban authorization entry for
+`RfqSettle::settle_quote(Quote)` with their key (the backend only
+simulates and relays; `backend/src/rfq/service.ts`). The taker's wallet
+signs a transaction carrying that entry as source. The contract checks
+the quote before any `require_auth`, consumes the maker's nonce, moves
+`amount_in` taker→maker and `amount_out` maker→taker, takes the fee from
+the taker leg, and checks both legs against the SwapBook oracle NAV band.
+
+| ID | Threat | Scenario | Mitigation | Residual risk |
+|---|---|---|---|---|
+| T-RFQ-1 | Spoofing | Someone other than `quote.taker` settles a maker's quote (e.g. a front-runner who sees the signed entry) | `quote.taker.require_auth()` and the maker's entry is bound to the full `Quote` struct including `taker`; signed XDR is returned only to the accepting taker (public views strip it, `rfq/store.ts` public view) | Low |
+| T-RFQ-2 | Tampering (replay) | A settled quote's maker entry is replayed, or re-bound to a different quote/contract/network | Soroban auth entries commit to contract id, function, args and network; host-side nonce + `Used(maker, nonce)` temporary entry refused on second use (`is_used`), kept for `MAX_QUOTE_TTL_LEDGERS + 1` regardless of the quote's expiry; `expiry_ledger` checked before auth; makers can retire a nonce early with `cancel_nonce` | Low — confirmed in the pre-audit review (audit/PRE-AUDIT.md) |
+| T-RFQ-3 | Tampering (price) | Maker (or a compromised maker key) signs a quote far from NAV; taker accepts a bad price | `max_nav_dev_bps` band checked **on-chain** against `SwapBook.get_oracle_price` in both directions, failing closed when no feed exists or the price is older than 1,000 ledgers (`OracleStale`); backend reference strip shows oracle and issuer NAV side by side; fee capped at 0.5 bps in code (`set_fee` ≤ `MAX_FEE_PER_100K`) | Low — a stolen maker key can lose the maker's inventory at up to the band width per quote; maker bot caps notional (`RFQ_MAX_NOTIONAL`) |
+| T-RFQ-4 | Tampering (backend) | Compromised backend alters quotes or relays a different transaction | The taker signs the exact envelope its wallet simulates; the maker's entry only authorizes the `Quote` it signed; the backend cannot sign for either party. Worst case is refusing to relay (availability) or showing a misleading reference price, which the on-chain band bounds | Low |
+| T-RFQ-5 | DoS | Spam requests exhaust makers or the in-memory store | Per-taker caps (3 open, 2 s spacing), bounded store with eviction, maker API keys, wallet screening at request/prepare, rate limits per IP | Medium — accepted for current scale; makers choose what to quote |
+| T-RFQ-6 | Info disclosure | Maker's signed entry leaks before settlement, letting a third party settle it | Only the accepting taker receives the signed XDR; and T-RFQ-1 binds settlement to that taker anyway | Low |
+| T-RFQ-7 | Repudiation | Dispute over whether a quote was honoured | `settle` event with maker, taker, amounts, nonce; `is_used(maker, nonce)` view; ledger record | Low |
+| T-RFQ-9 | DoS (maker) | A maker signs a quote, then empties its inventory so settlement fails after the taker's auth; the taker pays the failed-transaction fee and the nonce is not consumed (the whole tx reverts) | Failure is bounded to one network fee per attempt; the backend's enforce-mode simulation at accept time catches an already-empty maker; makers that do this lose their API key | Low |
+| T-RFQ-8 | Elevation | Admin changes `swap_book` to a contract that reports a convenient price, or raises the fee | Fee hard-capped at compile time; `set_swap_book` is admin-only and behind the two-step transfer (T-ADM); a malicious swap_book is admin compromise, analyzed at T-ADM-2 | Low |
 
 ### Admin operations (boundary: operator machine → contracts)
 

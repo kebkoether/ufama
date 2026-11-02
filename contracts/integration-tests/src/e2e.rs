@@ -149,6 +149,13 @@ fn fee_ceil(amount: i128, num: i128) -> i128 {
     (amount * num + 100_000 - 1) / 100_000
 }
 
+/// Smallest gross payment that nets the maker `net` after the 0.5 bps
+/// SwapBook fee: ceil(net * 100_000 / 99_995). The maker's floor is net
+/// of fee, so this is what a taker must send to fill at the floor.
+fn gross_for(net: i128) -> i128 {
+    (net * 100_000 + 99_995 - 1) / 99_995
+}
+
 // ─── 1. P2P lifecycle: place → quote → partial fill → fill → withdraw ───
 
 #[test]
@@ -166,24 +173,29 @@ fn p2p_lifecycle_fees_accrue_in_real_vault_and_withdraw() {
         &amount, &amount, &10_000u32,
         &0u32, &0u32, &0u32, &soroban_sdk::vec![&w.env]);
 
-    // Taker-direction quote: spending 4,000 B buys 4,000 A
+    // Taker-direction quote: the quote is GROSS of the fee, so spending
+    // the whole 4,000 B budget buys 4,000 A less the 0.5 bps fee
     let pay_budget = 4_000_0000000i128;
     let (bought, paid) = book.quote_fill(&w.token_a, &w.token_b, &pay_budget);
-    assert_eq!(bought, pay_budget);
     assert_eq!(paid, pay_budget);
+    assert_eq!(bought, pay_budget - fee_ceil(pay_budget, 5));
 
-    // Partial fill at the quoted terms
+    // Partial fill at the quoted terms: the maker nets its 1:1 floor
     book.partial_fill(&w.taker, &order_id, &bought, &paid);
     let fee1 = fee_ceil(paid, 5);
     assert_eq!(token_b.balance(&w.maker), paid - fee1);
+    assert_eq!(token_b.balance(&w.maker), bought);
     assert_eq!(vault.get_balance(&w.token_b), fee1);
 
-    // Fill the remainder
+    // Fill the remainder — gross of fee, so the maker nets the pro-rata floor
     let rest = amount - bought;
-    book.fill_order(&w.taker, &order_id, &rest);
-    let fee2 = fee_ceil(rest, 5);
+    let pay2 = gross_for(rest);
+    assert!(book.try_fill_order(&w.taker, &order_id, &rest).is_err());
+    book.fill_order(&w.taker, &order_id, &pay2);
+    let fee2 = fee_ceil(pay2, 5);
     assert_eq!(vault.get_balance(&w.token_b), fee1 + fee2);
-    assert_eq!(token_b.balance(&w.maker), amount - fee1 - fee2);
+    assert_eq!(token_b.balance(&w.maker), bought + pay2 - fee2);
+    assert!(token_b.balance(&w.maker) >= amount);
     // Taker holds the maker's full escrow
     assert_eq!(
         TokenClient::new(&w.env, &w.token_a).balance(&w.taker),
@@ -416,9 +428,10 @@ fn oracle_guarded_pricing_end_to_end() {
         &amount, &0i128, &10_000u32,
         &1u32, &100u32, &0u32, &soroban_sdk::vec![&w.env]);
 
-    // Fair value at 1.2, minimum payment = ceil(fair * 99%)
+    // Fair value at 1.2, maker's floor = ceil(fair * 99%) net of fee;
+    // the taker sends it gross
     let fair = amount * 12 / 10;
-    let min_pay = (fair * 9_900 + 10_000 - 1) / 10_000;
+    let min_pay = gross_for((fair * 9_900 + 10_000 - 1) / 10_000);
     // Underpayment bounces
     assert!(book
         .try_fill_order(&w.taker, &order_id, &(min_pay - 1))
@@ -543,16 +556,15 @@ fn liquidity_wallets_excluded_from_crossing_each_other() {
     );
 
     // The sibling wallet cannot cross — the market cannot wash itself
+    let pay = gross_for(10_000_0000000);
+    assert!(book.try_fill_order(&lp_b, &ask, &pay).is_err());
     assert!(book
-        .try_fill_order(&lp_b, &ask, &10_000_0000000)
-        .is_err());
-    assert!(book
-        .try_partial_fill(&lp_b, &ask, &1_0000000, &1_0000000)
+        .try_partial_fill(&lp_b, &ask, &1_0000000, &gross_for(1_0000000))
         .is_err());
 
     // An organic taker fills normally, fee lands in the real vault
-    book.fill_order(&w.taker, &ask, &10_000_0000000);
-    let fee = fee_ceil(10_000_0000000, 5);
+    book.fill_order(&w.taker, &ask, &pay);
+    let fee = fee_ceil(pay, 5);
     assert_eq!(
         FeeVaultClient::new(&w.env, &w.vault_id).get_balance(&w.token_b),
         fee
@@ -575,13 +587,15 @@ fn match_and_place_settles_fills_and_escrow_in_one_invocation() {
         &soroban_sdk::vec![&w.env],
     );
 
-    // Maker sells 1,000 A: 400 crosses instantly, 600 sits — one tx
+    // Maker sells 1,000 A: 400 crosses instantly (paid gross of fee so
+    // the counter-maker nets its 400 A floor), the rest sits — one tx
+    let pay = gross_for(400_0000000);
     let fills = soroban_sdk::vec![
         &w.env,
         swap_book::FillSpec {
             order_id: reverse_id,
             fill_amount_in: 400_0000000,
-            amount_out: 400_0000000,
+            amount_out: pay,
         },
     ];
     let new_id = book.match_and_place(
@@ -591,18 +605,20 @@ fn match_and_place_settles_fills_and_escrow_in_one_invocation() {
         &soroban_sdk::vec![&w.env], &fills,
     );
 
-    // Fill leg: maker received 400 B whole; counter-maker got 400 A - fee
-    let fee = fee_ceil(400_0000000, 5);
+    // Fill leg: maker received 400 B whole; counter-maker netted >= 400 A
+    let fee = fee_ceil(pay, 5);
     assert_eq!(
         TokenClient::new(&w.env, &w.token_b).balance(&w.maker),
         400_0000000
     );
+    assert!(pay - fee >= 400_0000000);
     assert_eq!(vault.get_balance(&w.token_a), fee);
 
-    // Escrow leg: the 600 A remainder sits as a live, fillable order
+    // Escrow leg: the remainder sits as a live, fillable order
     let order = book.get_order(&new_id);
-    assert_eq!(order.amount_in_remaining, 600_0000000);
-    book.fill_order(&w.taker, &new_id, &600_0000000);
+    assert_eq!(order.amount_in_remaining, 1_000_0000000 - pay);
+    let pay2 = gross_for(600_0000000);
+    book.fill_order(&w.taker, &new_id, &pay2);
     assert_eq!(book.get_order(&new_id).amount_in_remaining, 0);
-    assert_eq!(vault.get_balance(&w.token_b), fee_ceil(600_0000000, 5));
+    assert_eq!(vault.get_balance(&w.token_b), fee_ceil(pay2, 5));
 }
