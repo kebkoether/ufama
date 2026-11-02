@@ -1,0 +1,28 @@
+name: Maker watch
+
+# Pages the repo owner (GitHub emails on a failed scheduled run) when no
+# RFQ maker is connected to production. Zero infrastructure: a cron that
+# asks /api/health/maker, which answers 503 while makersConnected == 0.
+# Two probes a minute apart so a maker mid-reconnect doesn't page.
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: RFQ maker connected
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe /api/health/maker
+        env:
+          URL: ${{ vars.MAKER_HEALTH_URL || 'https://atomicswap-aggregator-production.up.railway.app/api/health/maker' }}
+        run: |
+          for attempt in 1 2; do
+            code=$(curl -s -o body.json -w '%{http_code}' --max-time 20 "$URL" || echo 000)
+            echo "attempt $attempt: HTTP $code"; cat body.json 2>/dev/null; echo
+            if [ "$code" = "200" ]; then exit 0; fi
+            [ "$attempt" = "1" ] && sleep 60
+          done
+          echo "::error::No RFQ maker connected to production (HTTP $code). Start the maker service (backend/railway.maker.json) or check its logs."
+          exit 1
