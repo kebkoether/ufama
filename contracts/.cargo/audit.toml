@@ -1,0 +1,11 @@
+# cargo-audit configuration for the contracts workspace.
+[advisories]
+ignore = [
+  # crypto-bigint 0.5 timing variability (via soroban-env-host 27 -> k256 ->
+  # elliptic-curve). Host-side only: the test/host crate, never linked into
+  # the wasm32v1-none contract builds (cargo tree --target wasm32v1-none
+  # shows no k256/crypto-bigint). Fixed upstream only in crypto-bigint 0.6+,
+  # which elliptic-curve 0.13 (pinned by soroban-env-host) cannot take.
+  # Re-check when soroban-sdk moves past 27.
+  "RUSTSEC-2026-0387",
+]
