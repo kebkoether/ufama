@@ -2,9 +2,10 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::Address as _,
+    symbol_short,
+    testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
     token::{StellarAssetClient, TokenClient},
-    Env,
+    Env, IntoVal,
 };
 
 fn setup() -> (Env, Address, Address, Address) {
@@ -57,12 +58,65 @@ fn test_withdraw_up_to_balance() {
 }
 
 #[test]
-fn test_admin_management() {
+fn test_admin_two_step_rotation() {
     let (env, vault_id, admin, _token) = setup();
     let client = FeeVaultClient::new(&env, &vault_id);
 
     assert_eq!(client.get_admin(), admin);
+    // Nothing pending: accept has nothing to do
+    assert_eq!(client.try_accept_admin(), Err(Ok(FeeVaultError::NoPendingAdmin)));
+
+    // Proposing does NOT hand over power yet
     let new_admin = Address::generate(&env);
-    client.set_admin(&new_admin);
+    client.transfer_admin(&new_admin);
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                vault_id.clone(),
+                (symbol_short!("admin"), symbol_short!("proposed")).into_val(&env),
+                new_admin.clone().into_val(&env)
+            )
+        ]
+    );
+    assert_eq!(client.get_admin(), admin);
+
+    // A mistyped proposal is recoverable: re-propose overrides it
+    let typo = Address::generate(&env);
+    client.transfer_admin(&typo);
+    client.transfer_admin(&new_admin);
+
+    // Acceptance needs the PENDING address's auth — the old admin alone
+    // cannot complete it
+    env.set_auths(&[]);
+    env.mock_auths(&[MockAuth {
+        address: &admin,
+        invoke: &MockAuthInvoke {
+            contract: &vault_id,
+            fn_name: "accept_admin",
+            args: ().into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_accept_admin().is_err());
+    assert_eq!(client.get_admin(), admin);
+
+    env.mock_all_auths();
+    client.accept_admin();
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                vault_id.clone(),
+                (symbol_short!("admin"), symbol_short!("accepted")).into_val(&env),
+                new_admin.clone().into_val(&env)
+            )
+        ]
+    );
     assert_eq!(client.get_admin(), new_admin);
+
+    // Consumed: a second accept has nothing pending
+    assert_eq!(client.try_accept_admin(), Err(Ok(FeeVaultError::NoPendingAdmin)));
 }

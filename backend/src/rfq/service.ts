@@ -667,6 +667,7 @@ function explain(err: unknown): string {
       '9': 'NavBandTooWide',
       '10': 'NavBandExceeded (quote is outside its NAV band)',
       '11': 'OracleUnavailable (no fresh NAV feed for this pair)',
+      '15': 'OracleStale (NAV price older than 1,000 ledgers; the pushed price has not been updated)',
     };
     return names[m[1]] ? `${names[m[1]]}` : `contract error #${m[1]}`;
   }

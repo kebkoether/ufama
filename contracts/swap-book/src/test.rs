@@ -68,6 +68,26 @@ fn advance_to(env: &Env, seq: u32) {
     env.ledger().with_mut(|li| li.sequence_number = seq);
 }
 
+/// ceil(amount * 5 / 100_000) — the default 0.5 bps protocol fee.
+fn fee_of(amount: i128) -> i128 {
+    (amount * 5 + 100_000 - 1) / 100_000
+}
+
+/// Smallest gross payment that nets the maker `net` after the default
+/// fee: ceil(net * 100_000 / 99_995).
+fn gross_for(net: i128) -> i128 {
+    (net * 100_000 + 99_995 - 1) / 99_995
+}
+
+/// Place a 1:1 fixed order of `amount` A for B expiring at `expiry`.
+fn place_1to1(client: &SwapBookClient<'_>, t: &TestCtx, amount: i128, expiry: u32) -> u64 {
+    client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &amount, &amount, &expiry,
+        &0, &0, &0, &no_excl(&t.env),
+    )
+}
+
 // ─── Fixed-Price Order Tests ──────────────────────────
 
 #[test]
@@ -150,12 +170,50 @@ fn test_partial_fill_underpayment_rejected() {
         &10_000_0000000, &9_999_5000000, &200,
         &0, &0, &0,
     &no_excl(&t.env));
-    // Exact pro-rata for half = ceil(9_999_5000000 / 2) = 4_999_7500000
-    // One stroop below must be rejected.
-    let res = client.try_partial_fill(&t.taker, &order_id, &5_000_0000000, &4_999_7499999);
+    // Exact pro-rata for half = ceil(9_999_5000000 / 2) = 4_999_7500000 —
+    // that is what the MAKER must net; the taker sends it plus the fee.
+    let net = 4_999_7500000i128;
+    let gross = gross_for(net);
+    assert!(gross > net);
+    // One stroop below the gross floor must be rejected (the maker would
+    // net less than their pro-rata minimum once the fee comes out)
+    let res = client.try_partial_fill(&t.taker, &order_id, &5_000_0000000, &(gross - 1));
     assert!(res.is_err());
-    // Exact amount succeeds
-    client.partial_fill(&t.taker, &order_id, &5_000_0000000, &4_999_7500000);
+    // The exact gross amount succeeds and the maker nets at least the floor
+    let before = TokenClient::new(&t.env, &t.token_b).balance(&t.maker);
+    client.partial_fill(&t.taker, &order_id, &5_000_0000000, &gross);
+    let received = TokenClient::new(&t.env, &t.token_b).balance(&t.maker) - before;
+    assert_eq!(received, gross - fee_of(gross));
+    assert!(received >= net);
+}
+
+/// L3: the maker's floor is NET of fee — paying exactly the floor is an
+/// underpayment, because the fee would come out of the maker's side.
+#[test]
+fn test_maker_floor_is_net_of_fee() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+    let amount = 1_000_0000000i128;
+    let order_id = place_1to1(&client, &t, amount, 10_000);
+
+    // Gross == floor: maker would net floor - fee → rejected
+    assert!(client.try_fill_order(&t.taker, &order_id, &amount).is_err());
+    // Gross == floor + fee(gross): maker nets exactly the floor → accepted
+    let gross = gross_for(amount);
+    let before = TokenClient::new(&t.env, &t.token_b).balance(&t.maker);
+    client.fill_order(&t.taker, &order_id, &gross);
+    let received = TokenClient::new(&t.env, &t.token_b).balance(&t.maker) - before;
+    assert_eq!(received, amount);
+    assert_eq!(
+        TokenClient::new(&t.env, &t.token_b).balance(&t.fee_vault),
+        gross - amount
+    );
+
+    // Fee holiday: the floor and the gross coincide again
+    client.set_fee(&0);
+    let order2 = place_1to1(&client, &t, amount, 10_000);
+    assert!(client.try_fill_order(&t.taker, &order2, &(amount - 1)).is_err());
+    client.fill_order(&t.taker, &order2, &amount);
 }
 
 #[test]
@@ -174,10 +232,11 @@ fn test_dust_fill_cannot_round_to_free() {
     // Paying zero is always rejected
     assert!(client.try_partial_fill(&t.taker, &order_id, &61_999, &0).is_err());
     // A 1-stroop payment is consumed whole by the fee — the maker would
-    // net zero, so the fill is rejected outright
+    // net zero, below the 1-stroop floor, so the fill is rejected outright
     assert!(client.try_partial_fill(&t.taker, &order_id, &61_999, &1).is_err());
-    // Smallest fill that nets the maker something: 2 stroops (1 fee + 1)
-    client.partial_fill(&t.taker, &order_id, &124_000, &2);
+    // 124,000 A has a 2-stroop floor; 2 gross nets 1 → rejected, 3 nets 2
+    assert!(client.try_partial_fill(&t.taker, &order_id, &124_000, &2).is_err());
+    client.partial_fill(&t.taker, &order_id, &124_000, &3);
 }
 
 #[test]
@@ -280,9 +339,20 @@ fn test_quote_fill_taker_direction() {
     // Taker pays 5,000 B to buy A
     let (bought, paid) = client.quote_fill(&t.token_a, &t.token_b, &5_000_0000000);
     assert!(paid <= 5_000_0000000);
-    // At 0.5 bps under par, 5,000 B buys slightly MORE than 5,000 A
-    assert!(bought > 5_000_0000000);
-    assert!(bought <= 10_000_0000000);
+    assert!(paid > 0);
+    // The maker's 0.5 bps discount is exactly offset by the 0.5 bps fee
+    // the taker sends on top, so 5,000 B buys exactly 5,000 A (gross
+    // quoting: before the fee came out of the maker's side, the same
+    // budget "bought" slightly more than 5,000 A).
+    assert_eq!(bought, 5_000_0000000);
+    assert_eq!(paid, 5_000_0000000);
+
+    // The quote is GROSS: it is fillable as-is, and tight to the stroop
+    let order_id = 1u64;
+    assert!(client
+        .try_partial_fill(&t.taker, &order_id, &bought, &(paid - 1))
+        .is_err());
+    client.partial_fill(&t.taker, &order_id, &bought, &paid);
 
     // Empty reverse side quotes zero
     let (bought_rev, paid_rev) = client.quote_fill(&t.token_b, &t.token_a, &5_000_0000000);
@@ -453,7 +523,7 @@ fn test_excluded_counterparty_blocked() {
     let t = setup();
     let client = SwapBookClient::new(&t.env, &t.contract_id);
     let blocked = Address::generate(&t.env);
-    StellarAssetClient::new(&t.env, &t.token_b).mint(&blocked, &1_000_0000000);
+    StellarAssetClient::new(&t.env, &t.token_b).mint(&blocked, &1_001_0000000);
 
     let order_id = client.place_order(
         &t.maker, &t.token_a, &t.token_b,
@@ -461,17 +531,16 @@ fn test_excluded_counterparty_blocked() {
         &0, &0, &0,
         &soroban_sdk::vec![&t.env, blocked.clone()],
     );
+    let pay = gross_for(1_000_0000000);
 
     // The excluded wallet cannot fill — not even partially
+    assert!(client.try_fill_order(&blocked, &order_id, &pay).is_err());
     assert!(client
-        .try_fill_order(&blocked, &order_id, &1_000_0000000)
-        .is_err());
-    assert!(client
-        .try_partial_fill(&blocked, &order_id, &1_0000000, &1_0000000)
+        .try_partial_fill(&blocked, &order_id, &1_0000000, &gross_for(1_0000000))
         .is_err());
 
     // Anyone else can
-    client.fill_order(&t.taker, &order_id, &1_000_0000000);
+    client.fill_order(&t.taker, &order_id, &pay);
     assert_eq!(client.get_order(&order_id).amount_in_remaining, 0);
 }
 
@@ -551,10 +620,12 @@ fn test_match_and_place_fills_and_escrows_atomically() {
         &0, &0, &0, &no_excl(&t.env),
     );
 
-    // Maker wants to sell 1,000 A for B: fill the 400 B order, sit the rest
+    // Maker wants to sell 1,000 A for B: fill the 400 B order (paying the
+    // counter-maker's 400 A floor gross of fee), sit the rest
+    let pay = gross_for(400_0000000);
     let fills = soroban_sdk::vec![
         &t.env,
-        FillSpec { order_id: reverse_id, fill_amount_in: 400_0000000, amount_out: 400_0000000 },
+        FillSpec { order_id: reverse_id, fill_amount_in: 400_0000000, amount_out: pay },
     ];
     let new_id = client.match_and_place(
         &t.maker, &t.token_a, &t.token_b,
@@ -565,23 +636,25 @@ fn test_match_and_place_fills_and_escrows_atomically() {
 
     // The fill leg settled: as taker on the reverse order, the maker
     // receives the counter-order's escrow (400 B) in FULL; the 0.5 bps
-    // fee comes out of the payment to the counter-maker, as on any fill.
-    let fee = (400_0000000i128 * 5 + 100_000 - 1) / 100_000;
+    // fee comes out of the maker's gross payment, and the counter-maker
+    // nets its full 400 A floor.
+    let fee = fee_of(pay);
     assert_eq!(
         TokenClient::new(&t.env, &t.token_b).balance(&t.maker),
         1_000_000_0000000 + 400_0000000
     );
     assert_eq!(
         TokenClient::new(&t.env, &t.token_a).balance(&counter),
-        400_0000000 - fee
+        pay - fee
     );
+    assert!(pay - fee >= 400_0000000);
     assert_eq!(
         TokenClient::new(&t.env, &t.token_a).balance(&t.fee_vault),
         fee
     );
-    // The remainder (600 A) sits escrowed as the new order
+    // The remainder (1,000 A minus the gross payment) sits escrowed
     let order = client.get_order(&new_id);
-    assert_eq!(order.amount_in_remaining, 600_0000000);
+    assert_eq!(order.amount_in_remaining, 1_000_0000000 - pay);
     assert_eq!(order.min_amount_out, 600_0000000);
     // Reverse order is fully consumed
     assert_eq!(client.get_order(&reverse_id).amount_in_remaining, 0);
@@ -598,13 +671,14 @@ fn test_match_and_place_full_consume_places_nothing() {
         &500_0000000, &500_0000000, &10_000,
         &0, &0, &0, &no_excl(&t.env),
     );
+    let pay = gross_for(500_0000000);
     let fills = soroban_sdk::vec![
         &t.env,
-        FillSpec { order_id: reverse_id, fill_amount_in: 500_0000000, amount_out: 500_0000000 },
+        FillSpec { order_id: reverse_id, fill_amount_in: 500_0000000, amount_out: pay },
     ];
     let new_id = client.match_and_place(
         &t.maker, &t.token_a, &t.token_b,
-        &500_0000000, &500_0000000, &10_000,
+        &pay, &500_0000000, &10_000,
         &0, &0, &0, &no_excl(&t.env), &fills,
     );
     assert_eq!(new_id, 0); // nothing left to sit
@@ -695,8 +769,9 @@ fn test_sep40_preferred_over_pushed_price_and_fails_closed() {
         &100_0000000, &0, &10_000,
         &1, &100, &0, &no_excl(&t.env),
     );
-    // fair = 100 A * 2 = 200 B; floor = ceil(fair * 99%) = 198 B
-    let min_pay = (200_0000000i128 * 9_900 + 10_000 - 1) / 10_000;
+    // fair = 100 A * 2 = 200 B; floor = ceil(fair * 99%) = 198 B net,
+    // which the taker must send gross of the fee
+    let min_pay = gross_for((200_0000000i128 * 9_900 + 10_000 - 1) / 10_000);
     assert!(client.try_fill_order(&t.taker, &order_id, &(min_pay - 1)).is_err());
     client.fill_order(&t.taker, &order_id, &min_pay);
 
@@ -716,8 +791,8 @@ fn test_sep40_preferred_over_pushed_price_and_fails_closed() {
         &1_0000000, &0, &10_000,
         &1, &100, &0, &no_excl(&t.env),
     );
-    // fair = 1 A * 62,000 = 62,000 B; floor = ceil(62,000 * 99%)
-    let pushed_floor = (62_000_0000000i128 * 9_900 + 10_000 - 1) / 10_000;
+    // fair = 1 A * 62,000 = 62,000 B; floor = ceil(62,000 * 99%), gross of fee
+    let pushed_floor = gross_for((62_000_0000000i128 * 9_900 + 10_000 - 1) / 10_000);
     StellarAssetClient::new(&t.env, &t.token_b).mint(&t.taker, &62_000_0000000);
     client.fill_order(&t.taker, &order3, &pushed_floor);
 }
@@ -909,4 +984,284 @@ fn test_admin_two_step_rotation() {
 
     // The rotated admin can operate (mock auths: flow-level check)
     client.set_fee(&0);
+}
+
+// ─── Pre-audit fixes ─────────────────────────────────────
+
+/// M3: a maker may hold at most MAX_OPEN_PER_MAKER_PAIR open orders on a
+/// directed pair; closing one frees a slot.
+#[test]
+fn test_maker_pair_open_order_cap() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+
+    let mut ids = Vec::new(&t.env);
+    for _ in 0..MAX_OPEN_PER_MAKER_PAIR {
+        ids.push_back(place_1to1(&client, &t, 1_0000000, 10_000));
+    }
+    // The 11th is refused with the dedicated error
+    let res = client.try_place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &1_0000000, &1_0000000, &10_000,
+        &0, &0, &0, &no_excl(&t.env),
+    );
+    assert_eq!(res, Err(Ok(SwapBookError::MakerPairLimit)));
+    // ...also via match_and_place (shared placement path)
+    let res = client.try_match_and_place(
+        &t.maker, &t.token_a, &t.token_b,
+        &1_0000000, &1_0000000, &10_000,
+        &0, &0, &0, &no_excl(&t.env), &soroban_sdk::vec![&t.env],
+    );
+    assert_eq!(res, Err(Ok(SwapBookError::MakerPairLimit)));
+
+    // The cap is per directed pair and per maker: the reverse side and
+    // another maker are unaffected
+    client.place_order(
+        &t.maker, &t.token_b, &t.token_a,
+        &1_0000000, &1_0000000, &10_000,
+        &0, &0, &0, &no_excl(&t.env),
+    );
+    client.place_order(
+        &t.taker, &t.token_a, &t.token_b,
+        &1_0000000, &1_0000000, &10_000,
+        &0, &0, &0, &no_excl(&t.env),
+    );
+
+    // Cancel frees a slot → the 11th now succeeds
+    client.cancel_order(&ids.get(0).unwrap());
+    let id11 = place_1to1(&client, &t, 1_0000000, 10_000);
+    assert!(id11 > 0);
+    assert_eq!(
+        client
+            .try_place_order(
+                &t.maker, &t.token_a, &t.token_b,
+                &1_0000000, &1_0000000, &10_000,
+                &0, &0, &0, &no_excl(&t.env),
+            ),
+        Err(Ok(SwapBookError::MakerPairLimit))
+    );
+
+    // A full fill frees a slot (a partial does not)
+    client.partial_fill(&t.taker, &ids.get(1).unwrap(), &5_000_000, &gross_for(5_000_000));
+    assert!(client
+        .try_place_order(
+            &t.maker, &t.token_a, &t.token_b,
+            &1_0000000, &1_0000000, &10_000,
+            &0, &0, &0, &no_excl(&t.env),
+        )
+        .is_err());
+    client.fill_order(&t.taker, &ids.get(1).unwrap(), &gross_for(5_000_000));
+    place_1to1(&client, &t, 1_0000000, 10_000);
+
+    // Expiry frees a slot
+    advance_to(&t.env, 10_001);
+    client.expire_order(&ids.get(2).unwrap());
+    place_1to1(&client, &t, 1_0000000, 20_000);
+
+    // Router claim frees a slot
+    let router = Address::generate(&t.env);
+    client.set_router(&router);
+    assert!(client
+        .try_place_order(
+            &t.maker, &t.token_a, &t.token_b,
+            &1_0000000, &1_0000000, &20_000,
+            &0, &0, &15_000, &no_excl(&t.env),
+        )
+        .is_err());
+    // (free one via expiry first so the timer order fits)
+    client.expire_order(&ids.get(3).unwrap());
+    let timer_id = client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &1_0000000, &1_0000000, &20_000,
+        &0, &0, &15_000, &no_excl(&t.env),
+    );
+    advance_to(&t.env, 15_001);
+    client.claim_expired_timer(&timer_id);
+    place_1to1(&client, &t, 1_0000000, 20_000);
+}
+
+/// L1: an order's ledger entry lives at least until its own expiry, not
+/// just the generic 30-day window, and stays readable after 30 days.
+#[test]
+fn test_order_ttl_covers_expiry() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+    let seq = t.env.ledger().sequence();
+
+    // 90-day order (the maximum expiry)
+    let far = seq + 1_555_200;
+    let far_id = place_1to1(&client, &t, 1_0000000, far);
+    // Short order: generic window
+    let near_id = place_1to1(&client, &t, 1_0000000, seq + 200);
+
+    let (ttl_far, ttl_near, ttl_pair, ttl_count) = t.env.as_contract(&t.contract_id, || {
+        let p = t.env.storage().persistent();
+        (
+            p.get_ttl(&DataKey::Order(far_id)),
+            p.get_ttl(&DataKey::Order(near_id)),
+            p.get_ttl(&DataKey::PairIndex(t.token_a.clone(), t.token_b.clone())),
+            p.get_ttl(&DataKey::MakerPairCount(
+                t.maker.clone(),
+                t.token_a.clone(),
+                t.token_b.clone(),
+            )),
+        )
+    });
+    assert!(ttl_far >= far - seq, "order TTL {ttl_far} must cover expiry");
+    assert!(ttl_far <= MAX_TTL_EXTEND_TO);
+    assert_eq!(ttl_near, TTL_EXTEND_TO);
+    // The pair index and maker counter share the longest order's horizon
+    assert!(ttl_pair >= far - seq);
+    assert!(ttl_count >= far - seq);
+
+    // 60 days later (well past the old 30-day window) the long order is
+    // still readable and fillable
+    advance_to(&t.env, seq + 1_036_800);
+    assert_eq!(client.get_order(&far_id).status, OrderStatus::Open);
+    client.fill_order(&t.taker, &far_id, &gross_for(1_0000000));
+}
+
+/// L1: bump_ttl is permissionless and re-extends an order's entries.
+#[test]
+fn test_bump_ttl() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+    let seq = t.env.ledger().sequence();
+
+    let id = place_1to1(&client, &t, 1_0000000, seq + 200);
+    let pair_key = DataKey::PairIndex(t.token_a.clone(), t.token_b.clone());
+
+    // Let most of the window elapse: TTL drops under the refresh threshold
+    advance_to(&t.env, seq + 450_000);
+    let ttl_before = t
+        .env
+        .as_contract(&t.contract_id, || t.env.storage().persistent().get_ttl(&pair_key));
+    assert!(ttl_before < TTL_THRESHOLD);
+
+    // Anyone (no auth mocked for a specific caller) can bump
+    client.bump_ttl(&soroban_sdk::vec![&t.env, id]);
+    let (ttl_order, ttl_pair) = t.env.as_contract(&t.contract_id, || {
+        let p = t.env.storage().persistent();
+        (p.get_ttl(&DataKey::Order(id)), p.get_ttl(&pair_key))
+    });
+    assert_eq!(ttl_order, TTL_EXTEND_TO);
+    assert_eq!(ttl_pair, TTL_EXTEND_TO);
+
+    // Unknown ids are reported, not silently skipped
+    assert_eq!(
+        client.try_bump_ttl(&soroban_sdk::vec![&t.env, 999u64]),
+        Err(Ok(SwapBookError::OrderNotFound))
+    );
+    // An empty list is a no-op
+    client.bump_ttl(&soroban_sdk::vec![&t.env]);
+}
+
+/// I4: oracle-mode orders reject a negative min_amount_out.
+#[test]
+fn test_oracle_order_rejects_negative_min_out() {
+    let t = setup();
+    let (client, _) = setup_oracle(&t);
+    let res = client.try_place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &1_0000000, &-1, &500,
+        &1, &50, &0, &no_excl(&t.env),
+    );
+    assert_eq!(res, Err(Ok(SwapBookError::InvalidAmount)));
+    // Zero remains fine (oracle mode ignores it)
+    client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &1_0000000, &0, &500,
+        &1, &50, &0, &no_excl(&t.env),
+    );
+}
+
+/// I4: a set auto_route_after must be strictly before expiry.
+#[test]
+fn test_auto_route_after_must_precede_expiry() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+    for timer in [500u32, 501] {
+        let res = client.try_place_order(
+            &t.maker, &t.token_a, &t.token_b,
+            &1_0000000, &1_0000000, &500,
+            &0, &0, &timer, &no_excl(&t.env),
+        );
+        assert_eq!(res, Err(Ok(SwapBookError::InvalidAmount)));
+    }
+    // Timer in the past is still rejected, timer just before expiry is fine
+    assert!(client
+        .try_place_order(
+            &t.maker, &t.token_a, &t.token_b,
+            &1_0000000, &1_0000000, &500,
+            &0, &0, &100, &no_excl(&t.env),
+        )
+        .is_err());
+    client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &1_0000000, &1_0000000, &500,
+        &0, &0, &499, &no_excl(&t.env),
+    );
+}
+
+/// M1: get_oracle_price refuses a stale pushed price, so external
+/// consumers (RFQ settlement) can never read one.
+#[test]
+fn test_get_oracle_price_enforces_freshness() {
+    let t = setup();
+    let (client, _) = setup_oracle(&t);
+    let (num, den, at) = client.get_oracle_price(&t.token_a, &t.token_b);
+    assert_eq!((num, den, at), (62_000, 1, 100));
+
+    // Last fresh ledger
+    advance_to(&t.env, 100 + ORACLE_STALE_LEDGERS);
+    client.get_oracle_price(&t.token_a, &t.token_b);
+    // One past: stale
+    advance_to(&t.env, 100 + ORACLE_STALE_LEDGERS + 1);
+    assert_eq!(
+        client.try_get_oracle_price(&t.token_a, &t.token_b),
+        Err(Ok(SwapBookError::OraclePriceStale))
+    );
+    // A fresh push heals it
+    client.update_oracle_price(&t.token_a, &t.token_b, &62_000, &1);
+    client.get_oracle_price(&t.token_a, &t.token_b);
+}
+
+/// L5: admin setters that were silent now emit events.
+#[test]
+fn test_admin_setters_emit_events() {
+    use soroban_sdk::testutils::Events as _;
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+
+    let oracle_admin = Address::generate(&t.env);
+    client.set_oracle_admin(&oracle_admin);
+    assert_eq!(
+        t.env.events().all(),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                (symbol_short!("oracle"), symbol_short!("admin")).into_val(&t.env),
+                oracle_admin.into_val(&t.env)
+            )
+        ]
+    );
+
+    let sep40_id = t.env.register(MockSep40, ());
+    let feed_a = OracleAsset::Stellar(t.token_a.clone());
+    client.set_sep40_feed(&t.token_a, &sep40_id, &feed_a, &0u64);
+    client.remove_sep40_feed(&t.token_a);
+    assert_eq!(
+        t.env.events().all(),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                (symbol_short!("sep40"), symbol_short!("rm_feed")).into_val(&t.env),
+                t.token_a.clone().into_val(&t.env)
+            )
+        ]
+    );
 }

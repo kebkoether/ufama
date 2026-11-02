@@ -7,9 +7,16 @@ use soroban_sdk::{
 
 // ─── Storage Keys ───────────────────────────────────────
 
+/// Instance TTL management (ledgers): extend when below threshold, up to
+/// target — same window as the SwapBook.
+const TTL_THRESHOLD: u32 = 100_000;
+const TTL_EXTEND_TO: u32 = 518_400; // ~30 days at 5s/ledger
+
 #[contracttype]
 pub enum DataKey {
     Admin,
+    /// Two-step admin rotation: the proposed new admin, pending acceptance.
+    PendingAdmin,
 }
 
 #[contracterror]
@@ -21,6 +28,7 @@ pub enum FeeVaultError {
     Unauthorized = 3,
     InsufficientBalance = 4,
     InvalidAmount = 5,
+    NoPendingAdmin = 6,
 }
 
 // ─── Contract ───────────────────────────────────────────
@@ -47,6 +55,7 @@ impl FeeVault {
         to: Address,
     ) -> Result<(), FeeVaultError> {
         Self::require_admin(&env)?;
+        Self::bump_instance_ttl(&env);
 
         if amount <= 0 {
             return Err(FeeVaultError::InvalidAmount);
@@ -82,13 +91,37 @@ impl FeeVault {
             .ok_or(FeeVaultError::NotInitialized)
     }
 
-    /// Transfer admin to a new address. Admin only.
-    pub fn set_admin(env: Env, new_admin: Address) -> Result<(), FeeVaultError> {
+    /// Propose a new admin (two-step rotation). Admin only. The proposed
+    /// address must call `accept_admin` to take over, so a mistyped
+    /// transfer is recoverable until accepted — the vault's withdraw key
+    /// is never handed to an address that has not proven it is live.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), FeeVaultError> {
         Self::require_admin(&env)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Self::bump_instance_ttl(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
         env.events().publish(
-            (symbol_short!("admin"), symbol_short!("set")),
+            (symbol_short!("admin"), symbol_short!("proposed")),
             new_admin,
+        );
+        Ok(())
+    }
+
+    /// Complete an admin rotation — callable only by the proposed admin.
+    pub fn accept_admin(env: Env) -> Result<(), FeeVaultError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(FeeVaultError::NoPendingAdmin)?;
+        pending.require_auth();
+        Self::bump_instance_ttl(&env);
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("accepted")),
+            pending,
         );
         Ok(())
     }
@@ -103,6 +136,13 @@ impl FeeVault {
             .ok_or(FeeVaultError::NotInitialized)?;
         admin.require_auth();
         Ok(())
+    }
+
+    /// Keep the instance (admin, pending admin) alive.
+    fn bump_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 }
 

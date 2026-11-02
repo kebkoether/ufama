@@ -47,9 +47,23 @@ const MAX_ORDERS_PER_PAIR: u32 = 200;
 /// orders from squatting the bounded pair index.
 const MAX_EXPIRY_LEDGERS: u32 = 1_555_200;
 
+/// Cap on OPEN orders one maker may hold on one directed pair. The pair
+/// index is bounded (MAX_ORDERS_PER_PAIR) and shared by every maker, so
+/// without a per-maker cap a single wallet could fill it with dust-floor
+/// orders and lock everyone else out of the pair.
+const MAX_OPEN_PER_MAKER_PAIR: u32 = 10;
+
 /// Storage TTL management (ledgers): extend when below threshold, up to target.
 const TTL_THRESHOLD: u32 = 100_000;
 const TTL_EXTEND_TO: u32 = 518_400; // ~30 days at 5s/ledger
+
+/// Upper bound on any single TTL extension this contract requests
+/// (~180 days at 5s/ledger). Order entries are extended to cover their
+/// own expiry (≤ MAX_EXPIRY_LEDGERS ahead), which always fits under this;
+/// the cap is a guard against ever asking the host for more than the
+/// network's max entry TTL (3,110,400 on pubnet at the time of writing —
+/// `env.storage().max_ttl()` is also consulted at runtime).
+const MAX_TTL_EXTEND_TO: u32 = 3_110_400;
 
 // ─── Storage Keys ───────────────────────────────────────
 
@@ -81,6 +95,10 @@ pub enum DataKey {
     PendingAdmin,
     /// Minimum order size (base units) for orders escrowing this token.
     MinOrder(Address),
+    /// Number of OPEN / PartialFill orders a maker holds on a directed
+    /// pair: (maker, token_in, token_out) → u32. Enforces
+    /// MAX_OPEN_PER_MAKER_PAIR; removed when it drops to zero.
+    MakerPairCount(Address, Address, Address),
 }
 
 // ─── Types ──────────────────────────────────────────────
@@ -242,6 +260,7 @@ pub enum SwapBookError {
     BelowMinimumOrder = 27,
     ExpiryTooFar = 28,
     NoPendingAdmin = 29,
+    MakerPairLimit = 30,
 }
 
 // ─── Contract ───────────────────────────────────────────
@@ -263,6 +282,7 @@ impl SwapBook {
     /// orders and settles the maker atomically.
     pub fn set_router(env: Env, router: Address) -> Result<(), SwapBookError> {
         Self::require_admin(&env)?;
+        Self::bump_instance_ttl(&env);
         env.storage().instance().set(&DataKey::Router, &router);
         // The router receives claimed escrow — a redirect must be visible
         // on-chain the moment it happens.
@@ -278,6 +298,7 @@ impl SwapBook {
     /// transfer is recoverable until accepted.
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), SwapBookError> {
         Self::require_admin(&env)?;
+        Self::bump_instance_ttl(&env);
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
@@ -297,6 +318,7 @@ impl SwapBook {
             .get(&DataKey::PendingAdmin)
             .ok_or(SwapBookError::NoPendingAdmin)?;
         pending.require_auth();
+        Self::bump_instance_ttl(&env);
         env.storage().instance().set(&DataKey::Admin, &pending);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.events().publish(
@@ -315,6 +337,7 @@ impl SwapBook {
         min_amount: i128,
     ) -> Result<(), SwapBookError> {
         Self::require_admin(&env)?;
+        Self::bump_instance_ttl(&env);
         if min_amount < 0 {
             return Err(SwapBookError::InvalidAmount);
         }
@@ -337,9 +360,16 @@ impl SwapBook {
     /// Set the authorized oracle admin (contract admin only).
     pub fn set_oracle_admin(env: Env, oracle_admin: Address) -> Result<(), SwapBookError> {
         Self::require_admin(&env)?;
+        Self::bump_instance_ttl(&env);
         env.storage()
             .instance()
             .set(&DataKey::OracleAdmin, &oracle_admin);
+        // The oracle admin can move every pushed price — a rotation must
+        // be visible on-chain the moment it happens.
+        env.events().publish(
+            (symbol_short!("oracle"), symbol_short!("admin")),
+            oracle_admin,
+        );
         Ok(())
     }
 
@@ -362,6 +392,7 @@ impl SwapBook {
             .get(&DataKey::OracleAdmin)
             .ok_or(SwapBookError::NotInitialized)?;
         oracle_admin.require_auth();
+        Self::bump_instance_ttl(&env);
 
         if price_num <= 0 || price_den <= 0 {
             return Err(SwapBookError::InvalidPrice);
@@ -467,6 +498,11 @@ impl SwapBook {
         if mode == PriceMode::Fixed && min_amount_out <= 0 {
             return Err(SwapBookError::InvalidAmount);
         }
+        // Oracle mode ignores min_amount_out at fill time, but it is still
+        // stored and echoed in events — a negative value is never valid.
+        if mode == PriceMode::Oracle && min_amount_out < 0 {
+            return Err(SwapBookError::InvalidAmount);
+        }
         if mode == PriceMode::Oracle
             && (max_slippage_bps == 0 || max_slippage_bps > MAX_SLIPPAGE_BPS)
         {
@@ -482,14 +518,14 @@ impl SwapBook {
         if expiry > env.ledger().sequence().saturating_add(MAX_EXPIRY_LEDGERS) {
             return Err(SwapBookError::ExpiryTooFar);
         }
-        if let Some(min) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, i128>(&DataKey::MinOrder(token_in.clone()))
-        {
+        let min_key = DataKey::MinOrder(token_in.clone());
+        if let Some(min) = env.storage().persistent().get::<DataKey, i128>(&min_key) {
             if amount_in < min {
                 return Err(SwapBookError::BelowMinimumOrder);
             }
+            env.storage()
+                .persistent()
+                .extend_ttl(&min_key, TTL_THRESHOLD, TTL_EXTEND_TO);
         }
 
         // If Oracle mode, verify that a fresh oracle price exists for this pair
@@ -498,8 +534,13 @@ impl SwapBook {
             Self::check_oracle_fresh(&env, &price)?;
         }
 
-        // Validate auto_route_after is in the future (if set)
-        if auto_route_after > 0 && auto_route_after <= env.ledger().sequence() {
+        // Validate auto_route_after (if set): it must be in the future AND
+        // strictly before expiry — a timer that fires after the order has
+        // lapsed can never be claimed (claim_expired_timer refuses lapsed
+        // orders), so accepting it would only mislead the maker.
+        if auto_route_after > 0
+            && (auto_route_after <= env.ledger().sequence() || auto_route_after >= expiry)
+        {
             return Err(SwapBookError::InvalidAmount);
         }
 
@@ -516,6 +557,13 @@ impl SwapBook {
             .unwrap_or(Vec::new(&env));
         if order_ids.len() >= MAX_ORDERS_PER_PAIR {
             return Err(SwapBookError::BookFull);
+        }
+        // ...and the maker's own share of it
+        let count_key =
+            DataKey::MakerPairCount(maker.clone(), token_in.clone(), token_out.clone());
+        let open_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if open_count >= MAX_OPEN_PER_MAKER_PAIR {
+            return Err(SwapBookError::MakerPairLimit);
         }
 
         // Transfer token_in from maker to this contract (escrow)
@@ -551,14 +599,19 @@ impl SwapBook {
 
         Self::write_order(&env, order_id, &order);
 
+        // The pair index and the maker's counter must outlive the longest
+        // order they describe, so they share the order's TTL horizon.
+        let (ttl_threshold, ttl_extend_to) = Self::order_ttl_window(&env, &order);
         order_ids.push_back(order_id);
         env.storage().persistent().set(&pair_key, &order_ids);
         env.storage()
             .persistent()
-            .extend_ttl(&pair_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            .extend_ttl(&pair_key, ttl_threshold, ttl_extend_to);
+        env.storage().persistent().set(&count_key, &(open_count + 1));
         env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+            .persistent()
+            .extend_ttl(&count_key, ttl_threshold, ttl_extend_to);
+        Self::bump_instance_ttl(&env);
 
         env.events().publish(
             (symbol_short!("order"), symbol_short!("placed"), order_id),
@@ -574,8 +627,10 @@ impl SwapBook {
     ///
     /// Each `FillSpec` targets an order selling `token_out` for `token_in`
     /// (the reverse side of the new order). The maker acts as taker on
-    /// those fills, paying `amount_out` of their token_in per fill. The
-    /// payments plus the escrowed remainder must not exceed `amount_in`.
+    /// those fills, paying `amount_out` of their token_in per fill —
+    /// `amount_out` is the GROSS payment (protocol fee included), exactly
+    /// as `quote_fill` reports it. The payments plus the escrowed
+    /// remainder must not exceed `amount_in`.
     ///
     /// Returns the new order's id, or 0 if the fills consumed the full
     /// amount and nothing was placed. Placement params mirror place_order.
@@ -639,6 +694,7 @@ impl SwapBook {
     /// compile-time; 0 is valid (fee holiday).
     pub fn set_fee(env: Env, fee_per_100k: i128) -> Result<(), SwapBookError> {
         Self::require_admin(&env)?;
+        Self::bump_instance_ttl(&env);
         if !(0..=MAX_FEE_PER_100K).contains(&fee_per_100k) {
             return Err(SwapBookError::FeeAboveCap);
         }
@@ -658,6 +714,7 @@ impl SwapBook {
     /// Set the max acceptable SEP-40 price age in seconds. Admin only.
     pub fn set_sep40_max_age(env: Env, max_age_secs: u64) -> Result<(), SwapBookError> {
         Self::require_admin(&env)?;
+        Self::bump_instance_ttl(&env);
         env.storage().instance().set(&DataKey::Sep40MaxAge, &max_age_secs);
         env.events().publish(
             (symbol_short!("sep40"), symbol_short!("max_age")),
@@ -683,6 +740,7 @@ impl SwapBook {
         max_age_secs: u64,
     ) -> Result<(), SwapBookError> {
         Self::require_admin(&env)?;
+        Self::bump_instance_ttl(&env);
         let oracle_decimals: u32 = env.invoke_contract(
             &oracle,
             &Symbol::new(&env, "decimals"),
@@ -708,7 +766,49 @@ impl SwapBook {
     /// pushed price). Admin only.
     pub fn remove_sep40_feed(env: Env, token: Address) -> Result<(), SwapBookError> {
         Self::require_admin(&env)?;
-        env.storage().persistent().remove(&DataKey::Sep40Feed(token));
+        Self::bump_instance_ttl(&env);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Sep40Feed(token.clone()));
+        // Dropping a feed silently downgrades every pair containing the
+        // token to the pushed price — observers must see it.
+        env.events().publish(
+            (symbol_short!("sep40"), symbol_short!("rm_feed")),
+            token,
+        );
+        Ok(())
+    }
+
+    /// Permissionless TTL maintenance: extend the ledger entries of the
+    /// given orders (and their pair indexes / maker counters) so a
+    /// long-dated order never archives before its own expiry. Anyone may
+    /// call; it moves no funds and changes no order state.
+    pub fn bump_ttl(env: Env, order_ids: Vec<u64>) -> Result<(), SwapBookError> {
+        for i in 0..order_ids.len() {
+            let order_id = order_ids.get(i).unwrap();
+            let order = Self::read_order(&env, order_id)?;
+            let (threshold, extend_to) = Self::order_ttl_window(&env, &order);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Order(order_id), threshold, extend_to);
+            let pair_key = DataKey::PairIndex(order.token_in.clone(), order.token_out.clone());
+            if env.storage().persistent().has(&pair_key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&pair_key, threshold, extend_to);
+            }
+            let count_key = DataKey::MakerPairCount(
+                order.maker.clone(),
+                order.token_in.clone(),
+                order.token_out.clone(),
+            );
+            if env.storage().persistent().has(&count_key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&count_key, threshold, extend_to);
+            }
+        }
+        Self::bump_instance_ttl(&env);
         Ok(())
     }
 
@@ -732,7 +832,7 @@ impl SwapBook {
         order.status = OrderStatus::Cancelled;
         order.amount_in_remaining = 0;
         Self::write_order(&env, order_id, &order);
-        Self::remove_from_pair_index(&env, &order.token_in, &order.token_out, order_id);
+        Self::close_order_indexes(&env, &order);
 
         env.events().publish(
             (symbol_short!("order"), symbol_short!("cancel"), order_id),
@@ -765,7 +865,7 @@ impl SwapBook {
         order.status = OrderStatus::Expired;
         order.amount_in_remaining = 0;
         Self::write_order(&env, order_id, &order);
-        Self::remove_from_pair_index(&env, &order.token_in, &order.token_out, order_id);
+        Self::close_order_indexes(&env, &order);
 
         env.events().publish(
             (symbol_short!("order"), symbol_short!("expired"), order_id),
@@ -823,10 +923,11 @@ impl SwapBook {
     /// The taker wants to acquire `token_buy` and pay with `token_pay`.
     /// Scans orders where makers sell `token_buy` for `token_pay`
     /// (i.e. PairIndex(token_buy, token_pay)) and greedily computes how much
-    /// `token_buy` the taker receives for spending up to `amount_pay`
-    /// (before protocol fee).
+    /// `token_buy` the taker receives for spending up to `amount_pay`.
     ///
-    /// Returns (amount_bought, amount_paid).
+    /// Returns (amount_bought, amount_paid). `amount_paid` is the GROSS
+    /// amount the taker must send — the maker's floor plus the protocol
+    /// fee — so a quote passed straight to `partial_fill` is fillable.
     pub fn quote_fill(
         env: Env,
         token_buy: Address,
@@ -869,7 +970,7 @@ impl SwapBook {
             if max_fill <= 0 {
                 continue;
             }
-            let pay = match Self::required_payment(&env, &order, max_fill) {
+            let pay = match Self::required_gross_payment(&env, &order, max_fill) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
@@ -928,7 +1029,7 @@ impl SwapBook {
         order.amount_in_remaining = 0;
         order.status = OrderStatus::Routed;
         Self::write_order(&env, order_id, &order);
-        Self::remove_from_pair_index(&env, &order.token_in, &order.token_out, order_id);
+        Self::close_order_indexes(&env, &order);
 
         env.events().publish(
             (symbol_short!("order"), symbol_short!("claimed"), order_id),
@@ -975,13 +1076,18 @@ impl SwapBook {
         expired
     }
 
-    /// Read the current oracle price for a pair.
+    /// Read the current oracle price for a pair. Enforces the same
+    /// freshness bound as fills (ORACLE_STALE_LEDGERS for pushed prices;
+    /// SEP-40 reads are age-checked at the source), so an external
+    /// consumer (e.g. the RFQ settlement contract) can never act on a
+    /// stale pushed price.
     pub fn get_oracle_price(
         env: Env,
         token_in: Address,
         token_out: Address,
     ) -> Result<(i128, i128, u32), SwapBookError> {
         let price = Self::read_oracle(&env, &token_in, &token_out)?;
+        Self::check_oracle_fresh(&env, &price)?;
         Ok((price.num, price.den, price.updated_at))
     }
 
@@ -1007,9 +1113,55 @@ impl SwapBook {
     fn write_order(env: &Env, order_id: u64, order: &Order) {
         let key = DataKey::Order(order_id);
         env.storage().persistent().set(&key, order);
+        let (threshold, extend_to) = Self::order_ttl_window(env, order);
         env.storage()
             .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            .extend_ttl(&key, threshold, extend_to);
+    }
+
+    /// (threshold, extend_to) for an order's ledger entries: the usual
+    /// 30-day refresh, widened to cover the order's own expiry so a
+    /// 90-day order never archives while still live. Capped at
+    /// MAX_TTL_EXTEND_TO and at the network's max entry TTL. The threshold
+    /// is raised alongside, so an entry that no longer covers its expiry
+    /// is always re-extended, not skipped.
+    fn order_ttl_window(env: &Env, order: &Order) -> (u32, u32) {
+        let needed = order
+            .expiry
+            .saturating_sub(env.ledger().sequence())
+            .saturating_add(1);
+        let cap = MAX_TTL_EXTEND_TO.min(env.storage().max_ttl());
+        let extend_to = TTL_EXTEND_TO.max(needed).min(cap);
+        let threshold = TTL_THRESHOLD.max(needed).min(extend_to);
+        (threshold, extend_to)
+    }
+
+    /// Keep the instance (admin, router, fee, next id, ...) alive.
+    fn bump_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Bookkeeping when an order leaves Open/PartialFill (filled to zero,
+    /// cancelled, expired, routed): drop it from the pair index and
+    /// release the maker's per-pair slot.
+    fn close_order_indexes(env: &Env, order: &Order) {
+        Self::remove_from_pair_index(env, &order.token_in, &order.token_out, order.id);
+        let count_key = DataKey::MakerPairCount(
+            order.maker.clone(),
+            order.token_in.clone(),
+            order.token_out.clone(),
+        );
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if count <= 1 {
+            env.storage().persistent().remove(&count_key);
+        } else {
+            env.storage().persistent().set(&count_key, &(count - 1));
+            env.storage()
+                .persistent()
+                .extend_ttl(&count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
     }
 
     /// Read the price for a directed pair. Precedence: when a SEP-40
@@ -1023,14 +1175,8 @@ impl SwapBook {
         token_out: &Address,
     ) -> Result<OraclePriceData, SwapBookError> {
         {
-            let feed_in: Option<FeedConfig> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Sep40Feed(token_in.clone()));
-            let feed_out: Option<FeedConfig> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Sep40Feed(token_out.clone()));
+            let feed_in = Self::read_feed(env, token_in);
+            let feed_out = Self::read_feed(env, token_out);
             if let (Some(feed_in), Some(feed_out)) = (feed_in, feed_out) {
                 let p_in = Self::sep40_lastprice(env, &feed_in)?;
                 let p_out = Self::sep40_lastprice(env, &feed_out)?;
@@ -1065,10 +1211,28 @@ impl SwapBook {
                 });
             }
         }
+        let price_key = DataKey::OraclePrice(token_in.clone(), token_out.clone());
+        let price: OraclePriceData = env
+            .storage()
+            .persistent()
+            .get(&price_key)
+            .ok_or(SwapBookError::OraclePriceNotSet)?;
         env.storage()
             .persistent()
-            .get(&DataKey::OraclePrice(token_in.clone(), token_out.clone()))
-            .ok_or(SwapBookError::OraclePriceNotSet)
+            .extend_ttl(&price_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        Ok(price)
+    }
+
+    /// A token's SEP-40 feed config, keeping the entry alive on read.
+    fn read_feed(env: &Env, token: &Address) -> Option<FeedConfig> {
+        let key = DataKey::Sep40Feed(token.clone());
+        let feed: Option<FeedConfig> = env.storage().persistent().get(&key);
+        if feed.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        feed
     }
 
     /// Fetch one SEP-40 lastprice, enforcing positivity and max age.
@@ -1170,20 +1334,23 @@ impl SwapBook {
             return Err(SwapBookError::FillExceedsRemaining);
         }
 
-        // ── Price validation (ceiling — taker can never underpay) ──
+        // ── Price validation: the maker's floor is NET of the protocol
+        // fee. The fee comes out of the taker's payment, so the floor is
+        // compared against what the maker actually receives — the taker
+        // can never underpay the maker by the fee. ──
+        // Fee rounds up (min 1 stroop) so no fill is fee-free
+        let fee = Self::calculate_fee(env, amount_out);
+        let maker_receives = amount_out - fee;
         let required_out = Self::required_payment(env, &order, fill_amount_in)?;
-        if amount_out < required_out {
+        if maker_receives < required_out {
             return Err(match order.price_mode {
                 PriceMode::Fixed => SwapBookError::InsufficientOutput,
                 PriceMode::Oracle => SwapBookError::OracleSlippageExceeded,
             });
         }
-
-        // Fee rounds up (min 1 stroop) so no fill is fee-free
-        let fee = Self::calculate_fee(env, amount_out);
-        let maker_receives = amount_out - fee;
         // A fill so small the fee consumes the whole payment would strip
-        // escrow while paying the maker nothing.
+        // escrow while paying the maker nothing (reachable only when the
+        // floor itself rounds to zero, e.g. a dust oracle fill).
         if maker_receives <= 0 {
             return Err(SwapBookError::InvalidAmount);
         }
@@ -1209,7 +1376,7 @@ impl SwapBook {
         order.amount_in_remaining -= fill_amount_in;
         if order.amount_in_remaining == 0 {
             order.status = OrderStatus::Filled;
-            Self::remove_from_pair_index(env, &order.token_in, &order.token_out, order_id);
+            Self::close_order_indexes(env, &order);
         } else {
             order.status = OrderStatus::PartialFill;
         }
@@ -1222,8 +1389,9 @@ impl SwapBook {
         Ok(())
     }
 
-    /// The minimum token_out payment required to take `fill_amount_in` of the
-    /// order, per the order's pricing mode. Always rounds UP.
+    /// The minimum token_out the MAKER must receive (net of protocol fee)
+    /// for `fill_amount_in` of the order, per its pricing mode. Always
+    /// rounds UP.
     fn required_payment(
         env: &Env,
         order: &Order,
@@ -1253,31 +1421,65 @@ impl SwapBook {
         }
     }
 
+    /// The GROSS token_out a taker must send so that, after the protocol
+    /// fee is taken out, the maker still receives `required_payment`:
+    /// the smallest g with g - ceil(g * fee / D) >= net, which is
+    /// ceil(net * D / (D - fee)). This is what `quote_fill` reports and
+    /// what `fill_inner` accepts.
+    fn required_gross_payment(
+        env: &Env,
+        order: &Order,
+        fill_amount_in: i128,
+    ) -> Result<i128, SwapBookError> {
+        let net = Self::required_payment(env, order, fill_amount_in)?;
+        Ok(Self::gross_for_net(env, net))
+    }
+
+    fn gross_for_net(env: &Env, net: i128) -> i128 {
+        let fee = Self::fee_per_100k(env);
+        Self::muldiv_ceil(env, net, FEE_DENOMINATOR, FEE_DENOMINATOR - fee)
+    }
+
     /// Given a taker budget of token_pay, the largest fill of the order's
-    /// token_in that the budget can afford. Returns (fill_amount, payment).
+    /// token_in that the budget can afford, fee included. Returns
+    /// (fill_amount, gross_payment).
     fn max_affordable_fill(
         env: &Env,
         order: &Order,
         budget: i128,
     ) -> Result<(i128, i128), SwapBookError> {
-        // Invert the price to estimate max fill, then verify with the exact
-        // (ceiling) payment and step down if rounding pushed it over budget.
+        // Strip the fee from the budget, invert the price to estimate the
+        // max fill, then verify with the exact (ceiling) gross payment and
+        // step down if rounding pushed it over budget.
+        let net_budget = Self::muldiv_floor(
+            env,
+            budget,
+            FEE_DENOMINATOR - Self::fee_per_100k(env),
+            FEE_DENOMINATOR,
+        );
         let mut fill = match order.price_mode {
-            PriceMode::Fixed => Self::muldiv_floor(env, budget, order.amount_in, order.min_amount_out),
+            PriceMode::Fixed => {
+                Self::muldiv_floor(env, net_budget, order.amount_in, order.min_amount_out)
+            }
             PriceMode::Oracle => {
                 let price = Self::read_oracle(env, &order.token_in, &order.token_out)?;
                 Self::check_oracle_fresh(env, &price)?;
                 let slippage = order.max_slippage_bps as i128;
-                // budget / (price * (1 - slippage))
-                let gross = Self::muldiv_floor(env, budget, BPS_DENOMINATOR, BPS_DENOMINATOR - slippage);
-                Self::muldiv_floor(env, gross, price.den, price.num)
+                // net_budget / (price * (1 - slippage))
+                let fair = Self::muldiv_floor(
+                    env,
+                    net_budget,
+                    BPS_DENOMINATOR,
+                    BPS_DENOMINATOR - slippage,
+                );
+                Self::muldiv_floor(env, fair, price.den, price.num)
             }
         };
         if fill > order.amount_in_remaining {
             fill = order.amount_in_remaining;
         }
         while fill > 0 {
-            let pay = Self::required_payment(env, order, fill)?;
+            let pay = Self::required_gross_payment(env, order, fill)?;
             if pay <= budget {
                 return Ok((fill, pay));
             }
@@ -1350,6 +1552,9 @@ impl SwapBook {
                 }
             }
             env.storage().persistent().set(&pair_key, &new_ids);
+            env.storage()
+                .persistent()
+                .extend_ttl(&pair_key, TTL_THRESHOLD, TTL_EXTEND_TO);
         }
     }
 }

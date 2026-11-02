@@ -357,7 +357,7 @@
                   "u64": "1"
                 },
                 {
-                  "i128": "1980000000"
+                  "i128": "1980099005"
                 }
               ]
             }
@@ -376,7 +376,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                     },
                     {
-                      "i128": "1979901000"
+                      "i128": "1980000000"
                     }
                   ]
                 }
@@ -396,7 +396,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                     },
                     {
-                      "i128": "99000"
+                      "i128": "99005"
                     }
                   ]
                 }
@@ -599,7 +599,7 @@
                   "u64": "3"
                 },
                 {
-                  "i128": "613800000000"
+                  "i128": "613830691535"
                 }
               ]
             }
@@ -618,7 +618,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                     },
                     {
-                      "i128": "613769310000"
+                      "i128": "613800000000"
                     }
                   ]
                 }
@@ -638,7 +638,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                     },
                     {
-                      "i128": "30690000"
+                      "i128": "30691535"
                     }
                   ]
                 }
@@ -1041,6 +1041,39 @@
           "ext": "v0"
         },
         "live_until": 6312099
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "MakerPairCount"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  },
+                  {
+                    "address": "CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN"
+                  },
+                  {
+                    "address": "CD3FXVGYSLQFFTW3UH6WFF2OKZH7VERGZJZAMJHTGHBWO4F6URWEJL23"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u32": 1
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 518500
       },
       {
         "entry": {
@@ -2141,7 +2174,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "30789000"
+                      "i128": "30790540"
                     }
                   },
                   {
@@ -2193,7 +2226,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "10615749211000"
+                      "i128": "10615780000000"
                     }
                   },
                   {
@@ -2245,7 +2278,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "10004220000000"
+                      "i128": "10004189209460"
                     }
                   },
                   {
@@ -2414,7 +2447,7 @@
               }
             ],
             "data": {
-              "i128": "613769310000"
+              "i128": "613800000000"
             }
           }
         }
@@ -2443,7 +2476,7 @@
               }
             ],
             "data": {
-              "i128": "30690000"
+              "i128": "30691535"
             }
           }
         }
@@ -2506,10 +2539,10 @@
                   "i128": "10000000"
                 },
                 {
-                  "i128": "613800000000"
+                  "i128": "613830691535"
                 },
                 {
-                  "i128": "30690000"
+                  "i128": "30691535"
                 }
               ]
             }

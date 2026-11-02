@@ -147,7 +147,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5"
                 },
                 {
-                  "i128": "10000000000"
+                  "i128": "10010000000"
                 }
               ]
             }
@@ -245,7 +245,7 @@
                   "u64": "1"
                 },
                 {
-                  "i128": "10000000000"
+                  "i128": "10000500026"
                 }
               ]
             }
@@ -264,7 +264,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                     },
                     {
-                      "i128": "9999500000"
+                      "i128": "10000000000"
                     }
                   ]
                 }
@@ -284,7 +284,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                     },
                     {
-                      "i128": "500000"
+                      "i128": "500026"
                     }
                   ]
                 }
@@ -1055,7 +1055,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "500000"
+                      "i128": "500026"
                     }
                   },
                   {
@@ -1107,7 +1107,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "10009999500000"
+                      "i128": "10010000000000"
                     }
                   },
                   {
@@ -1159,7 +1159,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "9990000000000"
+                      "i128": "9989999499974"
                     }
                   },
                   {
@@ -1211,7 +1211,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "10000000000"
+                      "i128": "10010000000"
                     }
                   },
                   {
