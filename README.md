@@ -144,43 +144,52 @@ Deploy to testnet: `./scripts/deploy-testnet.sh`.
 | Aqua | 1 | Aqua REST + pool `estimate_swap` | ✅ `swap_chained` via adapter (mainnet-verified) |
 | SushiSwap V3 | 2 | pool `slot0` spot | ✅ direct `pool.swap` via adapter (mainnet-verified) |
 | Stellar DEX | 3 | Horizon path-finding (includes classic AMMs) | classic `path_payment` — standalone tx or blend leg, never a Router segment |
+| Curve (stableswap-rs) | 4 | pool `get_dy` | adapter deployed, unarmed until the mainnet factory exists |
 
-## v1.1 (in repo, not yet deployed)
+## Mainnet status — v1.2.1 live
 
-The contracts on `main` are ahead of the deployed mainnet set. New in
-v1.1 — all tested, awaiting deployment + backend `SWAPBOOK_V11=1`:
+Everything on `main` is deployed. The live contract set (addresses in
+[DEPLOYMENTS.md](./DEPLOYMENTS.md)): FeeVault, SwapBook v1.2, Router
+v1.2.1 (surplus share), TwapBook v1.2, Aqua + Sushi adapters v1.2, the
+Curve adapter (deployed, **unarmed** until Curve's factory lands on
+mainnet), and RfqSettle (2026-10-17). Backend runs on Railway with
+`SWAPBOOK_V11=1`; frontend on Vercel.
+
+What the live set includes beyond v1.0:
 
 - **`match_and_place`**: fills reverse-side orders and escrows the
   remainder in ONE invocation — the book can't move mid-plan.
 - **Excluded counterparties**: per-order list (≤ 5) of addresses that may
   not fill it; protocol-operated liquidity wallets auto-exclude each
-  other via `SDF_LIQUIDITY_WALLETS`, so seeded inventory can never cross
-  itself. Self-fills are rejected outright.
-- **SEP-40 oracle (Reflector-ready)**: when configured and both tokens of
-  a pair have feeds, prices come exclusively from the SEP-40 oracle (fail
-  closed on stale/missing); other pairs keep the guarded pushed price.
-- **Settable fees, hard-capped**: SwapBook and Router fees are now
-  admin-settable 0–0.5 bps (compile-time cap, like TwapBook's 10 bps).
-  The Router DEFAULTS TO ZERO — instant swaps are venue-fees-only, as the
-  UI says; P2P keeps its advertised 0.5 bps.
+  other via `SDF_LIQUIDITY_WALLETS`. Self-fills are rejected outright.
+- **SEP-40 oracle (Reflector + RedStone)**: when both tokens of a pair
+  have feeds, prices come exclusively from the oracle (fail closed on
+  stale/missing). Feeds registered for XLM/USDC and the Etherfuse
+  stablebonds (USTRY, CETES, TESOURO).
+- **Settable fees, hard-capped**: Router 0 bps (cap 0.5), SwapBook 0.5
+  bps (cap 0.5), TwapBook 10 bps (cap 10), RfqSettle 0.5 bps (cap 0.5).
 - **Partner fee-split on Soroban legs**: `execute_route_partner` carves
-  the integrator's fee (≤ 100 bps) from the output ON TOP of the protocol
-  fee and pays it on-chain — closes the classic-legs-only gap.
-- Backend: peer-swap plans prefer organic makers over protocol liquidity
-  wallets, and skip orders that exclude the taker; `/v1` uses the on-chain
-  partner split when enabled.
+  the integrator's fee (≤ 100 bps) from the output on-chain.
+- **RFQ**: makers stream requests, sign quotes locally, and the taker
+  settles atomically against an on-chain NAV band. Standing orders stay
+  as the fallback. SDK in [sdk/](./sdk/), OpenAPI at `/openapi.yaml`.
 - **Off-chain wallet screening** (`SCREENING_PROVIDER`): denylist or
   Predicate policy API, enforced at every build endpoint plus a
   connect-time `GET /api/screen/:address` — the contracts themselves stay
   permissionless by design.
+- **Legal**: Terms of Use, Privacy Notice and a first-connect
+  acknowledgment gate (`frontend/src/lib/legal.ts`).
 
 ## Known gaps / next up
 
-- **Deploy v1.1** (addresses will supersede DEPLOYMENTS.md) and flip
-  `SWAPBOOK_V11=1` + `SWAPBOOK_CONTRACT_ID` on Railway.
+- **Audit** of the live contract set before public promotion (Stellar
+  Audit Bank application in progress; scope in [audit/](./audit/)).
+- **Curve**: arm the adapter once Curve's mainnet factory exists
+  (`scripts/curve.sh`).
 - **Indexer**: the Postgres schema in `backend/src/db/schema.sql` has no
   writer yet — consume the contract events (`order placed/filled/...`).
-- **Audit** before public launch (of the v1.1 contract set).
+- **Maker**: move the RFQ maker bot to an always-on Railway service
+  (`backend/railway.maker.json`) and fund it on the bond side.
 
 ## License
 

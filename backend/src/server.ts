@@ -2471,6 +2471,30 @@ app.get('/api/health', async (_req, res) => {
   });
 });
 
+/**
+ * GET /api/health/maker — 200 only while at least one RFQ maker is
+ * streaming requests, else 503. Built for dumb uptime monitors (a
+ * GitHub Actions cron in .github/workflows/maker-watch.yml, UptimeRobot,
+ * Better Stack): HTTP status is the signal, the body is the explanation.
+ * A dead maker is otherwise invisible — the RFQ tab just shows the
+ * standing-order / DEX fallbacks.
+ */
+app.get('/api/health/maker', (_req, res) => {
+  if (!config.rfqContractId) {
+    res.status(503).json({ ok: false, reason: 'rfq not configured' });
+    return;
+  }
+  const makersConnected = rfq.listenerCount();
+  const ok = makersConnected > 0;
+  res.status(ok ? 200 : 503).json({
+    ok,
+    makersConnected,
+    makerKeys: RFQ_MAKER_KEYS.size,
+    openRequests: rfq.openCount(),
+    reason: ok ? undefined : 'no maker connected to /api/rfq/stream',
+  });
+});
+
 function rpcHostOnly(): string {
   try {
     return new URL(config.rpcUrl).host;
