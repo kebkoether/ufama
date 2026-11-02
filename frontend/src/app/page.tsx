@@ -131,26 +131,6 @@ export default function Home() {
           ))}
         </div>
       </div>
-
-      {/* Footer */}
-      <div
-        style={{
-          textAlign: 'center',
-          marginTop: '32px',
-          fontSize: '12px',
-          color: '#565b68',
-        }}
-      >
-        Built on{' '}
-        <span style={{ color: '#8a8f9c', fontWeight: 500 }}>Stellar</span>
-        {' '}&middot;{' '}
-        Powered by{' '}
-        <span style={{ color: '#8a8f9c', fontWeight: 500 }}>Soroban</span>
-        {' '}&middot;{' '}
-        <span title="Build version" style={{ fontFamily: 'monospace', fontSize: '11px' }}>
-          {process.env.NEXT_PUBLIC_BUILD_SHA}
-        </span>
-      </div>
     </div>
   );
 }
