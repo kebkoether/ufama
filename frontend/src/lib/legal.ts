@@ -12,7 +12,7 @@ export const TERMS_VERSION = '2026-11-02';
 /** Who runs the hosted interface. Fill in once an entity exists. */
 export const OPERATOR_NAME = 'the operator of ufama.trade';
 /** US state whose law governs the Terms (e.g. "Delaware"). Required before launch. */
-export const GOVERNING_STATE = '[GOVERNING STATE]';
+export const GOVERNING_STATE = 'California';
 export const LEGAL_CONTACT = 'legal@ufama.trade';
 export const SITE = 'ufama.trade';
 export const REPO_URL = 'https://github.com/kebkoether/ufama';
