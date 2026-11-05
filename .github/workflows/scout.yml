@@ -56,6 +56,10 @@ jobs:
         run: |
           git clone --quiet https://github.com/rust-lang/rust-clippy "$HOME/rust-clippy-mirror"
           git -C "$HOME/rust-clippy-mirror" branch master origin/main
+          # Clones only get a local branch for the mirror's HEAD, and dylint
+          # revparses the bare name "master", so HEAD must point at it.
+          git -C "$HOME/rust-clippy-mirror" symbolic-ref HEAD refs/heads/master
+          git -C "$HOME/rust-clippy-mirror" rev-parse master
           git config --global url."file://$HOME/rust-clippy-mirror".insteadOf "https://github.com/rust-lang/rust-clippy"
       - name: Run Scout
         run: |
