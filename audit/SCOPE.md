@@ -26,7 +26,7 @@ cargo build --release --target wasm32v1-none
 
 | Contract | Path | Rust LOC | Unit tests | Mainnet address | Priority |
 |---|---|---|---|---|---|
-| RfqSettle | `contracts/rfq/src/lib.rs` | 490 | 14 | `CBFNGCV7IIZC2E2LUQFLBJU2E4UKG4AINSDWWOU5S64OFKHXTOB74DNB` | **1** |
+| RfqSettle | `contracts/rfq/src/lib.rs` | 490 | 14 | `CBOK7OLUI763SDSBEUXDEMTOM2OLH4ETIIKPCJBQZG6SETK7YSEPSAT7` | **1** |
 | SwapBook v1.2 | `contracts/swap-book/src/lib.rs` | 1563 | 41 | `CB2KKROC2H6H757TY4H67ZAT3POFZWY532WOMQDQFWUFWK7PTJUTAEBN` | **1** |
 | Router v1.2.1 | `contracts/router/src/lib.rs` | 828 | 17 | `CCT3IA6HKUA5GCAR7XLSNR4N5V2WEKDM6G4OSZ4EDXNS56CLDFBT2BDO` | 2 |
 | TwapBook v1.2 | `contracts/twap-book/src/lib.rs` | 699 | 13 | `CD7NOEXYJJKRPNADYM6C3AST33HF7WLYFOMWGQCX5MHD4CM7LYPB7U6I` | 2 |
