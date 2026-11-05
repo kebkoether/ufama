@@ -48,6 +48,15 @@ jobs:
       - name: Install Scout
         if: steps.scout-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-scout-audit --version "$SCOUT_VERSION" --locked
+      # Scout pins dylint 4.1, whose driver build script clones
+      # rust-lang/rust-clippy and checks out "master". Clippy renamed its
+      # default branch to "main" (dylint 6 follows), so serve the build a
+      # local mirror that still carries a "master" ref.
+      - name: Mirror Clippy with a master branch (dylint 4.1 workaround)
+        run: |
+          git clone --quiet https://github.com/rust-lang/rust-clippy "$HOME/rust-clippy-mirror"
+          git -C "$HOME/rust-clippy-mirror" branch master origin/main
+          git config --global url."file://$HOME/rust-clippy-mirror".insteadOf "https://github.com/rust-lang/rust-clippy"
       - name: Run Scout
         run: |
           cargo scout-audit --version
