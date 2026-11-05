@@ -35,6 +35,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2025-08-07
+          targets: wasm32v1-none
           components: rustc-dev, llvm-tools-preview, rust-src
       - uses: Swatinem/rust-cache@v2
         with:
@@ -64,7 +65,9 @@ jobs:
       - name: Run Scout
         run: |
           cargo scout-audit --version
-          cargo scout-audit --output-format md --output-path "$GITHUB_WORKSPACE/scout-report.md"
+          # Scout defaults to --target=wasm32-unknown-unknown, which soroban-sdk 27's
+          # build script refuses on Rust 1.82+. An explicit target replaces that default.
+          cargo scout-audit --output-format md --output-path "$GITHUB_WORKSPACE/scout-report.md" -- --target=wasm32v1-none
       - name: Summary
         if: always()
         run: |
