@@ -39,7 +39,7 @@ the published audits list (stellar.org/audit-bank/projects).
 | Eligible priority category | **Financial Protocols** ("protocols managing on-chain value") — no traction threshold for priority categories. |
 | Code complete, nearly mainnet-ready, audit needed in 4–6 weeks | Live on mainnet since 2026-08 (v1.2.1 set) and 2026-10 (RfqSettle). Code frozen for the audit once pre-audit fixes land. |
 | Extensive tests, deployed on testnet | 75 contract unit tests plus the cross-contract integration crate; every contract was deployed and exercised on testnet before mainnet. |
-| Self-service tooling scan results + remediation plan for crit/high/med | [SCANS.md](./SCANS.md) (Scout, cargo audit, clippy; 2026-08-21) and [REMEDIATION.md](./REMEDIATION.md). **Re-run Scout on the current tree** — RfqSettle and the Curve adapter postdate the scan. |
+| Self-service tooling scan results + remediation plan for crit/high/med | [SCANS.md](./SCANS.md) (Scout, cargo audit, clippy; 2026-11-05, all nine crates incl. RfqSettle and Curve) and [REMEDIATION.md](./REMEDIATION.md). |
 | STRIDE threat model | [THREAT_MODEL.md](../THREAT_MODEL.md): dataflow diagram with trust boundaries, 26 threats across six boundaries, per SDF's template. **Add the RFQ flow** (maker pre-signed auth entry, NAV band) — it postdates the model. |
 | Responsive during the audit | One maintainer, full-time available. |
 | Able to pay the co-pay | 5% of the audit cost, refundable. Budget for it. |
@@ -62,12 +62,14 @@ the published audits list (stellar.org/audit-bank/projects).
 
 ## To do before sending
 
-- [ ] Re-run Scout (`cargo scout-audit`) and Almanax on the current tree;
-      update SCANS.md with the date and commit.
-- [ ] Add the RFQ dataflow and threats to THREAT_MODEL.md.
-- [ ] Land PRE-AUDIT.md fixes, tag the commit of record.
-- [ ] Make sure hello@ufama.trade receives mail (Porkbun forwarding);
-      SDF will reply there.
+- [x] Re-run Scout on the current tree (2026-11-05, GitHub Actions; the
+      August run had produced no real detector output) and triage every
+      class in SCANS.md. Almanax: not run (hosted service, no CLI).
+- [x] Add the RFQ dataflow and threats to THREAT_MODEL.md (T-RFQ-1..9).
+- [x] Land PRE-AUDIT.md fixes (PR #81), redeploy RfqSettle v1.1
+      (2026-11-05), tag the commit of record (`audit-2026-11-05`).
+- [x] hello@ufama.trade and legal@ufama.trade receive mail (Porkbun
+      forwarding, 2026-11-05).
 - [ ] Decide the firm preference and that the 5% co-pay is acceptable.
 
 ## Draft email (send from hello@ufama.trade)
