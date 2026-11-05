@@ -11,7 +11,8 @@
 | Aqua adapter v1.2 (venue 1) | `CBYQV73IOS3KFIXZV6TC3LC7CPQQGTFQG2UEJ5EF5LFBMVBF7XRSUJCE` |
 | Sushi adapter v1.2 (venue 2) | `CAWVG65APH5K56AS7FWXKKDLSJQUO5WIGCVFUFFFRA2JOJ35OYERLCVR` |
 | Curve adapter (venue 4, UNARMED) | `CCTMKF4PIHIW6UKF3ETVNLE4Z3ZSGLI4HMDWVWCXKSHJHVZEILKGMG7O` |
-| RfqSettle (2026-10-17) | `CBFNGCV7IIZC2E2LUQFLBJU2E4UKG4AINSDWWOU5S64OFKHXTOB74DNB` |
+| RfqSettle v1.1 (2026-11-05, pre-audit fixes) | `CBOK7OLUI763SDSBEUXDEMTOM2OLH4ETIIKPCJBQZG6SETK7YSEPSAT7` |
+| RfqSettle v1.0 (2026-10-17, retired) | `CBFNGCV7IIZC2E2LUQFLBJU2E4UKG4AINSDWWOU5S64OFKHXTOB74DNB` |
 
 Admin/deployer: `GB3BIN23PHTOPHTEGTC4VCY2HVSY6HDYG3C6QXQQ3TCEJR74K6DWGMQT`.
 Router v1.2 `CBSF6G7HXYWHXQDGZROJU4MLONCTNZXF7U3LNURUYMWR5B75TZJGAUJW` is
@@ -33,7 +34,7 @@ deployment:
 
 | Contract | Change | Redeploy |
 |---|---|---|
-| RfqSettle | stale-price refusal (`OracleStale`), durable replay record, `cancel_nonce`, views return errors instead of trapping, `transfer_admin` event | **Yes, cheap** (`bash scripts/rfq.sh deploy`, ~17 XLM rent; then set `RFQ_CONTRACT_ID` on Railway and in the frontend) |
+| RfqSettle | stale-price refusal (`OracleStale`), durable replay record, `cancel_nonce`, views return errors instead of trapping, `transfer_admin` event | **Done 2026-11-05**: `CBOK7OLUI763SDSBEUXDEMTOM2OLH4ETIIKPCJBQZG6SETK7YSEPSAT7` (tx `e1bd6887…dd80`, ~15.2 XLM rent+fees, optimized wasm sha256 `4fbad161…ec8c`). Railway `RFQ_CONTRACT_ID` must point at it. |
 | SwapBook | per-maker-per-pair cap, TTLs cover order expiry + `bump_ttl`, maker floor net of fee, `get_oracle_price` freshness, events, validation | Yes — batch with the post-audit redeploy unless the audit is far off; needs feed re-registration (`scripts/register-rwa-feeds.sh`), oracle admin, router wiring, and the backend already sends gross payments so it works against both versions |
 | FeeVault | two-step admin (`set_admin` removed), instance TTL bumps | Yes, with SwapBook (the vault address is wired into every contract) |
 
@@ -136,7 +137,7 @@ quote path; the venue was then removed from the testnet Router.
 
 ## RFQ settlement — mainnet rollout
 
-RfqSettle deployed 2026-10-17: `CBFNGCV7IIZC2E2LUQFLBJU2E4UKG4AINSDWWOU5S64OFKHXTOB74DNB`
+RfqSettle v1.1 deployed 2026-11-05: `CBOK7OLUI763SDSBEUXDEMTOM2OLH4ETIIKPCJBQZG6SETK7YSEPSAT7` (replaces v1.0 `CBFNGCV7IIZC2E2LUQFLBJU2E4UKG4AINSDWWOU5S64OFKHXTOB74DNB`, which holds no funds and is simply no longer quoted against). v1.0 was deployed 2026-10-17
 (admin mainnet-deployer, fee_vault CBNI2QR4…HPXP, swap_book CB2KKROC…AEBN,
 fee 5/100k). Code rent for the 11 KB wasm was ~16.6 XLM. Step 1 below is
 done. Steps 2–3 done 2026-10-23: Railway carries RFQ_CONTRACT_ID +
