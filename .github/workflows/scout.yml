@@ -62,6 +62,26 @@ jobs:
           git -C "$HOME/rust-clippy-mirror" symbolic-ref HEAD refs/heads/master
           git -C "$HOME/rust-clippy-mirror" rev-parse master
           git config --global url."file://$HOME/rust-clippy-mirror".insteadOf "https://github.com/rust-lang/rust-clippy"
+      # soroban-sdk-macros 27.0.5 calls str::floor_char_boundary, stable since
+      # Rust 1.91 (2025-09) but still gated on Scout's pinned nightly-2025-08-07.
+      # Inject the feature gate into that one crate via a rustc wrapper; the
+      # workspace crates are still compiled by dylint's driver.
+      - name: rustc wrapper for the pinned nightly (feature gate for soroban-sdk-macros)
+        run: |
+          cat > "$RUNNER_TEMP/rustc-wrap.sh" <<'SH'
+          #!/usr/bin/env bash
+          for a in "$@"; do
+            if [ "$a" = "soroban_sdk_macros" ]; then
+              export RUSTC_BOOTSTRAP=1
+              exec "$@" -Zcrate-attr='feature(round_char_boundary)'
+            fi
+          done
+          exec "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/rustc-wrap.sh"
+          echo "RUSTC_WRAPPER=$RUNNER_TEMP/rustc-wrap.sh" >> "$GITHUB_ENV"
+      - name: Pre-check the workspace builds under the pinned nightly
+        run: cargo +nightly-2025-08-07 check --target wasm32v1-none --workspace --exclude integration-tests
       - name: Run Scout
         run: |
           cargo scout-audit --version
