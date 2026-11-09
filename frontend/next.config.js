@@ -1,6 +1,10 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   experimental: {},
+  // ufama renders no <Image>; disabling the optimizer removes the
+  // /_next/image route entirely (GHSA-2xp9-vwfh-vxw4, GHSA-2464-fhr4-w9xw
+  // are unauthenticated RCEs in that route on Next < 15.5.28).
+  images: { unoptimized: true },
   env: {
     // Vercel injects the commit at build time; footer shows it so
     // "which build am I looking at" is a glance, not an investigation.
