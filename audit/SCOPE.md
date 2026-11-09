@@ -7,9 +7,13 @@ auditor: what to look at, what we believe holds, what we already know.
 
 ## Commit of record
 
-`main` at the time of application. We will tag the frozen commit
-`audit-YYYY-MM-DD` once the pre-audit fixes in [PRE-AUDIT.md](./PRE-AUDIT.md)
-land, and will not deploy new contract code during the engagement.
+Tag **`audit-2026-11-05`** = `main` at
+`31c10cc4b788623ece4bcb2ecc39c4dda29e6e01` (merged 2026-11-09). Contract
+sources were frozen on 2026-11-05 when the pre-audit fixes in
+[PRE-AUDIT.md](./PRE-AUDIT.md) landed and RfqSettle v1.1 was deployed; the
+scans in [SCANS.md](./SCANS.md) ran against those same sources (`3e2e073`),
+and the commits between `3e2e073` and the tag touch only CI and audit
+documentation. We will not deploy new contract code during the engagement.
 Contracts are **not upgradeable**; findings ship as new deployments.
 
 Toolchain: pinned in `contracts/rust-toolchain.toml`; target
