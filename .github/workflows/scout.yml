@@ -1,0 +1,102 @@
+name: Scout
+
+# CoinFabrik Scout (Soroban static analyzer) on the contracts workspace.
+# Runs on Linux because the Windows build of Scout's detector helper fails
+# silently on the maintainer's machine. Manual dispatch, weekly, and
+# whenever this file changes. The markdown report is uploaded as an
+# artifact; copy it into audit/scout-report.md when refreshing SCANS.md.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
+  push:
+    paths:
+      - ".github/workflows/scout.yml"
+
+env:
+  SCOUT_VERSION: "0.3.16"
+
+jobs:
+  scout:
+    name: Contracts (Scout)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0" # keep in sync with contracts/rust-toolchain.toml
+          targets: wasm32v1-none
+      # Scout's detectors are dylint libraries built on a pinned nightly.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-08-07
+          targets: wasm32v1-none
+          components: rustc-dev, llvm-tools-preview, rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts
+      - name: Cache Scout binary
+        id: scout-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-scout-audit
+          key: scout-${{ runner.os }}-${{ env.SCOUT_VERSION }}
+      - name: Install Scout
+        if: steps.scout-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-scout-audit --version "$SCOUT_VERSION" --locked
+      # Scout pins dylint 4.1, whose driver build script clones
+      # rust-lang/rust-clippy and checks out "master". Clippy renamed its
+      # default branch to "main" (dylint 6 follows), so serve the build a
+      # local mirror that still carries a "master" ref.
+      - name: Mirror Clippy with a master branch (dylint 4.1 workaround)
+        run: |
+          git clone --quiet https://github.com/rust-lang/rust-clippy "$HOME/rust-clippy-mirror"
+          git -C "$HOME/rust-clippy-mirror" branch master origin/main
+          # Clones only get a local branch for the mirror's HEAD, and dylint
+          # revparses the bare name "master", so HEAD must point at it.
+          git -C "$HOME/rust-clippy-mirror" symbolic-ref HEAD refs/heads/master
+          git -C "$HOME/rust-clippy-mirror" rev-parse master
+          git config --global url."file://$HOME/rust-clippy-mirror".insteadOf "https://github.com/rust-lang/rust-clippy"
+      # soroban-sdk-macros 27.0.5 calls str::floor_char_boundary, stable since
+      # Rust 1.91 (2025-09) but still gated on Scout's pinned nightly-2025-08-07.
+      # Inject the feature gate into that one crate via a rustc wrapper; the
+      # workspace crates are still compiled by dylint's driver.
+      - name: rustc wrapper for the pinned nightly (feature gate for soroban-sdk-macros)
+        run: |
+          cat > "$RUNNER_TEMP/rustc-wrap.sh" <<'SH'
+          #!/usr/bin/env bash
+          for a in "$@"; do
+            if [ "$a" = "soroban_sdk_macros" ]; then
+              export RUSTC_BOOTSTRAP=1
+              exec "$@" -Zcrate-attr='feature(round_char_boundary)'
+            fi
+          done
+          exec "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/rustc-wrap.sh"
+          echo "RUSTC_WRAPPER=$RUNNER_TEMP/rustc-wrap.sh" >> "$GITHUB_ENV"
+      - name: Pre-check the workspace builds under the pinned nightly
+        run: cargo +nightly-2025-08-07 check --target wasm32v1-none --workspace --exclude integration-tests
+      - name: Run Scout
+        run: |
+          cargo scout-audit --version
+          # Scout defaults to --target=wasm32-unknown-unknown, which soroban-sdk 27's
+          # build script refuses on Rust 1.82+. An explicit target replaces that default.
+          cargo scout-audit --output-format md --output-path "$GITHUB_WORKSPACE/scout-report.md" -- --target=wasm32v1-none
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/scout-report.md" ]; then
+            cat "$GITHUB_WORKSPACE/scout-report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scout-report-${{ github.sha }}
+          path: scout-report.md
+          if-no-files-found: warn

@@ -17,6 +17,9 @@ item must precede.
 | 8 | RUSTSEC-2024-0436 (`paste` unmaintained) + yanked `spin 0.9.8` — transitive deps of `soroban-sdk` | cargo audit | Info | — | Tracked; no action available downstream, resolves with future soroban-sdk releases |
 | 9 | Migrate `env.events().publish` to `#[contractevent]` types (deprecation in soroban-sdk 27) | clippy | Low | Post-audit | Deferred deliberately — changes the on-chain event encoding, so it ships with the next contract deployment, not as a repo-only edit |
 | 10 | `cargo fmt` normalization of the workspace | hygiene | Low | Post-audit | Deferred to a dedicated PR so audit-facing diffs stay reviewable |
+| 11 | Events on adapter wiring setters (`set_router`, `set_factory`, `set_pool`) and the TwapBook fee setter | Scout `storage-change-events` | Low | Next deployment | Open — cosmetic; the admin-surface paths the threat model monitors already emit events |
+| 12 | soroban-sdk bump (27.0.5 → the release matching the mainnet protocol at redeploy time) | Scout `soroban-version` | Low | Post-audit redeploy | Open — deployed contracts stay on the protocol version mainnet runs; bump with the batched SwapBook/FeeVault redeploy |
+| 13 | Replace in-loop `vec.get(i).unwrap()` with `?`/`expect` and make the RfqSettle views' `Result` signatures carry real errors or drop them | Scout `unsafe-unwrap`, `unused-return-enum` | Info | Next deployment | Open — all flagged unwraps are provably unreachable (SCANS.md triage); readability only |
 
 Resolved recently:
 
